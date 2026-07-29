@@ -6,8 +6,6 @@ on:
   pull_request:
 
 jobs:
-  # Skeleton job: the real test suite (RSpec against isolated app + queue test
-  # databases) replaces this from PR 3 onward, per IMPLEMENTATION_PLAN.md §13.
   foundation:
     name: Repository foundation checks
     runs-on: ubuntu-latest
@@ -21,3 +19,51 @@ jobs:
           test -f CLAUDE.md
           test -f .github/PULL_REQUEST_TEMPLATE.md
           test -f .github/workflows/ci.yml
+
+  # The real suite runs from PR 3 onward (IMPLEMENTATION_PLAN.md §13). Ruby is pinned
+  # from .ruby-version — the same pin the Dockerfile uses — so CI and the image can
+  # never drift.
+  test:
+    name: RSpec suite
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      RAILS_ENV: test
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL client library
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libpq-dev
+
+      # ruby-version is deliberately omitted: setup-ruby reads .ruby-version when it
+      # is unset, so the pin lives in exactly one place.
+      - uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+
+      # Prepares both isolated test databases declared in config/database.yml. The
+      # queue database is schema-empty until PR 8; a version-0 schema loads cleanly.
+      - name: Prepare test databases
+        run: bin/rails db:test:prepare
+
+      - name: Run RSpec
+        run: bundle exec rspec

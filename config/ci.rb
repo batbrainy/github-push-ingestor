@@ -3,6 +3,10 @@
 CI.run do
   step "Setup", "bin/setup --skip-server"
 
+  # Isolated test databases, never the development ones (plan §2A).
+  step "Tests: Prepare databases", "bin/rails db:test:prepare"
+  step "Tests: RSpec", "bundle exec rspec"
+
   step "Style: Ruby", "bin/rubocop"
 
   step "Security: Gem audit", "bin/bundler-audit"
