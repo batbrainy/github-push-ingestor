@@ -37,4 +37,17 @@ RSpec.describe JsonLogFormatter do
 
     expect(JSON.parse(line)).to include("level" => "warn", "message" => "[1, 2]")
   end
+
+  it "never lets payloads overwrite the formatter-owned fields" do
+    line = formatter.call("INFO", Time.utc(2026, 7, 29), nil,
+                          { "level" => "error", service: "spoof", timestamp: "1970-01-01", environment: "prod", event: "x" })
+
+    expect(JSON.parse(line)).to include(
+      "level" => "info",
+      "service" => "github-push-ingestor",
+      "timestamp" => "2026-07-29T00:00:00.000Z",
+      "environment" => "test",
+      "event" => "x"
+    )
+  end
 end

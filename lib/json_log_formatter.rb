@@ -11,14 +11,19 @@ require "time"
 class JsonLogFormatter < ::Logger::Formatter
   SERVICE_NAME = "github-push-ingestor".freeze
 
+  # Owned by the formatter; payload keys with these names are dropped so a
+  # structured event can never spoof the severity, service, or timestamp
+  # operators filter on.
+  RESERVED_KEYS = %w[timestamp level service environment].freeze
+
   def call(severity, time, _progname, message)
+    payload = normalize(message).reject { |key, _| RESERVED_KEYS.include?(key.to_s) }
     entry = {
       timestamp: time.utc.iso8601(3),
       level: severity.to_s.downcase,
       service: SERVICE_NAME,
       environment: Rails.env.to_s
-    }
-    entry.merge!(normalize(message))
+    }.merge(payload)
     JSON.generate(entry) << "\n"
   end
 

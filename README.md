@@ -54,7 +54,9 @@ development databases):
 docker compose run --rm test
 ```
 
-Logs are one structured JSON stream across all services:
+Rails and application logs (requests, and jobs from PR 8 onward) are one
+structured JSON stream; PostgreSQL and Puma startup output remain their own
+plain-text formats:
 
 ```bash
 docker compose logs -f

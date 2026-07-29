@@ -44,6 +44,7 @@ services:
   # db:prepare runs.
   setup:
     build: .
+    image: github-push-ingestor-app
     restart: "no"
     command: ["bin/rails", "db:prepare"]
     environment: *app_env
@@ -53,6 +54,7 @@ services:
 
   web:
     build: .
+    image: github-push-ingestor-app
     restart: unless-stopped
     # Puma directly (no `bin/rails server` pid file) so `unless-stopped`
     # actually recovers from ungraceful kills — see the Dockerfile CMD note.
@@ -77,6 +79,7 @@ services:
   # github_push_ingestor_queue_test (plan §2A, §12).
   test:
     build: .
+    image: github-push-ingestor-app
     profiles: ["tools"]
     restart: "no"
     command: ["bash", "-c", "bin/rails db:test:prepare && bundle exec rspec"]

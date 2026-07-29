@@ -29,8 +29,11 @@ Rails.application.configure do
   # Print deprecation notices to the Rails logger.
   config.active_support.deprecation = :log
 
-  # Raise an error on page load if there are pending migrations.
-  config.active_record.migration_error = :page_load
+  # Pending migrations are reported by GET /health/ready as a JSON 503
+  # (plan §11), the same in every environment. The default :page_load
+  # middleware would intercept requests first and answer with an HTML 500,
+  # which is the wrong contract for an API-only service.
+  config.active_record.migration_error = false
 
   # Highlight code that triggered database queries in logs.
   config.active_record.verbose_query_logs = true
