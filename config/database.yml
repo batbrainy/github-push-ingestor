@@ -1,0 +1,44 @@
+# Two databases in the same PostgreSQL 16 instance (IMPLEMENTATION_PLAN.md §2A):
+#   primary — the business tables, the system of record
+#   queue   — Solid Queue's database (jobs run there from PR 8 onward; declared
+#             here already so the compose `setup` service prepares both and
+#             `web`/`worker` never race concurrent db:prepare runs)
+#
+# Test databases are fully isolated from development (plan §2A, §12):
+#   github_push_ingestor_test / github_push_ingestor_queue_test
+
+default: &default
+  adapter: postgresql
+  encoding: unicode
+  max_connections: <%= ENV.fetch("RAILS_MAX_THREADS") { 5 } %>
+  host: <%= ENV.fetch("POSTGRES_HOST") { "localhost" } %>
+  port: <%= ENV.fetch("POSTGRES_PORT") { 5432 } %>
+  username: <%= ENV.fetch("POSTGRES_USER") { "postgres" } %>
+  password: <%= ENV.fetch("POSTGRES_PASSWORD") { "postgres" } %>
+
+development:
+  primary:
+    <<: *default
+    database: github_push_ingestor_development
+  queue:
+    <<: *default
+    database: github_push_ingestor_queue_development
+    migrations_paths: db/queue_migrate
+
+test:
+  primary:
+    <<: *default
+    database: github_push_ingestor_test
+  queue:
+    <<: *default
+    database: github_push_ingestor_queue_test
+    migrations_paths: db/queue_migrate
+
+production:
+  primary:
+    <<: *default
+    database: <%= ENV.fetch("POSTGRES_DB") { "github_push_ingestor_production" } %>
+  queue:
+    <<: *default
+    database: <%= ENV.fetch("POSTGRES_QUEUE_DB") { "github_push_ingestor_queue_production" } %>
+    migrations_paths: db/queue_migrate
