@@ -92,12 +92,30 @@ Do not mix refactoring, feature work, formatting, and unrelated cleanup. Use the
 PR template; keep the plan and README accurate in the same PR that changes
 behavior.
 
-## AI usage rules
+## AI-assisted development workflow
 
-AI assistance is used throughout this repository. The discipline that makes that
-safe:
+AI tools are used to accelerate implementation, but engineering decisions remain
+human-owned.
 
-- Validate generated code; verify behavior through tests before accepting it.
+When making changes:
+
+- Read and follow `IMPLEMENTATION_PLAN.md` before implementation.
+- Keep changes aligned with the current PR's scope in the plan's ladder (§13).
+- Do not create separate AI planning documents, AI transcripts, or AI-generated
+  notes unless explicitly requested. Engineering decisions are preserved through
+  code, tests, PR descriptions, and ADRs under `docs/adr/` — nowhere else.
+
+For each pull request:
+
+- Explain the implementation approach in the PR description.
+- Include important tradeoffs and rejected alternatives when applicable.
+- Link the related GitHub issue.
+- Ensure generated code has been reviewed and validated — verify behavior
+  through tests before accepting it.
+- Run the relevant tests before proposing merge.
+
+Discipline that makes AI assistance safe here:
+
 - Confirm external API claims against official documentation or dated live
   probes — this project's `304`-quota finding (plan §10) exists because a
   documented claim did not survive an unauthenticated probe.
@@ -105,7 +123,28 @@ safe:
 - Never let generated text overstate guarantees: no "exactly-once", no "complete
   capture", no "complete enrichment coverage" (plan §16).
 
-## Before completing any change
+AI assistance should improve speed and consistency, not replace architecture
+review, testing, security review, or operational reasoning.
 
-Confirm: tests pass; the Docker workflow still works; documentation remains
-accurate; the change matches `IMPLEMENTATION_PLAN.md`.
+The workflow is:
+
+```
+issue → implementation → tests → PR description + review → merge
+```
+
+Not:
+
+```
+issue → AI plan document → AI notes → AI summary → code
+```
+
+## Before opening a pull request
+
+Confirm:
+
+- The change matches the linked issue's scope.
+- The change matches `IMPLEMENTATION_PLAN.md`.
+- No unrelated refactoring is included.
+- Tests cover the important behavior and failure modes, and they pass.
+- The Docker workflow still works, where applicable.
+- Documentation is updated if behavior or architecture changed.
