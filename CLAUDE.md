@@ -109,10 +109,24 @@ For each pull request:
 
 - Explain the implementation approach in the PR description.
 - Include important tradeoffs and rejected alternatives when applicable.
-- Link the related GitHub issue.
+- Link the related GitHub issue with a `Closes #<issue>` line in the PR
+  description, so the merge closes the issue automatically.
 - Ensure generated code has been reviewed and validated — verify behavior
   through tests before accepting it.
 - Run the relevant tests before proposing merge.
+
+### Per-issue implementation protocol
+
+Implement ONLY the GitHub issue the PR is for (issue #X).
+
+Before changing files:
+
+1. List the files you plan to modify.
+2. Explain why each file belongs to this issue.
+3. Identify work explicitly deferred to later PRs.
+
+Do not implement future PR scope.
+Keep the PR reviewable.
 
 Discipline that makes AI assistance safe here:
 
