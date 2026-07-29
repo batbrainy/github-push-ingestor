@@ -20,3 +20,4 @@ jobs:
           test -f LICENSE
           test -f CLAUDE.md
           test -f .github/PULL_REQUEST_TEMPLATE.md
+          test -f .github/workflows/ci.yml

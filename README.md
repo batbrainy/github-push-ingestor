@@ -30,13 +30,15 @@ pre-implementation revision history lives in Git and in its Appendices A–D.
 | Crash-recovery verification (container kills) | PR 11, 12 |
 | Known limitations (sampling-based enrichment, no complete-capture guarantee, shared-IP budget) | PR 12 |
 
-## Reviewer commands (once PR 2 lands)
+## Reviewer commands (future)
+
+Each command becomes available with the PR that ships it:
 
 ```bash
-docker compose up --build
-docker compose run --rm ingest
-docker compose run --rm test
-docker compose logs -f
+docker compose up --build        # PR 2
+docker compose run --rm test     # PR 2 (real suite from PR 3)
+docker compose logs -f           # PR 2
+docker compose run --rm ingest   # PR 5
 ```
 
 ## Development
