@@ -1,0 +1,91 @@
+# Compose topology per IMPLEMENTATION_PLAN.md §2A.
+#
+# `docker compose up --build` starts db + setup + web (worker arrives with
+# PR 8; continuous polling starts then). The `tools`-profiled services run
+# only when explicitly targeted:
+#
+#   docker compose run --rm test     # isolated test databases; never touches
+#                                    # the development databases
+#
+# Docker's default restart policy is `no`, so crash recovery is declared
+# explicitly: `unless-stopped` on long-running services, never on one-shots.
+
+name: github-push-ingestor
+
+x-app-env: &app_env
+  RAILS_ENV: ${RAILS_ENV:-development}
+  POSTGRES_HOST: db
+  POSTGRES_USER: postgres
+  POSTGRES_PASSWORD: postgres
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  RAILS_MAX_THREADS: ${RAILS_MAX_THREADS:-5}
+
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # TCP check on purpose: postgres's first-boot initdb runs a temporary
+      # server that answers pg_isready on the unix socket only — a socket
+      # check can report healthy before the real server is up.
+      test: ["CMD-SHELL", "pg_isready -U postgres -h 127.0.0.1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # One-shot: prepares BOTH the primary and queue databases declared in
+  # config/database.yml, so web (and later worker) never race concurrent
+  # db:prepare runs.
+  setup:
+    build: .
+    restart: "no"
+    command: ["bin/rails", "db:prepare"]
+    environment: *app_env
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    build: .
+    restart: unless-stopped
+    # Puma directly (no `bin/rails server` pid file) so `unless-stopped`
+    # actually recovers from ungraceful kills — see the Dockerfile CMD note.
+    command: ["bundle", "exec", "puma", "-C", "config/puma.rb"]
+    ports:
+      - "3000:3000"
+    environment: *app_env
+    depends_on:
+      db:
+        condition: service_healthy
+      setup:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/health/live"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # Depends only on db (never on the development `setup` service) and
+  # prepares its own isolated test databases: github_push_ingestor_test and
+  # github_push_ingestor_queue_test (plan §2A, §12).
+  test:
+    build: .
+    profiles: ["tools"]
+    restart: "no"
+    command: ["bash", "-c", "bin/rails db:test:prepare && bundle exec rspec"]
+    environment:
+      <<: *app_env
+      RAILS_ENV: test
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
