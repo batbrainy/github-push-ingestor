@@ -51,9 +51,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install PostgreSQL client library
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libpq-dev
-
       # ruby-version is deliberately omitted: setup-ruby reads .ruby-version when it
       # is unset, so the pin lives in exactly one place.
       - uses: ruby/setup-ruby@v1
