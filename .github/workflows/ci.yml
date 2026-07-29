@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Skeleton job: the real test suite (RSpec against isolated app + queue test
+  # databases) replaces this from PR 3 onward, per IMPLEMENTATION_PLAN.md §13.
+  foundation:
+    name: Repository foundation checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify required repository files exist
+        run: |
+          test -f IMPLEMENTATION_PLAN.md
+          test -f README.md
+          test -f LICENSE
+          test -f CLAUDE.md
+          test -f .github/PULL_REQUEST_TEMPLATE.md
+          test -f .github/workflows/ci.yml
