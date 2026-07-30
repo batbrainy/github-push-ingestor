@@ -34,15 +34,53 @@ RSpec.describe Github::Ingestion::SourceProvisioner do
                                                  configuration: { "endpoint" => "/events" })
     end
 
-    # source_type is deliberately not unique (§6 anticipates per-repository sources), so two
-    # concurrent processes on a fresh database can both insert. Converging on the lowest id
-    # is what keeps that harmless: both derive the same advisory lock key afterwards, so the
-    # source lock still protects the source.
+    # Duplicate rows can predate this code or be created by hand, and every process has to
+    # derive the same advisory lock key from them or the source lock stops protecting the
+    # source.
     it "converges on the lowest id when several rows of the type exist" do
       first = create_event_source(source_type: "github_public_events")
       create_event_source(source_type: "github_public_events")
 
       expect(described_class.ensure!(mode: :live).id).to eq(first.id)
+    end
+
+    # source_type is deliberately not unique (§6 anticipates per-repository sources), so a
+    # bare check-then-insert would let two first-time processes each end up on the row *it*
+    # created, take source locks on two different event_source.id values, and poll the same
+    # feed concurrently — the exact guarantee §9 asks the source lock to provide.
+    describe "two processes provisioning at once" do
+      it "serializes the check and the insert against a second session" do
+        expect(EventSource.connection).to receive(:execute)
+          .with(described_class::PROVISIONING_LOCK).and_call_original
+
+        described_class.ensure!(mode: :live)
+      end
+
+      # The lock self-conflicts, so a second session cannot hold it while provisioning runs.
+      # Asserted with a real out-of-pool connection, because a thread would share this
+      # session and the assertion would pass no matter what the code did.
+      it "takes a lock a concurrent provisioner would have to wait for" do
+        second_session.exec("BEGIN; LOCK TABLE event_sources IN SHARE ROW EXCLUSIVE MODE")
+
+        blocked = second_session.exec(<<~SQL).getvalue(0, 0)
+          SELECT count(*) FROM pg_locks
+          WHERE relation = 'event_sources'::regclass AND mode = 'ShareRowExclusiveLock'
+        SQL
+
+        expect(blocked.to_i).to eq(1)
+      ensure
+        second_session.exec("ROLLBACK")
+      end
+
+      # Every call after the first is a single SELECT: #ensure! reads before it ever reaches
+      # the transaction, so the table lock is a first-write cost and not a per-run one.
+      it "does not lock the table once the row exists" do
+        described_class.ensure!(mode: :live)
+
+        expect(EventSource.connection).not_to receive(:execute).with(described_class::PROVISIONING_LOCK)
+
+        described_class.ensure!(mode: :live)
+      end
     end
 
     it "keeps sources of different types apart" do

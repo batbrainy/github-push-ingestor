@@ -40,6 +40,12 @@ module Github
 
       REFUSING_ERRORS = [ Errors::ConfigurationError, Errors::FixtureMiss, Errors::FixtureCorpusError ].freeze
 
+      # The two denial reasons the ledger's window reset genuinely governs: both clear when
+      # the counters and remaining are refreshed for the next window. The ledger's other two
+      # reasons do not — :globally_blocked clears on global_blocked_until, and
+      # :window_uninitialized is enrichment-only and unreachable from a poll.
+      RESET_BACKED_REASONS = %w[ class_allowance_exhausted reserve_reached ].freeze
+
       BUSY_MESSAGE = "source busy — poller cycle in progress".freeze
 
       USAGE = <<~TEXT.freeze
@@ -126,14 +132,22 @@ module Github
       end
 
       # §9's line is "Ingestion deferred until T", where T comes from effective_poll_time.
-      # PR 5 has no cadence to defer against, so the instant it can honestly name is the one
-      # the ledger already knows: the window reset. When there is none — a held gate has no
-      # instant at all — the reason stands on its own.
+      # PR 5 has no cadence to defer against, so the only instant it can honestly name is the
+      # one the ledger already knows — and only for the reasons that instant actually governs.
+      #
+      # A held gate has no instant at all; a secondary limit clears on a Retry-After and a
+      # global block on global_blocked_until, neither of which PR 5 persists (PR 6 owns both).
+      # Printing the window reset beside any of those would be a confident wrong answer, which
+      # is worse than printing no answer, so those deferrals state the reason alone.
       def deferred_line(result, summary)
-        reset_at = Report.timestamp(summary.budget_reset_at)
+        reset_at = Report.timestamp(summary.budget_reset_at) if reset_backed?(result)
         until_clause = reset_at ? " until #{reset_at}" : ""
 
         "Ingestion deferred#{until_clause} — #{result.deferral_reason}"
+      end
+
+      def reset_backed?(result)
+        RESET_BACKED_REASONS.include?(result.deferral_reason)
       end
 
       def help

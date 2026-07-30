@@ -118,6 +118,33 @@ RSpec.describe Github::Ingestion::OneShot do
       expect(printed).to include("Ingestion deferred until #{(frozen_time + 3600).iso8601}")
     end
 
+    it "names it for a reserve breach too, which the same window reset clears" do
+      active_budget_window(now: frozen_time)
+      runner_returns(status: "deferred", classification: :budget_denied,
+                     deferral_reason: "reserve_reached")
+
+      one_shot.call
+
+      expect(printed).to include("Ingestion deferred until #{(frozen_time + 3600).iso8601}")
+    end
+
+    # A held gate has no instant, and a secondary limit clears on a Retry-After that PR 5
+    # does not persist. Borrowing the ledger's reset for either would be a confident wrong
+    # answer, which is worse than no answer.
+    it "states the reason alone when the window reset does not govern the deferral" do
+      active_budget_window(now: frozen_time)
+
+      %w[gate_unavailable secondary_limited globally_blocked].each do |reason|
+        output.truncate(output.rewind)
+        runner_returns(status: "deferred", classification: :gate_unavailable, deferral_reason: reason)
+
+        one_shot.call
+
+        expect(printed).to include("Ingestion deferred — #{reason}")
+        expect(printed).not_to include("deferred until"), "expected no instant for #{reason}"
+      end
+    end
+
     it "prints the state summary too" do
       runner_returns(status: "deferred", deferral_reason: "gate_unavailable")
 

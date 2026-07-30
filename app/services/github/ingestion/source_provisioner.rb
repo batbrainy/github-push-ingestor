@@ -22,25 +22,46 @@ module Github
       # *something*, writes this, and never changes it again.
       INITIAL_STATUS = "idle".freeze
 
+      # Held only while the row is being created, which is once per database. It self-
+      # conflicts, so two first-time provisioners serialize; it does not conflict with
+      # SELECT, so no reader is delayed; and it is released at COMMIT, so nothing can leak
+      # it. Deliberately not a fourth advisory-lock namespace: this is one table's
+      # first-write problem, and Github::LockOrder exists to police the two locks that can
+      # actually deadlock against each other.
+      PROVISIONING_LOCK = "LOCK TABLE event_sources IN SHARE ROW EXCLUSIVE MODE".freeze
+
       class << self
         # @return [EventSource] the row this mode polls through
         def ensure!(mode: Github.configuration.mode, now: Time.current)
           source_type = EventSources::Base.for_mode(mode).source_type
 
-          existing(source_type) || create(source_type, now) || existing(source_type)
+          existing(source_type) || provision(source_type, now)
         end
 
         private
 
-        # Always the lowest id for the type. event_sources.source_type is deliberately not
-        # unique — plan §6 anticipates per-repository sources and a PR 3 spec asserts that
-        # several rows of one type are allowed — so provisioning cannot be made atomic with
-        # an ON CONFLICT clause. Converging on the lowest id is what makes the residual race
-        # harmless: two processes that both insert still derive the *same* advisory lock key
-        # from the same row afterwards, so the source lock keeps protecting the source. The
-        # cost of the race is one extra row and one extra poll attempt, with duplicate
-        # events absorbed by github_event_id uniqueness. Adding the constraint belongs to
-        # PR 6, which owns this table.
+        # event_sources.source_type is deliberately not unique — plan §6 anticipates
+        # per-repository sources and a PR 3 spec asserts several rows of one type are
+        # allowed — so provisioning cannot be made atomic with an ON CONFLICT clause, and a
+        # bare check-then-insert is a real hazard rather than a theoretical one: two
+        # first-time processes would each end up on the row *it* created, take source locks
+        # on two different event_source.id values, and poll the same feed concurrently.
+        # That is precisely the guarantee §9 asks the source lock to provide.
+        #
+        # So the check and the insert are serialized. The lock is reached only when the row
+        # is genuinely absent, because #ensure! reads first and outside any transaction —
+        # every call after the first is a single SELECT.
+        def provision(source_type, now)
+          EventSource.transaction do
+            EventSource.connection.execute(PROVISIONING_LOCK)
+
+            existing(source_type) || create(source_type, now)
+          end
+        end
+
+        # The lowest id for the type, always. Duplicate rows can still predate this code or
+        # be created by hand, and every process has to derive the same advisory lock key
+        # from them or the source lock stops protecting the source.
         def existing(source_type)
           EventSource.where(source_type: source_type).order(:id).first
         end
@@ -50,8 +71,6 @@ module Github
         def create(source_type, now)
           EventSource.create!(source_type: source_type, status: INITIAL_STATUS, enabled: true,
                               configuration: {}, created_at: now, updated_at: now)
-        rescue ActiveRecord::RecordNotUnique
-          nil
         end
       end
     end

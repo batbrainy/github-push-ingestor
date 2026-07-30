@@ -198,6 +198,21 @@ RSpec.describe Github::IngestionRunner do
       expect(IngestionRun.sole).to be_deferred
     end
 
+    # §11 makes run_id the correlation identifier for the whole flow, and a deferral is
+    # exactly the line an operator greps for when a run produced no events — so it must not
+    # be the one ingestion line that cannot be joined to its run.
+    it "correlates the deferral line with the run it belongs to" do
+      allow(Rails.logger).to receive(:info)
+      active_budget_window(now: frozen_time, poll_used: 12, poll_allowance: 12)
+
+      deferred = ingest(fixture_runner(transport: fixture_transport))
+
+      expect(Rails.logger).to have_received(:info).with(
+        hash_including(event: "ingestion.deferred", run_id: deferred.run_id,
+                       reason: "class_allowance_exhausted")
+      )
+    end
+
     it "spends nothing and writes no events" do
       expect(transport.requests).to be_empty
       expect(PushEvent.count).to eq(0)

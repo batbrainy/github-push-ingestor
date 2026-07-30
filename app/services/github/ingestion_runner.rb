@@ -122,7 +122,9 @@ module Github
       # Order matters: 304 and the deferrals carry no usable body, so they are answered before
       # anything tries to decode one.
       return outcome("not_modified", fetched) if fetched.not_modified?
-      return deferral(fetched) if fetched.deferred? || DEFERRING_CLASSIFICATIONS.include?(fetched.classification)
+      if fetched.deferred? || DEFERRING_CLASSIFICATIONS.include?(fetched.classification)
+        return deferral(fetched, recorder.run_id)
+      end
       return outcome("failed", fetched, last_error: describe(fetched)) unless fetched.ok?
 
       process(source, fetched, recorder)
@@ -140,10 +142,14 @@ module Github
       outcome("failed", fetched, last_error: "#{error.class.name}: #{error.message}")
     end
 
-    def deferral(fetched)
+    # run_id is threaded in rather than left off: §11 makes it the correlation identifier for
+    # the whole flow, and a deferral is exactly the line an operator greps for when a run
+    # produced no events. Without it this would be the one ingestion line that cannot be
+    # joined to the run it belongs to.
+    def deferral(fetched, run_id)
       reason = fetched.deferred? ? deferral_reason(fetched) : fetched.classification.to_s
 
-      Rails.logger.info(event: "ingestion.deferred", reason: reason,
+      Rails.logger.info(event: "ingestion.deferred", run_id: run_id, reason: reason,
                         classification: fetched.classification, http_status: fetched.status)
 
       outcome("deferred", fetched, deferral_reason: reason)
