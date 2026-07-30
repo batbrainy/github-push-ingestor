@@ -64,6 +64,11 @@ module Github
     # believe it owns the source.
     LockSessionChanged = Class.new(Error)
 
+    # A response arrived with a status but a body this application cannot use at all —
+    # not a JSON array of events. Distinct from a malformed *event*, which PR 5
+    # quarantines individually while the rest of the page is processed.
+    MalformedResponse = Class.new(Error)
+
     # Github::BudgetLedger#reserve! was called inside an application transaction. The
     # debit has to be committed before the request is issued, or an outer rollback
     # would refund a request GitHub has already counted (§7, "failures stay spent").

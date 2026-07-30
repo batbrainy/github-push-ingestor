@@ -116,11 +116,20 @@ module Github
       log_result(failure(request, e, attempt: attempt))
     end
 
-    # Payload- and Link-supplied URLs go through the payload path, which always applies
-    # the full live policy first and only then projects onto the fixture scheme — so
-    # fixture mode is never a weaker boundary than live.
+    # A location GitHub supplied — a payload URL, a Link target, a Location header —
+    # always clears the full *live* policy first and is only then projected onto the
+    # fixture scheme, so fixture mode is never a weaker boundary than live and a
+    # response body cannot forge a corpus address.
+    #
+    # A location this application constructed is validated against the current mode
+    # directly, which is what lets the offline event source address the corpus with a
+    # fixture:// URL that no payload could ever supply.
     def validate(request)
-      UrlPolicy.validate_payload_url!(request.url, mode: @mode)
+      if request.payload_supplied?
+        UrlPolicy.validate_payload_url!(request.url, mode: @mode)
+      else
+        UrlPolicy.validate!(request.url, mode: @mode)
+      end
     end
 
     def rate_limit_from(response)

@@ -342,7 +342,8 @@ RSpec.describe Github::RequestExecutor do
 
       expect {
         executor(offline, mode: :fixture).call(
-          Github::Request.new(url: "https://api.github.com/users/nobody", request_class: :actor)
+          Github::Request.new(url: "https://api.github.com/users/nobody",
+                              request_class: :actor, origin: :payload)
         )
       }.to raise_error(Github::Errors::FixtureMiss)
     end
@@ -351,7 +352,11 @@ RSpec.describe Github::RequestExecutor do
       active_budget_window(remaining: 60)
       offline = Github::Transports::Fixture.new(corpus: corpus)
 
-      result = executor(offline, mode: :fixture).call(poll_request)
+      # The offline source's own fixture:// location: application-origin, so it is
+      # validated against fixture mode directly rather than through the payload path.
+      result = executor(offline, mode: :fixture).call(
+        Github::EventSources::FixtureEvents.new.first_page_request
+      )
 
       expect(result).to be_ok
       expect(current_budget).to have_attributes(poll_used: 1, remaining: 59)
