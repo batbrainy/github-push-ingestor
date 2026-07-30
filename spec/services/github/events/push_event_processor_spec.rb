@@ -235,23 +235,27 @@ RSpec.describe Github::Events::PushEventProcessor do
     end
   end
 
-  # A non-finite Float — JSON.parse("1e400") yields Float::INFINITY — can be neither
-  # fingerprinted nor stored in jsonb, so it has no quarantine row available to it. Both
-  # halves of that boundary are pinned here, because where the failure surfaces decides
-  # which counter it lands in.
-  describe "a payload that cannot be represented in JSON" do
-    let(:unstorable) { JSON.parse("[1e400]").first }
+  # A non-finite Float — JSON.parse("1e400") yields Float::INFINITY — has no fingerprint,
+  # so a malformed envelope carrying one has no quarantine row available to it and lands in
+  # events_failed. Both halves of that asymmetry are pinned, because where the value is
+  # noticed decides which counter it reaches.
+  describe "a value JSON cannot represent" do
+    let(:beyond_float) { JSON.parse("[1e400]").first }
 
     it "raises when it would have to fingerprint one, rather than inventing an identity" do
       envelope = well_formed_envelope("payload" => { "head" => nil })
-      envelope["payload"]["weight"] = unstorable
+      envelope["payload"]["weight"] = beyond_float
 
       expect { processor.call(envelope) }.to raise_error(ArgumentError, /not representable in JSON/)
     end
 
-    it "does not fingerprint a healthy envelope, so the value surfaces at the write instead" do
+    # A healthy envelope is never fingerprinted, and ActiveSupport's JSON encoder writes
+    # Infinity into jsonb as null without raising — verified against PostgreSQL 16, not
+    # assumed. So this event persists with that one field nulled, inside ADR 0001's
+    # semantic-retention tradeoff.
+    it "accepts a healthy envelope carrying one, since nothing needs its fingerprint" do
       envelope = well_formed_envelope
-      envelope["payload"]["weight"] = unstorable
+      envelope["payload"]["weight"] = beyond_float
 
       expect(processor.call(envelope)).to be_push_event
     end

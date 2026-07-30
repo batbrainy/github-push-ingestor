@@ -23,10 +23,14 @@ module Github
     # envelope with a null login would land in events_failed rather than in the taxonomy.
     #
     # #call never raises for malformed data — that is the whole point of the taxonomy.
-    # The single exception is a payload that cannot be represented in JSON at all (a
-    # non-finite Float from a literal like 1e400): it has no fingerprint and no jsonb
-    # representation, so it cannot be quarantined either, and its only honest terminal
-    # outcome is events_failed via the writer's rescue.
+    # The single exception is a payload carrying a value JSON cannot represent (a
+    # non-finite Float, which JSON.parse produces from a literal like 1e400): it has no
+    # fingerprint, so it has no quarantine row available to it, and its only honest
+    # terminal outcome is events_failed via the writer's rescue. Note the asymmetry, which
+    # was verified rather than assumed: a *well-formed* envelope carrying such a value is
+    # never fingerprinted, and ActiveSupport's JSON encoder writes it into jsonb as null
+    # without raising — so it persists, with that one field nulled, inside ADR 0001's
+    # semantic-retention tradeoff.
     #
     # Envelope structure and the event type are the registry's half of the taxonomy; by
     # the time this runs, the envelope is a Hash whose type is exactly EVENT_TYPE.

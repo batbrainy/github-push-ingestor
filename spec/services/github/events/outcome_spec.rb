@@ -42,30 +42,6 @@ RSpec.describe Github::Events::Outcome do
     end
   end
 
-  # Feeds ingestion_runs.push_events_seen, which counts what GitHub typed as a push
-  # whether or not it normalized (§8 step 4).
-  describe "#push_type?" do
-    it "is true for a quarantined PushEvent, because GitHub still called it one" do
-      outcome = described_class.quarantined(
-        event_type: "PushEvent", github_event_id: "1", raw_payload: {},
-        error_code: "missing_required_field", error_message: "payload is missing head",
-        payload_fingerprint: "0" * 64
-      )
-
-      expect(outcome).to be_push_type
-    end
-
-    it "is false for an envelope with no usable type" do
-      outcome = described_class.quarantined(
-        event_type: nil, github_event_id: "1", raw_payload: {},
-        error_code: "missing_event_type", error_message: "type is absent",
-        payload_fingerprint: "0" * 64
-      )
-
-      expect(outcome).not_to be_push_type
-    end
-  end
-
   describe "#to_log" do
     it "carries the fields §11 asks for and omits the ones a kind does not have" do
       outcome = described_class.ignored(event_type: "WatchEvent", github_event_id: "58000000004",

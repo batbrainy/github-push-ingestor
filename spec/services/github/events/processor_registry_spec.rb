@@ -89,10 +89,6 @@ RSpec.describe Github::Events::ProcessorRegistry do
       expect(outcome).to be_ignored
     end
 
-    it "does not count an ignored event as a push event seen" do
-      expect(registry.process("type" => "WatchEvent")).not_to be_push_type
-    end
-
     # §7 row 3, structural half. EventSources::Base#events returns elements untouched,
     # "including nulls, which a valid JSON array can legitimately contain".
     it "quarantines a null element" do

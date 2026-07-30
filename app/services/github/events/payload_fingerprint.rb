@@ -95,10 +95,16 @@ module Github
         end
 
         # JSON.parse("1e400") succeeds and yields Float::INFINITY, and JSON.generate
-        # then raises JSON::GeneratorError. Such a payload cannot be fingerprinted and
-        # cannot be stored in either jsonb column either, so its only terminal outcome
-        # is events_failed — and the log line should name the value rather than surface
-        # a bare generator error from three frames down.
+        # then raises JSON::GeneratorError. So such a value has no fingerprint, which
+        # means a malformed envelope carrying one has no quarantine row available to it —
+        # its only terminal outcome is events_failed, and the log line should name the
+        # value rather than surface a bare generator error from three frames down.
+        #
+        # Storage is a separate and quieter problem, verified against PostgreSQL 16 rather
+        # than assumed: ActiveSupport's JSON encoder writes Infinity into jsonb as null.
+        # It does not raise. That is within ADR 0001's semantic-retention tradeoff, but it
+        # is one more reason not to derive an identity from a value the database will not
+        # keep.
         def finite!(float)
           return float if float.finite?
 

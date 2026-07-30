@@ -76,12 +76,6 @@ module Github
       def ignored? = kind == :ignored
       def quarantined? = kind == :quarantined
 
-      # Feeds ingestion_runs.push_events_seen, which counts envelopes GitHub *typed* as
-      # pushes whether or not they normalized — so a PushEvent that quarantined is still
-      # a push event seen (§8 step 4: "Filter PushEvent entries"). An envelope with no
-      # usable type is not counted as one, which is why page 1's eight envelopes give six.
-      def push_type? = event_type == PushEventProcessor::EVENT_TYPE
-
       def to_log
         {
           github_event_id: github_event_id, event_type: event_type,
