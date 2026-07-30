@@ -7,6 +7,12 @@ CI.run do
   step "Tests: Prepare databases", "bin/rails db:test:prepare"
   step "Tests: RSpec", "bundle exec rspec"
 
+  # The suite loads Rails through rails_helper, so it cannot exercise the one-shot's own
+  # boot path — its shebang, its config/environment require, and any stdlib the harness
+  # happens to have loaded already. Running it once is the only thing that does. Fixture
+  # mode, so it touches no network.
+  step "Tests: One-shot ingestion smoke", "env RAILS_ENV=test GITHUB_MODE=fixture bin/ingest"
+
   step "Style: Ruby", "bin/rubocop"
 
   step "Security: Gem audit", "bin/bundler-audit"

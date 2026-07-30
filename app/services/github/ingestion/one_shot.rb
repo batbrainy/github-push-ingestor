@@ -1,3 +1,8 @@
+# Explicit, and load-bearing: optparse is not required by Rails. The test suite happens to
+# have it loaded through another gem, so nothing in RSpec catches its absence — only running
+# bin/ingest does, which is why CI now does exactly that.
+require "optparse"
+
 module Github
   module Ingestion
     # The one-shot ingestion command (IMPLEMENTATION_PLAN.md §9).
