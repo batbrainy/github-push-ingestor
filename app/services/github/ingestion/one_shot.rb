@@ -86,12 +86,12 @@ module Github
         result = @runner.call(event_source: event_source,
                               wait_seconds: @configuration.source_lock_wait_seconds, force: force)
 
-        report(outcome_line(result), result.tally)
+        report(result.tally) { |summary| outcome_line(result, summary) }
         Result.new(outcome: result.status.to_sym, exit_code: result.failed? ? FAILURE : SUCCESS)
       rescue Errors::SourceBusy
         # §9's wording, verbatim. No run row exists — the runner opens one inside the lock —
         # so there is no tally to print, only the state that already existed.
-        report(BUSY_MESSAGE)
+        report { BUSY_MESSAGE }
         Result.new(outcome: :busy, exit_code: SUCCESS)
       rescue *REFUSING_ERRORS => error
         @error_output.puts("#{humanize(error)}: #{error.message}")
@@ -102,22 +102,25 @@ module Github
       # §9's summary is printed on every path that has a database, including the failing and
       # deferred ones — captured *after* the lock is released, so it reflects the run's own
       # writes. Composed and written as one string so a concurrent log line cannot split it.
-      def report(headline = nil, tally = nil)
+      #
+      # The snapshot is taken before the headline is built and handed to the block, so a
+      # headline that needs persisted state reads it from the same snapshot the block below
+      # prints. This class asks the database nothing directly.
+      def report(tally = nil)
         summary = StateSummary.capture
+        headline = block_given? ? yield(summary) : nil
 
-        blocks = [ headline, tally&.to_s, summary.to_s ].compact
-
-        @output.puts(blocks.join("\n\n"))
+        @output.puts([ headline, tally&.to_s, summary.to_s ].compact.join("\n\n"))
       rescue StandardError => error
         # A summary that cannot be read must not mask the outcome that was already decided.
         @error_output.puts("State summary unavailable: #{error.class.name}")
       end
 
-      def outcome_line(result)
+      def outcome_line(result, summary)
         case result.status
         when "completed" then "Ingestion run #{result.run_id} completed"
         when "not_modified" then "Ingestion run #{result.run_id} completed — GitHub reported no changes (304)"
-        when "deferred" then deferred_line(result)
+        when "deferred" then deferred_line(result, summary)
         else "Ingestion run #{result.run_id} failed: #{result.last_error}"
         end
       end
@@ -126,8 +129,8 @@ module Github
       # PR 5 has no cadence to defer against, so the instant it can honestly name is the one
       # the ledger already knows: the window reset. When there is none — a held gate has no
       # instant at all — the reason stands on its own.
-      def deferred_line(result)
-        reset_at = Report.timestamp(GithubApiBudget.where(id: GithubApiBudget::SINGLETON_ID).pick(:reset_at))
+      def deferred_line(result, summary)
+        reset_at = Report.timestamp(summary.budget_reset_at)
         until_clause = reset_at ? " until #{reset_at}" : ""
 
         "Ingestion deferred#{until_clause} — #{result.deferral_reason}"
