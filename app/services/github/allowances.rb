@@ -13,7 +13,7 @@ module Github
   # These are request-*attempt* allowances, not guaranteed successful polls: a 500
   # retry or a forced one-shot consumes poll allowance and can reduce the number of
   # completed scheduled polls that hour (§7).
-  Allowances = Data.define(:limit, :reserve, :poll_allowance, :enrichment_allowance) do
+  class Allowances < Data.define(:limit, :reserve, :poll_allowance, :enrichment_allowance)
     class << self
       # The formula exactly as written. enrichment_allowance may come out zero or
       # negative; that is precisely the configuration #feasible? rejects, so it is
