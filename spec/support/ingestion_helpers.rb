@@ -61,7 +61,7 @@ module IngestionHelpers
   # zero wall-clock time.
   def fixture_executor(transport: fixture_transport, **overrides)
     Github::RequestExecutor.new(
-      transport: transport, mode: :fixture, sleeper: ->(_seconds) {},
+      transport: transport, mode: :fixture, sleeper: ->(_seconds) { },
       clock: -> { frozen_time }, **overrides
     )
   end
