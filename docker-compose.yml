@@ -19,6 +19,13 @@ x-app-env: &app_env
   POSTGRES_PASSWORD: postgres
   LOG_LEVEL: ${LOG_LEVEL:-info}
   RAILS_MAX_THREADS: ${RAILS_MAX_THREADS:-5}
+  # live | fixture (plan §6, §12). Live ingestion is the default runtime
+  # behavior; fixture resolves every request inside fixtures/github/ with no
+  # network at all. It lives in the shared anchor because the choice has to be
+  # process-wide — a poller and an enrichment worker disagreeing about the mode
+  # would be worse than either setting.
+  GITHUB_MODE: ${GITHUB_MODE:-live}
+  GITHUB_FIXTURE_SCENARIO: ${GITHUB_FIXTURE_SCENARIO:-default}
 
 services:
   db:
@@ -86,6 +93,11 @@ services:
     environment:
       <<: *app_env
       RAILS_ENV: test
+      # Pinned rather than inherited: the suite exercises the live transport under
+      # WebMock and sets fixture mode itself where it wants it, so
+      # `GITHUB_MODE=fixture docker compose run --rm test` must not quietly run a
+      # different suite than CI.
+      GITHUB_MODE: live
     depends_on:
       db:
         condition: service_healthy
