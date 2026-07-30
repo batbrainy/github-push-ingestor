@@ -76,9 +76,14 @@ module Github
       # clearing rule, one stale hour-long backoff keeps deferring a source that has been
       # healthy for its last three polls — the component becomes permanent rather than a
       # constraint.
+      #
+      # `status` is deliberately *not* written back to "idle". A success can only reach a
+      # source that was schedulable, since IngestionRunner refuses to poll a failed one at
+      # all — so writing it would be dead code that quietly returned a source to service
+      # the moment the gate was bypassed. §10's failed state clears on an operator's
+      # decision, and this is the only place that could have made it clear on its own.
       def success(now:)
-        { last_success_at: now, consecutive_failures: 0, retry_not_before_at: nil,
-          last_error: nil, status: "idle" }
+        { last_success_at: now, consecutive_failures: 0, retry_not_before_at: nil, last_error: nil }
       end
 
       def failure(event_source, outcome, now:)

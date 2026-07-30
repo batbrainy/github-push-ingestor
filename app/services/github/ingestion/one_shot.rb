@@ -43,9 +43,10 @@ module Github
       # §9's instant comes from effective_poll_time, which the runner computes and puts on
       # its Result — so this class names T for every reason but two.
       #
-      # A held gate has no instant at all: it clears when whoever holds it lets go, and
-      # naming a time would be a confident wrong answer.
-      NO_INSTANT_REASONS = %w[ gate_unavailable ].freeze
+      # Neither has an instant. A held gate clears when whoever holds it lets go, and a
+      # source taken out of service by a permanent 4xx clears when an operator says so.
+      # Naming a time for either would be a confident wrong answer.
+      NO_INSTANT_REASONS = %w[ gate_unavailable source_failed ].freeze
       # :reserve_reached is a ledger denial reflecting GitHub's own `remaining`, not a term
       # of §9's formula — so effective_poll_time can sit in the past while the ledger still
       # refuses, and the window reset is the honest instant. Making the reserve a

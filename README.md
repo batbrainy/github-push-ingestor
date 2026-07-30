@@ -132,7 +132,7 @@ budget ledger as every other process, so it can never blow the hourly budget.
 
 | Exit | Meaning |
 |---|---|
-| `0` | Ran, or deferred: not yet due, source busy, poll allowance spent, request gate held, a global block in force, or GitHub reported a rate limit |
+| `0` | Ran, or deferred: not yet due, source busy, source out of service, poll allowance spent, request gate held, a global block in force, or GitHub reported a rate limit |
 | `1` | The attempt failed — a transport failure, a non-success status after retries, or an unusable response body |
 | `2` | Refused to run: an unknown option, a configuration the process must not run with, or a gap in the fixture corpus |
 
@@ -267,6 +267,29 @@ newest ~100 events, and the feed moves considerably faster than that. **This ser
 samples the public feed rather than mirroring it**, and pagination deepens a single
 poll within the budget rather than backfilling: events that rolled out of the window
 while the service was down are not recoverable.
+
+### When a source goes out of service
+
+A permanent `4xx` from `/events` — not a rate limit, not a `5xx`, both of which are
+retried — takes the source out of service: `event_sources.status` becomes `failed`,
+`last_error` records why, and **no further poll is attempted**, including under
+`--force`. That is deliberate: the request cannot succeed, so retrying it on a cadence
+would spend the hourly budget on a certainty.
+
+```text
+Ingestion deferred — source_failed
+```
+
+Nothing returns it to service automatically — a later success cannot, because no later
+poll happens. Clear it once the cause is fixed:
+
+```bash
+docker compose exec db psql -U postgres -d github_push_ingestor_development -c "
+  UPDATE event_sources SET status = 'idle', last_error = NULL WHERE status = 'failed';"
+```
+
+`enabled` is a separate switch and stays untouched: it means *an operator turned this
+off*, while `status` means *the system took this out of service*.
 
 ### Recovering from a fixture rate-limit run
 

@@ -66,6 +66,18 @@ RSpec.describe Github::Ingestion::PollState do
                                               last_error: nil)
     end
 
+    # §10's failed state clears on an operator's decision. IngestionRunner refuses to poll
+    # a failed source at all, so this is unreachable in practice — and writing "idle" here
+    # anyway would mean the gate being bypassed once silently returned the source to
+    # service.
+    it "does not return a failed source to service" do
+      event_source.update!(status: "failed")
+
+      record(outcome(status: "completed"))
+
+      expect(event_source).to be_failed
+    end
+
     it "caches the answer it just computed into next_poll_at" do
       expect(event_source.next_poll_at).to eq(now + 300)
     end

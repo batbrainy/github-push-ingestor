@@ -15,9 +15,13 @@
 class EventSource < ApplicationRecord
   # idle   — healthy and schedulable. A completed poll, a 304, and every deferral leave
   #          it here; a deferral is a fact about time, not about the source's health.
-  # failed — §10's "/events returns permanent 4xx → source failed". Operator-recoverable
-  #          only: nothing in the plan defines an automatic transition back, and
-  #          inventing one would silently re-enable a source a human took out.
+  # failed — §10's "/events returns permanent 4xx → source failed". Enforced rather than
+  #          merely recorded: Github::IngestionRunner refuses to poll a failed source at
+  #          all, including under --force, because the request cannot succeed and polling
+  #          it on a cadence would spend the hourly budget on a certainty.
+  #          Operator-recoverable only — nothing writes this back to idle, since a later
+  #          success cannot happen and inventing an automatic transition would silently
+  #          return a source to service without anyone looking at why it left.
   STATUSES = %w[idle failed].freeze
 
   has_many :ingestion_runs, inverse_of: :event_source, dependent: :restrict_with_error

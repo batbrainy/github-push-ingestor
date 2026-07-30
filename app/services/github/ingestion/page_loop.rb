@@ -40,6 +40,24 @@ module Github
       # a server error, which is retried and leaves the source healthy.
       SOURCE_FAILING_CLASSIFICATIONS = %i[ client_error not_found ].freeze
 
+      # Raised when an error this class does not model reaches it *after* a page has come
+      # back — a writer that blew up, a policy that raised, a body that broke something
+      # downstream. The distinction matters because the request was already spent: the run
+      # has to be recorded as an attempted, failed poll, so the cadence advances and the
+      # source backs off. Without that, the next invocation is immediately due again and
+      # spends another request into the same crash, once per invocation, indefinitely.
+      #
+      # It carries the outcome and re-raises the original from IngestionRunner, so the
+      # crash still escapes exactly as it did before — only the bookkeeping changes.
+      class WalkInterrupted < StandardError
+        attr_reader :outcome
+
+        def initialize(outcome)
+          @outcome = outcome
+          super("the page walk was interrupted after #{outcome.tally.pages_fetched} page(s)")
+        end
+      end
+
       # Everything the run row, the source row, and the operator's line need, assembled
       # once. Nested inside its producer, like IngestionRunner::Result and OneShot::Result.
       class Outcome < Data.define(:status, :tally, :classification, :last_error, :deferral_reason,
@@ -120,6 +138,25 @@ module Github
         end
 
         def call
+          walk
+        rescue StandardError => error
+          # Nothing came back, so nothing was attempted and IngestionRunner's own rescue is
+          # the right one — it records an unattempted failure and leaves the schedule alone.
+          #
+          # The one case this predicate does not cover is a debit whose request never
+          # produced a response at all, which RequestExecutor only allows for
+          # Errors::FixtureMiss: every live transport failure comes back as a FetchResult
+          # with a :transport_error classification. A corpus gap is an authoring error in
+          # fixture mode, spends no real quota, and is refused with exit 2 rather than
+          # retried, so leaving the source untouched there is the honest answer.
+          raise if @latest.nil?
+
+          raise WalkInterrupted.new(interrupted(error))
+        end
+
+        private
+
+        def walk
           request = @source.first_page_request(etag: @etag, context: { run_id: @run_id })
           page = 0
 
@@ -136,7 +173,14 @@ module Github
           end
         end
 
-        private
+        # The classification of the page that did come back, so Outcome#attempted? is true
+        # and the poll state moves. The tally is kept for the same reason it is kept on a
+        # truncated walk: the events already written are real, and the run row should say
+        # so.
+        def interrupted(error)
+          outcome(status: "failed", tally: @tally, classification: @latest.classification,
+                  last_error: "#{error.class.name}: #{error.message}", etag: page_one_etag)
+        end
 
         def fetch(request, page:)
           fetched = @loop.executor.call(request)

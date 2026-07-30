@@ -84,7 +84,17 @@ than an aesthetic complaint:
    is why.
 
 9. **A run row exists iff the process tried to reach GitHub.** A poll the schedule turned
-   away writes no `ingestion_runs` row and no source state.
+   away writes no `ingestion_runs` row and no source state. The converse also holds: a
+   crash *after* a page came back records an attempted, failed poll, so the cadence
+   advances and the source backs off rather than the next invocation being immediately due
+   and spending another request into the same crash.
+
+10. **`event_sources.status = failed` is enforced, not merely recorded.** A permanent 4xx
+    on `/events` takes the source out of service, and the runner refuses to poll it —
+    including under `--force`, which §9 does not license to bypass it. Nothing writes it
+    back to `idle`, because no later success can happen; recovery is an operator's
+    decision. `enabled` keeps its own meaning, an operator's switch, so the two never
+    overlap.
 
 ## Consequences
 

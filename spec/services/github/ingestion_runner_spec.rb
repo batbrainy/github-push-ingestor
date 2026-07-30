@@ -579,6 +579,57 @@ RSpec.describe Github::IngestionRunner do
     end
   end
 
+  # §10: "/events returns permanent 4xx → source failed/disabled". The state is only
+  # meaningful if something enforces it — otherwise it is a label that lies, and the source
+  # keeps spending quota on a request that cannot succeed.
+  describe "a source taken out of service" do
+    let(:transport) { fixture_transport }
+
+    before { event_source.update!(status: "failed", last_error: "GitHub returned 404 (not_found)") }
+
+    it "is not polled at all" do
+      result = ingest(fixture_runner(transport: transport))
+
+      expect(result).to be_deferred
+      expect(result.deferral_reason).to eq("source_failed")
+      expect(transport.requests).to be_empty
+      expect(current_budget.poll_used).to eq(0)
+    end
+
+    it "opens no run row, because nothing tried to reach GitHub" do
+      expect { ingest(fixture_runner(transport: transport)) }.not_to change(IngestionRun, :count).from(0)
+    end
+
+    # §9 enumerates what --force bypasses, and this is not on the list. Recovery is an
+    # operator's decision, not a flag's.
+    it "is not polled under --force either" do
+      result = ingest(fixture_runner(transport: transport), force: true)
+
+      expect(result.deferral_reason).to eq("source_failed")
+      expect(transport.requests).to be_empty
+    end
+
+    it "stays out of service until an operator clears it" do
+      ingest(fixture_runner(transport: transport))
+      expect(event_source.reload).to be_failed
+
+      event_source.update!(status: "idle")
+
+      expect(ingest(fixture_runner(transport: transport))).to be_completed
+    end
+
+    # The one path that could have quietly returned a source to service on its own.
+    it "is never returned to service by a later success" do
+      event_source.update!(status: "idle")
+      ingest(fixture_runner(transport: transport))
+      event_source.update!(status: "failed")
+
+      ingest(fixture_runner(transport: fixture_transport, now: frozen_time + 301))
+
+      expect(event_source.reload).to be_failed
+    end
+  end
+
   describe "an unexpected error" do
     it "finalizes the run as failed and re-raises, so no row is abandoned in running" do
       writer = instance_double(Github::Ingestion::PageWriter)
@@ -589,6 +640,33 @@ RSpec.describe Github::IngestionRunner do
       expect(IngestionRun.sole).to be_failed
       expect(IngestionRun.sole.last_error).to eq("RuntimeError: boom")
       expect(IngestionRun.sole.completed_at).to eq(frozen_time)
+    end
+
+    # The request was already spent when this crashed, so the poll has to count as an
+    # attempt. Left unrecorded, the source is immediately due again and the next
+    # invocation spends another request into the same crash, once per invocation, for as
+    # long as the crash lasts.
+    it "records an attempted poll when the crash happened after a page came back" do
+      writer = instance_double(Github::Ingestion::PageWriter)
+      allow(writer).to receive(:write).and_raise(RuntimeError, "boom")
+
+      expect { ingest(fixture_runner(writer: writer)) }.to raise_error(RuntimeError, "boom")
+
+      expect(event_source.reload).to have_attributes(
+        last_polled_at: frozen_time, cadence_due_at: frozen_time + 300,
+        consecutive_failures: 1, last_error: "RuntimeError: boom", last_success_at: nil
+      )
+      expect(event_source.retry_not_before_at).to be >= frozen_time + 60
+    end
+
+    it "leaves the schedule alone when nothing was ever fetched" do
+      runner = fixture_runner
+      allow(Github::EventSources::Base).to receive(:for).and_raise(RuntimeError, "boom")
+
+      expect { ingest(runner) }.to raise_error(RuntimeError, "boom")
+
+      expect(event_source.reload).to have_attributes(last_polled_at: nil, cadence_due_at: nil,
+                                                     consecutive_failures: 0)
     end
 
     # Errors::FixtureMiss is re-raised by the executor because §6 requires a corpus gap to

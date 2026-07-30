@@ -104,11 +104,28 @@ module Github
     private
 
     def run(event_source, force:, lock_wait_ms:)
+      return out_of_service(event_source) if event_source.failed?
+
       now = @clock.call
       schedule = PollSchedule.for(event_source: event_source, now: now)
       return not_due(event_source, schedule, force: force) unless schedule.due?(now: now, force: force)
 
       poll(event_source, force: force, lock_wait_ms: lock_wait_ms)
+    end
+
+    # §10: "/events returns permanent 4xx → source failed/disabled". A source in that state
+    # is not merely deferred, it is out of service, so this is checked before the schedule
+    # rather than folded into it: `failed` is not a term of §9's formula, and it clears on
+    # an operator's decision rather than at an instant.
+    #
+    # `force` is deliberately never consulted here. §9 enumerates what --force bypasses and
+    # this is not on the list, and placing the check ahead of every use of `force` makes
+    # that structural rather than a rule someone could later relax.
+    def out_of_service(event_source)
+      Rails.logger.warn(event: "ingestion.source_unavailable", event_source_id: event_source.id,
+                        source_status: event_source.status, last_error: event_source.last_error)
+
+      Result.new(run_id: nil, status: "deferred", deferral_reason: "source_failed")
     end
 
     def poll(event_source, force:, lock_wait_ms:)
@@ -123,10 +140,20 @@ module Github
       outcome = @page_loop.run(EventSources::Base.for(event_source), run_id: recorder.run_id,
                                etag: force ? nil : event_source.etag)
       finish(recorder, event_source, outcome, started_at: started_at)
+    rescue Ingestion::PageLoop::WalkInterrupted => error
+      # A crash that happened *after* a page came back. The request is spent either way, so
+      # this records an attempted, failed poll — the cadence advances and the source backs
+      # off, instead of the next invocation being immediately due and spending another
+      # request into the same crash.
+      finish(recorder, event_source, error.outcome, started_at: started_at) if recorder&.run
+      raise error.cause
     rescue StandardError => error
-      # Finalize before re-raising, so no row is ever abandoned in `running` by an error
-      # this class could see. A SIGKILL still leaves one, and that is the intended crash
-      # signal.
+      # Nothing was fetched, so nothing was attempted: the run row is closed and the
+      # source's schedule is left exactly as the last real attempt left it.
+      #
+      # Finalize before re-raising either way, so no row is ever abandoned in `running` by
+      # an error this class could see. A SIGKILL still leaves one, and that is the intended
+      # crash signal.
       if recorder&.run
         finish(recorder, event_source, Ingestion::PageLoop::Outcome.failure(error), started_at: started_at)
       end
