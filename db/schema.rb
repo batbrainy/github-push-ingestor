@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_07_29_210007) do
+ActiveRecord::Schema[8.1].define(version: 2026_07_30_120000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -31,6 +31,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_07_29_210007) do
     t.text "status", null: false
     t.datetime "updated_at", null: false
     t.check_constraint "consecutive_failures >= 0", name: "event_sources_consecutive_failures_nonnegative"
+    t.check_constraint "status = ANY (ARRAY['idle'::text, 'failed'::text])", name: "event_sources_status_known"
   end
 
   create_table "github_actors", force: :cascade do |t|

@@ -17,4 +17,22 @@ RSpec.describe "the test suite's network boundary" do
   it "still reaches PostgreSQL, because libpq's socket is not one WebMock hooks" do
     expect(ActiveRecord::Base.connection.select_value("SELECT 1")).to eq(1)
   end
+
+  # script/probe_304.sh deliberately makes live, unauthenticated requests to
+  # api.github.com — it is the evidence §10 makes a required gate for PR 6. It shells out
+  # to curl, a separate process WebMock cannot intercept, so the boundary that matters is
+  # not "it is stubbed" but "nothing here runs it." That is trivially checkable, so it is
+  # checked rather than trusted: a spec, a CI step, or a bin/ci step that reached for it
+  # would spend a CI runner's quota on every push.
+  it "keeps the live probe out of the suite, out of CI, and out of bin/ci" do
+    reachable = Dir[Rails.root.join("spec/**/*.rb"), Rails.root.join(".github/workflows/*.yml")] +
+                [ Rails.root.join("config/ci.rb").to_s, Rails.root.join("bin/ci").to_s ]
+
+    referencing = reachable.select do |path|
+      File.file?(path) && File.basename(path) != File.basename(__FILE__) &&
+        File.read(path).include?("probe_304")
+    end
+
+    expect(referencing).to be_empty
+  end
 end

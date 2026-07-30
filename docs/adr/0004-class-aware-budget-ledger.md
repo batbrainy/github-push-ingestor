@@ -11,7 +11,9 @@ rather than to any event source, and non-search REST endpoints share the `core` 
 so `/events`, actor retrieval, and repository retrieval all compete for one budget
 (`IMPLEMENTATION_PLAN.md` §10). Two dated unauthenticated probes showed `x-ratelimit-used`
 incrementing across a `304`, so this application budgets every request including
-conditional ones.
+conditional ones. (§10 makes re-running that probe a required validation gate; the
+first-party transcript is
+[`docs/evidence/2026-07-30-unauthenticated-304-quota-probe.md`](../evidence/2026-07-30-unauthenticated-304-quota-probe.md).)
 
 V1 had mechanisms but no numbers. Appendix A item 2 recorded the consequence: polling at
 the observed `X-Poll-Interval` of 60 seconds is 60 requests an hour — the entire budget —

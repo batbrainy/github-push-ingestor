@@ -113,8 +113,8 @@ RSpec.describe Github::BudgetLedger do
       end
     end
 
-    # PR 4 enforces this column; PR 6 decides when to set it. Reading a column this PR
-    # never writes costs one clause and means PR 6 does not have to reopen the ledger's
+    # This class enforces the column; Github::RateLimitPolicy decides when it is set.
+    # Keeping the two apart means the policy never reopens the ledger's
     # critical section.
     it "honours a global block it never sets itself" do
       active_window(global_blocked_until: frozen_time + 60)
@@ -430,12 +430,120 @@ RSpec.describe Github::BudgetLedger do
     end
   end
 
+  # §10's three truly-global conditions. This class records the block;
+  # Github::RateLimitPolicy decides which condition warrants one and until when.
+  describe "#block_globally!" do
+    it "records the instant and refuses every class until it passes" do
+      active_window
+      ledger.block_globally!(until_at: frozen_time + 900, reason: :primary_rate_limit, now: frozen_time)
+
+      expect(budget.global_blocked_until).to eq(frozen_time + 900)
+      expect { ledger.reserve!(:poll, now: frozen_time) }
+        .to raise_error(Github::Errors::BudgetExhausted) { |error| expect(error.reason).to eq(:globally_blocked) }
+    end
+
+    it "lets requests through again once the instant has passed" do
+      active_window
+      ledger.block_globally!(until_at: frozen_time + 60, reason: :secondary_rate_limit, now: frozen_time)
+
+      expect { ledger.reserve!(:poll, now: frozen_time + 61) }.not_to raise_error
+    end
+
+    # GREATEST, and PostgreSQL ignoring NULL is the feature here rather than the hazard
+    # DEBIT_SQL's comment warns about: with nothing stored it takes the new instant, and
+    # with something stored it takes the later of the two. The global gate orders requests,
+    # not the post-response writes that follow them, so a short block landing after a long
+    # one is reachable — and letting it win would resume polling into an exhausted quota.
+    it "only ever moves a block later" do
+      active_window
+      ledger.block_globally!(until_at: frozen_time + 3600, reason: :primary_rate_limit, now: frozen_time)
+      ledger.block_globally!(until_at: frozen_time + 60, reason: :secondary_rate_limit, now: frozen_time)
+
+      expect(budget.global_blocked_until).to eq(frozen_time + 3600)
+    end
+
+    it "labels the window only when asked to" do
+      active_window
+
+      ledger.block_globally!(until_at: frozen_time + 60, reason: :secondary_rate_limit, now: frozen_time)
+      expect(budget).to be_active
+
+      ledger.block_globally!(until_at: frozen_time + 3600, reason: :primary_rate_limit,
+                             window_status: "globally_blocked", now: frozen_time)
+      expect(budget).to be_globally_blocked
+    end
+
+    # The same discipline every other statement in this class keeps: this is not an Active
+    # Record save, so a stale in-memory row must still raise rather than clobber the
+    # counters on a later write.
+    it "bumps lock_version, so a stale row still raises" do
+      active_window
+      stale = GithubApiBudget.find(described_class::SINGLETON_ID)
+
+      ledger.block_globally!(until_at: frozen_time + 60, reason: :secondary_rate_limit, now: frozen_time)
+
+      expect { stale.update!(reserve: 9) }.to raise_error(ActiveRecord::StaleObjectError)
+    end
+
+    it "creates no row, because a response without a reservation would mean an unreserved request" do
+      expect(ledger.block_globally!(until_at: frozen_time + 60, reason: :secondary_rate_limit,
+                                    now: frozen_time)).to eq(:no_ledger)
+      expect(GithubApiBudget.count).to eq(0)
+    end
+
+    # Same rule as every other write here: no live request may be issued from inside a
+    # transaction, so no ledger write may run inside one either.
+    it "refuses to run inside an application transaction" do
+      active_window
+
+      expect do
+        ActiveRecord::Base.transaction(joinable: true) do
+          ledger.block_globally!(until_at: frozen_time + 60, reason: :secondary_rate_limit, now: frozen_time)
+        end
+      end.to raise_error(Github::Errors::NestedTransaction)
+    end
+  end
+
+  # Both guards used to key on the window_status string. That was safe while the column
+  # held two values in practice; it stopped being safe once a global block could write a
+  # third, so each now keys on the fact it actually means.
+  describe "a global block over a window that was never initialized" do
+    before do
+      ledger.bootstrap!(now: frozen_time)
+      budget.update!(window_status: "globally_blocked", global_blocked_until: frozen_time + 60)
+    end
+
+    # Dispatching on the label sent this response past the initialize branch, past an
+    # equality test against nil, and into `snapshot.reset_at < nil` — an ArgumentError no
+    # rescue in the executor catches, on a row neither rollover predicate could ever fix
+    # because reset_at was NULL. Permanently.
+    it "still initializes the window from the next good response" do
+      expect(ledger.reconcile!(snapshot, request_class: :poll, now: frozen_time + 61))
+        .to eq(:initialized)
+      expect(budget).to be_active
+    end
+
+    # §7: enrichment is ineligible until the window has been initialized from authoritative
+    # headers — "never assume 60 remaining". A third label must not become a way past that.
+    it "still refuses enrichment, whatever the label says" do
+      expect { ledger.reserve!(:actor, now: frozen_time + 61) }
+        .to raise_error(Github::Errors::BudgetExhausted) { |error| expect(error.reason).to eq(:window_uninitialized) }
+    end
+  end
+
   describe "failures stay spent (plan §7)" do
     # The guarantee is structural: there is no code path that gives a request back.
     it "exposes no way to credit a reservation back" do
       expect(described_class.instance_methods(false)).to contain_exactly(
-        :reserve!, :reconcile!, :bootstrap!, :configuration
+        :reserve!, :reconcile!, :bootstrap!, :block_globally!, :configuration
       )
+    end
+
+    # The allowlist above catches a method appearing; this catches the specific method
+    # that would break the guarantee, however it were named. #block_globally! only ever
+    # moves an instant later, so adding it left the property intact.
+    it "names no operation that could give a request back" do
+      expect(described_class.instance_methods(false).grep(/credit|refund|release|restore/)).to be_empty
     end
 
     it "keeps the debit when the request fails without any response headers" do

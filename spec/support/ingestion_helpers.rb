@@ -67,13 +67,32 @@ module IngestionHelpers
   end
 
   def fixture_runner(transport: fixture_transport, now: frozen_time, executor: nil, writer: nil,
-                     **overrides)
+                     configuration: nil, **overrides)
+    configuration ||= Github.configuration
+
     Github::IngestionRunner.new(
-      executor: executor || fixture_executor(transport: transport, **overrides),
+      executor: executor || fixture_executor(transport: transport, ledger: ledger_for(configuration), **overrides),
       writer: writer || Github::Ingestion::PageWriter.new(clock: -> { now }),
+      configuration: configuration,
       clock: -> { now },
       monotonic: -> { 0.0 }
     )
+  end
+
+  # A configuration that differs from the process-wide one has to reach the ledger too,
+  # not only the page loop. RequestExecutor builds BudgetLedger.new with no argument, so a
+  # runner capped at three pages would otherwise be metered by a ledger still deriving
+  # poll_allowance from MAX_PAGES_PER_POLL=1 — the two would disagree in specs while
+  # agreeing in production, which is the worst way for a test to be green.
+  def ledger_for(configuration)
+    Github::BudgetLedger.new(configuration: configuration)
+  end
+
+  # §10's formula inputs are read once, at Configuration.new, and the object is frozen —
+  # so a pagination example changes them by building a configuration, never by touching
+  # ENV.
+  def configuration_with(**overrides)
+    Github::Configuration.new(Github::Configuration::DEFAULTS.merge(overrides.stringify_keys))
   end
 
   def fixture_event_source

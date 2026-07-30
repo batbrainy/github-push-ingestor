@@ -106,43 +106,79 @@ RSpec.describe Github::Ingestion::OneShot do
       expect(printed).to include("Ingestion deferred — class_allowance_exhausted")
     end
 
-    # §9's line is "Ingestion deferred until T". PR 5 has no cadence to defer against, so the
-    # instant it can honestly name is the window reset the ledger already knows.
-    it "names the window reset when the ledger knows one" do
-      active_budget_window(now: frozen_time)
-      runner_returns(status: "deferred", classification: :budget_denied,
-                     deferral_reason: "class_allowance_exhausted")
+    # §9's line is "Ingestion deferred until T", where T is effective_poll_time — computed
+    # by the runner against the same `force` the run used, and handed over on the Result.
+    # That is what lets every scheduling deferral name an honest instant instead of
+    # borrowing the ledger's window reset and hoping it fits.
+    it "names the instant the runner computed" do
+      runner_returns(status: "deferred", classification: nil, deferral_reason: "cadence_due_at",
+                     next_poll_at: frozen_time + 300)
 
       one_shot.call
 
-      expect(printed).to include("Ingestion deferred until #{(frozen_time + 3600).iso8601}")
+      expect(printed).to include("Ingestion deferred until #{(frozen_time + 300).iso8601} — cadence_due_at")
     end
 
-    it "names it for a reserve breach too, which the same window reset clears" do
-      active_budget_window(now: frozen_time)
-      runner_returns(status: "deferred", classification: :budget_denied,
-                     deferral_reason: "reserve_reached")
-
-      one_shot.call
-
-      expect(printed).to include("Ingestion deferred until #{(frozen_time + 3600).iso8601}")
-    end
-
-    # A held gate has no instant, and a secondary limit clears on a Retry-After that PR 5
-    # does not persist. Borrowing the ledger's reset for either would be a confident wrong
-    # answer, which is worse than no answer.
-    it "states the reason alone when the window reset does not govern the deferral" do
-      active_budget_window(now: frozen_time)
-
-      %w[gate_unavailable secondary_limited globally_blocked].each do |reason|
+    it "names it for the response-driven deferrals PR 6 gave an instant to" do
+      %w[rate_limited secondary_limited globally_blocked poll_class_blocked_until].each do |reason|
         output.truncate(output.rewind)
-        runner_returns(status: "deferred", classification: :gate_unavailable, deferral_reason: reason)
+        runner_returns(status: "deferred", deferral_reason: reason, next_poll_at: frozen_time + 900)
 
         one_shot.call
 
-        expect(printed).to include("Ingestion deferred — #{reason}")
-        expect(printed).not_to include("deferred until"), "expected no instant for #{reason}"
+        expect(printed).to include("Ingestion deferred until #{(frozen_time + 900).iso8601} — #{reason}")
       end
+    end
+
+    # A ledger denial reflecting GitHub's own `remaining` rather than this application's
+    # plan: it is not a term of §9's formula, so effective_poll_time can sit in the past
+    # while the ledger still refuses, and the window reset is the honest instant. Making
+    # the reserve a scheduling component was the tempting simplification and is wrong — a
+    # co-tenant's window rolling can clear it at any moment.
+    it "falls back to the window reset for a reserve breach, which the formula does not model" do
+      active_budget_window(now: frozen_time)
+      runner_returns(status: "deferred", classification: :budget_denied,
+                     deferral_reason: "reserve_reached", next_poll_at: nil)
+
+      one_shot.call
+
+      expect(printed).to include("Ingestion deferred until #{(frozen_time + 3600).iso8601}")
+    end
+
+    # A held gate clears when whoever holds it lets go. Naming a time would be a confident
+    # wrong answer, which is worse than no answer.
+    it "states the reason alone for a held gate, which has no instant at all" do
+      active_budget_window(now: frozen_time)
+      runner_returns(status: "deferred", classification: :gate_unavailable,
+                     deferral_reason: "gate_unavailable", next_poll_at: frozen_time + 900)
+
+      one_shot.call
+
+      expect(printed).to include("Ingestion deferred — gate_unavailable")
+      expect(printed).not_to include("deferred until")
+    end
+
+    # A pre-flight deferral never opened a run row, so there is no run_id to interpolate —
+    # the deferral line is the one outcome line that does not name one.
+    it "prints a deferral that never opened a run" do
+      runner_returns(status: "deferred", run_id: nil, classification: nil,
+                     deferral_reason: "poll_floor_until", next_poll_at: frozen_time + 60)
+
+      expect(one_shot.call).to have_attributes(outcome: :deferred, exit_code: 0)
+      expect(printed).to include("Ingestion deferred until #{(frozen_time + 60).iso8601} — poll_floor_until")
+    end
+
+    # Seven zeroes would suggest a run that produced nothing rather than one that never
+    # happened, and under a five-minute cadence a deferral is the common outcome of this
+    # command rather than an unusual one.
+    it "prints no counters, because nothing was fetched" do
+      runner_returns(status: "deferred", deferral_reason: "cadence_due_at",
+                     next_poll_at: frozen_time + 300)
+
+      one_shot.call
+
+      expect(printed).not_to include("Pages fetched:")
+      expect(printed).to include("Persisted push events:")
     end
 
     it "prints the state summary too" do
@@ -204,9 +240,6 @@ RSpec.describe Github::Ingestion::OneShot do
     end
   end
 
-  # Accepted now, inert now. What §9 says it bypasses — the configured cadence and the stored
-  # ETag — is PR 6's, and neither exists yet; shipping the flag means the documented command
-  # works today and the CLI surface does not change when PR 6 gives it teeth.
   describe "--force" do
     it "reaches the runner" do
       expect(runner).to receive(:call).with(hash_including(force: true))
@@ -220,10 +253,15 @@ RSpec.describe Github::Ingestion::OneShot do
       expect(one_shot(argv: %w[--force]).call.exit_code).to eq(0)
     end
 
-    it "is documented as inert until the poller lands" do
+    # §9 is precise about the blast radius, and so is the help text: a reviewer reaching
+    # for --force to make a demo work has to be able to see it cannot blow the budget or
+    # poll faster than GitHub asks.
+    it "documents both what it bypasses and what it does not" do
       one_shot(argv: %w[--help]).call
 
-      expect(printed).to include("No effect yet")
+      expect(printed).to include("Ignore the configured poll cadence and omit the stored ETag")
+      expect(printed).to include("does not bypass the source lock")
+      expect(printed).not_to include("No effect yet")
     end
   end
 

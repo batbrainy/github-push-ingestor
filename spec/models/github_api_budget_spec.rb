@@ -114,5 +114,50 @@ RSpec.describe GithubApiBudget do
     it "stores only the global block" do
       expect(described_class.column_names).to include("global_blocked_until")
     end
+
+    # The derivation §10 specifies, computed from three columns of this row at read time —
+    # so it cannot go stale across a window rollover the way a stored value would.
+    describe "#poll_class_blocked_until" do
+      it "is nil while the class still has allowance left" do
+        budget = create_budget(poll_used: 11, poll_allowance: 12, reset_at: frozen_time + 3600)
+
+        expect(budget.poll_class_blocked_until(now: frozen_time)).to be_nil
+      end
+
+      it "defers to the window reset once the allowance is spent" do
+        budget = create_budget(poll_used: 12, poll_allowance: 12, reset_at: frozen_time + 3600)
+
+        expect(budget.poll_class_blocked_until(now: frozen_time)).to eq(frozen_time + 3600)
+      end
+
+      # §7's per-window bootstrap depends on this: right after a rollover the counters are
+      # zero and reset_at is NULL, so nothing defers and the first real poll of the window
+      # is free to initialize it from authoritative headers.
+      it "is nil on a window that has not been initialized, which is what lets the first poll bootstrap it" do
+        budget = create_budget(poll_used: 0, poll_allowance: 12, reset_at: nil)
+
+        expect(budget.poll_class_blocked_until(now: frozen_time)).to be_nil
+      end
+
+      # Allowances#clamped yields poll_allowance = 0 when the observed limit is at or below
+      # the reserve. The plan's literal ternary would then return nil — "not blocked" — for
+      # a class that provably cannot spend, and a poller would re-attempt every tick
+      # forever. "Blocked, but we do not know until when" has to resolve to a bounded
+      # instant.
+      it "falls back to one cadence when the allowance is spent and no reset is known" do
+        budget = create_budget(poll_used: 0, poll_allowance: 0, reset_at: nil)
+
+        expect(budget.poll_class_blocked_until(now: frozen_time, cadence_seconds: 300))
+          .to eq(frozen_time + 300)
+      end
+
+      # A dead window never over-defers: its reset is in the past, so the term is in the
+      # past, and the ledger rolls the window on the next reservation.
+      it "names an instant that has already passed rather than blocking indefinitely" do
+        budget = create_budget(poll_used: 12, poll_allowance: 12, reset_at: frozen_time - 60)
+
+        expect(budget.poll_class_blocked_until(now: frozen_time)).to be < frozen_time
+      end
+    end
   end
 end

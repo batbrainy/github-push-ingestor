@@ -4,7 +4,8 @@ module Github
   #
   # The line this class does not cross: it names what happened, it never acts on it.
   # Setting global_blocked_until, deriving class blocking, computing effective_poll_time,
-  # applying Retry-After, and persisting ETags are all PR 6 (§13). Marking an entity
+  # applying Retry-After, and persisting ETags belong to Github::RateLimitPolicy,
+  # Github::PollSchedule and Github::Ingestion::PollState. Marking an entity
   # permanent_failure is PR 7. What each of them branches on is produced here.
   module ResponseClassifier
     CLASSIFICATIONS = %i[

@@ -72,7 +72,7 @@ module Github
     def etag = header("etag")
     def location = header("location")
 
-    # The raw Link header. Parsing it into next/last is PR 6's pagination work; PR 4
+    # The raw Link header. Parsing it into next/last is Github::LinkHeader's job; this
     # only guarantees the value survives the trip.
     def link_header = header("link")
 

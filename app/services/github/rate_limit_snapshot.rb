@@ -1,7 +1,7 @@
 module Github
   # The parsed form of IMPLEMENTATION_PLAN.md §10's "headers to process". Purely a
   # parser: it reads, it never decides. Github::BudgetLedger reconciles against it in
-  # PR 4, and PR 6's rate-limit policy makes the scheduling decisions from the same
+  # PR 4, and Github::RateLimitPolicy makes the scheduling decisions from the same
   # values.
   #
   # Tolerant by design — an absent or unparseable header becomes nil rather than

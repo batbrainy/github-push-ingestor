@@ -11,7 +11,7 @@ RSpec.describe Github::ResponseClassifier do
     end
 
     # §10: no event processing runs, and the reservation stays debited, because an
-    # unauthenticated 304 consumes quota. The classification exists so PR 6 can skip
+    # unauthenticated 304 consumes quota. The classification exists so the page loop skips
     # processing without anyone concluding the request was free.
     it "classifies a 304 as not modified, which is still a spent request" do
       expect(classify(304)).to eq(:not_modified)
@@ -106,7 +106,7 @@ RSpec.describe Github::ResponseClassifier do
     end
   end
 
-  # PR 6's blocking rules and PR 7's entity state machine both branch on this
+  # Github::RateLimitPolicy's blocking rules and PR 7's entity state machine both branch on this
   # vocabulary. A silently added value would fall through their case statements.
   it "names a closed classification vocabulary" do
     expect(described_class::CLASSIFICATIONS).to match_array(
