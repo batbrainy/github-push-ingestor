@@ -1,0 +1,255 @@
+{
+  "version": 1,
+  "default_headers": {
+    "content-type": "application/json; charset=utf-8",
+    "server": "github.com",
+    "x-github-api-version-selected": "2022-11-28",
+    "x-github-media-type": "github.v3; format=json",
+    "x-ratelimit-resource": "core",
+    "x-ratelimit-limit": "60",
+    "x-ratelimit-reset": "+3600",
+    "x-poll-interval": "60"
+  },
+  "scenarios": {
+    "default": {
+      "responses": {
+        "/events?per_page=100": [
+          {
+            "status": 200,
+            "body": "events/page-1.json",
+            "headers": {
+              "etag": "W/\"3f2a1c9d0b7e4a58c1d2e3f4a5b6c7d8\"",
+              "x-ratelimit-remaining": "59",
+              "x-ratelimit-used": "1"
+            }
+          },
+          {
+            "status": 304,
+            "headers": {
+              "etag": "W/\"3f2a1c9d0b7e4a58c1d2e3f4a5b6c7d8\"",
+              "x-ratelimit-remaining": "58",
+              "x-ratelimit-used": "2"
+            }
+          }
+        ],
+        "/users/octocat": [
+          {
+            "status": 200,
+            "body": "users/octocat.json",
+            "headers": {
+              "etag": "W/\"c8a4e1f0a2b3c4d5e6f7a8b9c0d1e2f3\"",
+              "x-ratelimit-remaining": "57",
+              "x-ratelimit-used": "3"
+            }
+          }
+        ],
+        "/users/monalisa": [
+          {
+            "status": 200,
+            "body": "users/monalisa.json",
+            "headers": {
+              "x-ratelimit-remaining": "56",
+              "x-ratelimit-used": "4"
+            }
+          }
+        ],
+        "/users/ghostuser": [
+          {
+            "status": 404,
+            "body": "errors/not-found.json",
+            "headers": {
+              "x-ratelimit-remaining": "55",
+              "x-ratelimit-used": "5"
+            }
+          }
+        ],
+        "/repos/octocat/Hello-World": [
+          {
+            "status": 200,
+            "body": "repos/octocat_hello-world.json",
+            "headers": {
+              "x-ratelimit-remaining": "54",
+              "x-ratelimit-used": "6"
+            }
+          }
+        ],
+        "/repos/monalisa/Spoon-Knife": [
+          {
+            "status": 200,
+            "body": "repos/monalisa_spoon-knife.json",
+            "headers": {
+              "x-ratelimit-remaining": "53",
+              "x-ratelimit-used": "7"
+            }
+          }
+        ],
+        "/repos/deleted-org/gone": [
+          {
+            "status": 404,
+            "body": "errors/not-found.json",
+            "headers": {
+              "x-ratelimit-remaining": "52",
+              "x-ratelimit-used": "8"
+            }
+          }
+        ]
+      }
+    },
+    "paginated": {
+      "inherit": "default",
+      "responses": {
+        "/events?per_page=100": [
+          {
+            "status": 200,
+            "body": "events/page-1.json",
+            "headers": {
+              "etag": "W/\"3f2a1c9d0b7e4a58c1d2e3f4a5b6c7d8\"",
+              "x-ratelimit-remaining": "59",
+              "x-ratelimit-used": "1",
+              "link": "<https://api.github.com/events?per_page=100&page=2>; rel=\"next\", <https://api.github.com/events?per_page=100&page=3>; rel=\"last\""
+            }
+          }
+        ],
+        "/events?page=2&per_page=100": [
+          {
+            "status": 200,
+            "body": "events/page-2.json",
+            "headers": {
+              "x-ratelimit-remaining": "58",
+              "x-ratelimit-used": "2",
+              "link": "<https://api.github.com/events?per_page=100&page=3>; rel=\"next\", <https://api.github.com/events?per_page=100&page=3>; rel=\"last\""
+            }
+          }
+        ],
+        "/events?page=3&per_page=100": [
+          {
+            "status": 200,
+            "body": "events/page-empty.json",
+            "headers": {
+              "x-ratelimit-remaining": "57",
+              "x-ratelimit-used": "3"
+            }
+          }
+        ]
+      }
+    },
+    "rate_limited": {
+      "inherit": "default",
+      "responses": {
+        "/events?per_page=100": [
+          {
+            "status": 403,
+            "body": "errors/rate-limit-exhausted.json",
+            "headers": {
+              "x-ratelimit-remaining": "0",
+              "x-ratelimit-used": "60"
+            }
+          }
+        ]
+      }
+    },
+    "secondary_rate_limited": {
+      "inherit": "default",
+      "responses": {
+        "/events?per_page=100": [
+          {
+            "status": 403,
+            "body": "errors/secondary-rate-limit.json",
+            "headers": {
+              "retry-after": "60",
+              "x-ratelimit-remaining": "42",
+              "x-ratelimit-used": "18"
+            }
+          }
+        ]
+      }
+    },
+    "transient_failure": {
+      "inherit": "default",
+      "responses": {
+        "/events?per_page=100": [
+          {
+            "status": 500,
+            "body": "errors/server-error.json",
+            "headers": {
+              "x-ratelimit-remaining": "59",
+              "x-ratelimit-used": "1"
+            }
+          },
+          {
+            "status": 500,
+            "body": "errors/server-error.json",
+            "headers": {
+              "x-ratelimit-remaining": "58",
+              "x-ratelimit-used": "2"
+            }
+          },
+          {
+            "status": 200,
+            "body": "events/page-1.json",
+            "headers": {
+              "etag": "W/\"3f2a1c9d0b7e4a58c1d2e3f4a5b6c7d8\"",
+              "x-ratelimit-remaining": "57",
+              "x-ratelimit-used": "3"
+            }
+          }
+        ]
+      }
+    },
+    "transient_failure_exhausted": {
+      "inherit": "default",
+      "responses": {
+        "/events?per_page=100": [
+          {
+            "status": 500,
+            "body": "errors/server-error.json",
+            "headers": {
+              "x-ratelimit-remaining": "59",
+              "x-ratelimit-used": "1"
+            }
+          }
+        ]
+      }
+    },
+    "redirecting_repository": {
+      "inherit": "default",
+      "responses": {
+        "/repos/octocat/Hello-World": [
+          {
+            "status": 301,
+            "headers": {
+              "location": "https://api.github.com/repos/octocat/hello-world-renamed",
+              "x-ratelimit-remaining": "54",
+              "x-ratelimit-used": "6"
+            }
+          }
+        ],
+        "/repos/octocat/hello-world-renamed": [
+          {
+            "status": 200,
+            "body": "repos/octocat_hello-world.json",
+            "headers": {
+              "x-ratelimit-remaining": "53",
+              "x-ratelimit-used": "7"
+            }
+          }
+        ]
+      }
+    },
+    "hostile_redirect": {
+      "inherit": "default",
+      "responses": {
+        "/repos/octocat/Hello-World": [
+          {
+            "status": 301,
+            "headers": {
+              "location": "https://evil.example.com/repos/octocat/Hello-World",
+              "x-ratelimit-remaining": "54",
+              "x-ratelimit-used": "6"
+            }
+          }
+        ]
+      }
+    }
+  }
+}

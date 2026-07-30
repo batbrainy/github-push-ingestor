@@ -10,11 +10,17 @@ and worker crashes.
 
 ## Status
 
-Data model stage (PR 3). The Rails 8.1 API, PostgreSQL, Docker Compose topology,
-health endpoints, and structured JSON logging landed in PR 2. The seven core
-tables are now migrated and modelled, with the idempotent write paths
-(`ON CONFLICT` inserts and stub-entity merge rules) covered by specs, and CI runs
-the real RSpec suite. Nothing polls GitHub yet.
+Request-infrastructure stage (PR 4). The Rails 8.1 API, PostgreSQL, Docker
+Compose topology, health endpoints, and structured JSON logging landed in PR 2;
+the seven core tables and their idempotent write paths landed in PR 3. This stage
+adds the chain every GitHub request flows through — the global request gate, the
+class-aware budget ledger, the SSRF URL policy, live and offline transports, and
+the static fixture corpus — plus the per-source advisory lock and the event-source
+adapter contract.
+
+**Nothing polls GitHub yet.** The infrastructure exists and is tested, but no
+event source is provisioned and no code path fetches a page: ingestion lands in
+PR 5 and scheduled polling in PR 6.
 
 Ingestion capabilities land PR by PR; each README section below is completed by
 the pull request that ships the capability it documents. The authoritative
@@ -82,19 +88,84 @@ is [`.env.example`](.env.example).
 | `LOG_LEVEL` | `info` | JSON log verbosity: `debug` adds per-request/per-page lines (plan §11) |
 | `RAILS_ENV` | `development` | Environment for the compose app services |
 | `RAILS_MAX_THREADS` | `5` | Connection pool / Puma thread size |
+| `GITHUB_MODE` | `live` | `live` reaches api.github.com; `fixture` resolves everything inside [`fixtures/github/`](fixtures/github/) with no network and fails closed on an unknown URL (plan §6, §12) |
+| `GITHUB_FIXTURE_SCENARIO` | `default` | Which corpus scenario fixture mode plays |
+| `HTTP_OPEN_TIMEOUT_SECONDS` | `5` | Connect timeout for a live request (plan §2A) |
+| `HTTP_READ_TIMEOUT_SECONDS` | `15` | Read timeout for a live request (plan §2A) |
+| `MAX_HTTP_RETRIES` | `2` | Retries after a 5xx or network timeout. Each retry is a fresh budget reservation (plan §10) |
+| `MAX_REDIRECTS` | `2` | Redirect hops followed per request, each re-validated and separately reserved |
+| `SOURCE_LOCK_WAIT_SECONDS` | `30` | How long the one-shot waits for a busy source lock; the poller attempts once (plan §9) |
+| `POLL_INTERVAL_SECONDS` | `300` | Allowance-formula input; obeyed as the poll cadence from PR 6 |
+| `MAX_PAGES_PER_POLL` | `1` | Allowance-formula input; enforced as the page cap from PR 6 |
+| `ENABLED_LIVE_SOURCE_COUNT` | `1` | Allowance-formula input: live sources sharing one per-IP budget |
+| `RATE_LIMIT_RESERVE` | `8` | Requests per hour left deliberately unspent (plan §10) |
+
+The last four feed the one authoritative allowance formula (plan §10):
+
+```text
+poll_attempt_allowance = ceil(3600 / POLL_INTERVAL_SECONDS)
+                         x MAX_PAGES_PER_POLL x ENABLED_LIVE_SOURCE_COUNT
+enrichment_allowance   = rate_limit - RATE_LIMIT_RESERVE - poll_attempt_allowance
+```
+
+With the defaults: 12 poll attempts and 40 enrichment attempts an hour, against
+GitHub's unauthenticated limit of 60. **The process refuses to boot** if the
+polling requirement leaves no capacity for enrichment.
+
+There is deliberately no variable for the API host or the API version. The
+allowed host is a constant in `Github::UrlPolicy`, because an environment
+variable there would make the SSRF boundary a deployment setting; the API version
+is pinned to `2022-11-28`, the version every live probe behind this plan was run
+under.
 
 Database connection settings (`POSTGRES_HOST`, `POSTGRES_PORT`,
 `POSTGRES_USER`, `POSTGRES_PASSWORD`) are managed by the compose topology
 itself and matter only when running the app outside compose.
 
-Budget knobs, fairness shares, refresh TTLs, and `GITHUB_MODE` arrive with
-PRs 4–7.
+Fairness shares and enrichment refresh TTLs arrive with PR 7.
+
+## The request path
+
+Every live GitHub request — polling and enrichment, from the poller, the worker, or the
+one-shot — takes one chain, and nothing outside it calls GitHub
+(`IMPLEMENTATION_PLAN.md` §5, §10):
+
+```text
+[polling only]  SourceLock  ──┐
+                              ├──► RequestExecutor ──► RequestGate
+[enrichment]  ────────────────┘                   ──► BudgetLedger.reserve!
+                                                  ──► UrlPolicy
+                                                  ──► Transport (Faraday | Fixture)
+```
+
+- **`Github::SourceLock`** is a session advisory lock owning one event source for a whole
+  polling operation. Enrichment requests belong to no source and never take it. The
+  lock-order invariant — source lock, then gate, never the reverse — is enforced at
+  runtime, not just documented.
+- **`Github::RequestGate`** is a second session advisory lock making outbound concurrency
+  exactly one, application-wide. One hold wraps one HTTP attempt: retries re-acquire it
+  rather than sleeping while holding it.
+- **`Github::BudgetLedger`** debits before the request is issued, per class. Failures stay
+  spent, reconciliation against response headers is monotonic within a rate-limit window,
+  and the first poll of each window bootstraps it from authoritative headers rather than
+  spending an extra request to discover the quota.
+- **`Github::UrlPolicy`** is the SSRF boundary. It rebuilds every URL from validated
+  components, and a URL that arrived inside a GitHub payload or a `Link` header always
+  clears the full live policy first.
+- **Transports** are `Faraday` (live) and `Fixture` (offline). The Faraday connection
+  carries the adapter and no middleware at all — retries and redirects belong to the
+  executor, because each attempt re-reserves budget and each redirect target is
+  re-validated.
+
+Decisions behind this are recorded in
+[`docs/adr/`](docs/adr/): advisory locks and the gate (0002), the source and transport
+seams (0003), and the class-aware ledger (0004).
 
 ## Planned contents
 
 | Section | Lands with |
 |---|---|
-| Architecture summary | PR 4–5 |
+| Ingestion and enrichment flow | PR 5, 7 |
 | Data model reference | PR 12 (design brief) |
 | One-shot ingestion command (default, `--force`, deferred/busy semantics) | PR 5 |
 | Continuous ingestion behavior and expected time before records appear | PR 6, 8 |
