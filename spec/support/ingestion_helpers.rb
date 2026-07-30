@@ -47,6 +47,38 @@ module IngestionHelpers
   def corpus_page(name)
     JSON.parse(Rails.root.join("fixtures", "github", "bodies", "events", name).read)
   end
+
+  # A transport with its own scripted-response cursor. Github::Transports::Fixture keeps
+  # cursors on the instance, "so two transports never share a script position" — which is
+  # what makes a *second* transport a faithful model of a second one-shot process, and
+  # therefore how the replay case is exercised without touching the corpus.
+  def fixture_transport(scenario: "default")
+    Github::Transports::Fixture.new(corpus: corpus(scenario: scenario), clock: -> { frozen_time })
+  end
+
+  # The real executor — gate, ledger, URL policy — over an offline transport. Only the
+  # sleeper and the clocks are replaced, so retry and deferral contracts are asserted in
+  # zero wall-clock time.
+  def fixture_executor(transport: fixture_transport, **overrides)
+    Github::RequestExecutor.new(
+      transport: transport, mode: :fixture, sleeper: ->(_seconds) {},
+      clock: -> { frozen_time }, **overrides
+    )
+  end
+
+  def fixture_runner(transport: fixture_transport, now: frozen_time, executor: nil, writer: nil,
+                     **overrides)
+    Github::IngestionRunner.new(
+      executor: executor || fixture_executor(transport: transport, **overrides),
+      writer: writer || Github::Ingestion::PageWriter.new(clock: -> { now }),
+      clock: -> { now },
+      monotonic: -> { 0.0 }
+    )
+  end
+
+  def fixture_event_source
+    Github::Ingestion::SourceProvisioner.ensure!(mode: :fixture, now: frozen_time)
+  end
 end
 
 RSpec.configure do |config|
