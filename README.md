@@ -10,8 +10,12 @@ and worker crashes.
 
 ## Status
 
-Bootstrap stage (PR 2). The Rails 8.1 API, PostgreSQL, Docker Compose topology,
-health endpoints, structured JSON logging, and the test harness are in place.
+Data model stage (PR 3). The Rails 8.1 API, PostgreSQL, Docker Compose topology,
+health endpoints, and structured JSON logging landed in PR 2. The seven core
+tables are now migrated and modelled, with the idempotent write paths
+(`ON CONFLICT` inserts and stub-entity merge rules) covered by specs, and CI runs
+the real RSpec suite. Nothing polls GitHub yet.
+
 Ingestion capabilities land PR by PR; each README section below is completed by
 the pull request that ships the capability it documents. The authoritative
 execution plan is [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) — its
@@ -90,7 +94,8 @@ PRs 4–7.
 
 | Section | Lands with |
 |---|---|
-| Architecture summary | PR 3–5 |
+| Architecture summary | PR 4–5 |
+| Data model reference | PR 12 (design brief) |
 | One-shot ingestion command (default, `--force`, deferred/busy semantics) | PR 5 |
 | Continuous ingestion behavior and expected time before records appear | PR 6, 8 |
 | Rate-limit behavior: allowance formula, budget table, global-vs-class blocking, per-window bootstrap | PR 6 |
@@ -103,7 +108,7 @@ PRs 4–7.
 
 ```bash
 docker compose up --build        # available now
-docker compose run --rm test     # available now (real suite grows from PR 3)
+docker compose run --rm test     # available now (real suite; runs in CI too)
 docker compose logs -f           # available now
 docker compose run --rm ingest   # PR 5
 ```
@@ -111,7 +116,10 @@ docker compose run --rm ingest   # PR 5
 ## Development
 
 AI-assisted development guidance for this repository lives in
-[`CLAUDE.md`](CLAUDE.md). Design brief and ADRs will live under `docs/`.
+[`CLAUDE.md`](CLAUDE.md).
+
+Architecture decision records live under [`docs/adr/`](docs/adr/). The design
+brief lands with PR 12.
 
 ## License
 
