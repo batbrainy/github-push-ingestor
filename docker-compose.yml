@@ -4,6 +4,8 @@
 # PR 8; continuous polling starts then). The `tools`-profiled services run
 # only when explicitly targeted:
 #
+#   docker compose run --rm ingest   # one ingestion cycle, then the state
+#                                    # summary (plan §9)
 #   docker compose run --rm test     # isolated test databases; never touches
 #                                    # the development databases
 #
@@ -80,6 +82,37 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+
+  # One-shot ingestion (plan §2A's topology table, §9's contract). Profiled so
+  # a plain `up` never starts it, and `restart: "no"` because a one-shot that
+  # restarts is a poller.
+  #
+  # An entrypoint rather than a command, so the plan's bare invocation and a
+  # flagged one both work:
+  #
+  #   docker compose run --rm ingest
+  #   docker compose run --rm ingest --force
+  #
+  # `command: []` is explicit: overriding the entrypoint clears the image's
+  # CMD, and saying so here means the puma command can never arrive as
+  # arguments to bin/ingest.
+  #
+  # environment is the shared anchor unmodified, unlike `test` — the
+  # deterministic reviewer path needs GITHUB_MODE=fixture to reach this
+  # container.
+  ingest:
+    build: .
+    image: github-push-ingestor-app
+    profiles: ["tools"]
+    restart: "no"
+    entrypoint: ["bin/ingest"]
+    command: []
+    environment: *app_env
+    depends_on:
+      db:
+        condition: service_healthy
+      setup:
+        condition: service_completed_successfully
 
   # Depends only on db (never on the development `setup` service) and
   # prepares its own isolated test databases: github_push_ingestor_test and
