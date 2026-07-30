@@ -12,18 +12,44 @@ class GithubActor < ApplicationRecord
   # §7 merge rule 1. Envelope values refresh identity fields on any observation,
   # including a duplicate replay — but an envelope upsert must never clear a
   # previously stored enrichment payload or name, so raw_payload, name, and every
-  # enrichment_* column are absent from this SET list entirely. COALESCE stops a
-  # sparse envelope from blanking a value already known.
+  # enrichment_* column are absent from this SET list entirely.
   #
   # Envelope-to-stub mapping (§7): actor.login -> login,
   # actor.display_login -> display_login, actor.url -> api_url,
   # actor.avatar_url -> avatar_url.
+  #
+  # Every assignment has the same shape, which resolves two problems at once:
+  #
+  #   COALESCE(CASE WHEN <envelope is fresh> THEN EXCLUDED.col END, <stored col>)
+  #
+  # A stale envelope makes the CASE yield NULL, so COALESCE keeps the stored value —
+  # an older observation can never overwrite identity captured from a newer one. That
+  # matters because sources commit independently and events arrive late (documented
+  # 30s-6h latency), and because updated_at is monotonic: without this guard the row
+  # could hold the older envelope's identity while updated_at claimed the newer
+  # observation. A fresh envelope that simply omits an optional field also yields
+  # NULL, so the same COALESCE stops a sparse envelope from blanking a known value.
+  #
+  # The comparison is >=, so two observations sharing an instant let the later write
+  # win rather than being discarded as stale.
   IDENTITY_MERGE = <<~SQL.squish
-    login         = EXCLUDED.login,
-    display_login = COALESCE(EXCLUDED.display_login, github_actors.display_login),
-    api_url       = COALESCE(EXCLUDED.api_url,       github_actors.api_url),
-    avatar_url    = COALESCE(EXCLUDED.avatar_url,    github_actors.avatar_url),
-    updated_at    = GREATEST(github_actors.updated_at, EXCLUDED.updated_at)
+    login = COALESCE(
+      CASE WHEN EXCLUDED.updated_at >= github_actors.updated_at
+           THEN EXCLUDED.login END,
+      github_actors.login),
+    display_login = COALESCE(
+      CASE WHEN EXCLUDED.updated_at >= github_actors.updated_at
+           THEN EXCLUDED.display_login END,
+      github_actors.display_login),
+    api_url = COALESCE(
+      CASE WHEN EXCLUDED.updated_at >= github_actors.updated_at
+           THEN EXCLUDED.api_url END,
+      github_actors.api_url),
+    avatar_url = COALESCE(
+      CASE WHEN EXCLUDED.updated_at >= github_actors.updated_at
+           THEN EXCLUDED.avatar_url END,
+      github_actors.avatar_url),
+    updated_at = GREATEST(github_actors.updated_at, EXCLUDED.updated_at)
   SQL
 
   # The explicit validate! mirrors PushEvent.insert_if_new: upsert goes straight to

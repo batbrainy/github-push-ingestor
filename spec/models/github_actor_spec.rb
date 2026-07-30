@@ -89,6 +89,37 @@ RSpec.describe GithubActor do
       expect(actor.last_error).to eq("enrichment allowance exhausted")
     end
 
+    # Sources commit independently and events arrive late, so an out-of-order envelope
+    # must not overwrite identity captured from a newer one — that would leave
+    # updated_at claiming the newer observation while the row held older values.
+    it "does not let an older envelope overwrite newer identity" do
+      described_class.upsert_stub!(github_id: 4242, login: "new-login",
+                                   display_login: "new-display",
+                                   api_url: "https://api.github.com/users/new",
+                                   avatar_url: "https://avatars/new",
+                                   now: frozen_time + 300)
+
+      described_class.upsert_stub!(github_id: 4242, login: "old-login",
+                                   display_login: "old-display",
+                                   api_url: "https://api.github.com/users/old",
+                                   avatar_url: "https://avatars/old",
+                                   now: frozen_time)
+
+      actor = described_class.find_by(github_id: 4242)
+      expect(actor.login).to eq("new-login")
+      expect(actor.display_login).to eq("new-display")
+      expect(actor.api_url).to eq("https://api.github.com/users/new")
+      expect(actor.avatar_url).to eq("https://avatars/new")
+      expect(actor.updated_at).to eq(frozen_time + 300)
+    end
+
+    it "applies an envelope observed at the same instant as the stored one" do
+      described_class.upsert_stub!(github_id: 4242, login: "first", now: frozen_time)
+      described_class.upsert_stub!(github_id: 4242, login: "second", now: frozen_time)
+
+      expect(described_class.find_by(github_id: 4242).login).to eq("second")
+    end
+
     it "never regresses updated_at for a late-arriving envelope" do
       described_class.upsert_stub!(github_id: 4242, login: "octocat", now: frozen_time + 300)
       described_class.upsert_stub!(github_id: 4242, login: "octocat", now: frozen_time)

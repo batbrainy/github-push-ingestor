@@ -17,10 +17,21 @@ class GithubRepository < ApplicationRecord
   # form and maps to full_name — it is deliberately not equated with the enriched
   # short name. name is the final segment of full_name, so it is envelope-derived
   # (§7's enrichment list excludes it) and belongs here under COALESCE.
+  # Assignments use the same freshness-guarded COALESCE shape as
+  # GithubActor::IDENTITY_MERGE — see the explanation there.
   IDENTITY_MERGE = <<~SQL.squish
-    full_name  = EXCLUDED.full_name,
-    name       = COALESCE(EXCLUDED.name,    github_repositories.name),
-    api_url    = COALESCE(EXCLUDED.api_url, github_repositories.api_url),
+    full_name = COALESCE(
+      CASE WHEN EXCLUDED.updated_at >= github_repositories.updated_at
+           THEN EXCLUDED.full_name END,
+      github_repositories.full_name),
+    name = COALESCE(
+      CASE WHEN EXCLUDED.updated_at >= github_repositories.updated_at
+           THEN EXCLUDED.name END,
+      github_repositories.name),
+    api_url = COALESCE(
+      CASE WHEN EXCLUDED.updated_at >= github_repositories.updated_at
+           THEN EXCLUDED.api_url END,
+      github_repositories.api_url),
     updated_at = GREATEST(github_repositories.updated_at, EXCLUDED.updated_at)
   SQL
 

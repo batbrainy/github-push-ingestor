@@ -49,6 +49,31 @@ RSpec.describe GithubRepository do
       expect(described_class.find_by(github_id: 8484).name).to eq("hello-world")
     end
 
+    it "does not let an older envelope overwrite newer identity" do
+      described_class.upsert_stub!(github_id: 8484, full_name: "octocat/new",
+                                   name: "new", api_url: "https://api.github.com/repos/new",
+                                   now: frozen_time + 300)
+
+      described_class.upsert_stub!(github_id: 8484, full_name: "octocat/old",
+                                   name: "old", api_url: "https://api.github.com/repos/old",
+                                   now: frozen_time)
+
+      repository = described_class.find_by(github_id: 8484)
+      expect(repository.full_name).to eq("octocat/new")
+      expect(repository.name).to eq("new")
+      expect(repository.api_url).to eq("https://api.github.com/repos/new")
+      expect(repository.updated_at).to eq(frozen_time + 300)
+    end
+
+    it "applies an envelope observed at the same instant as the stored one" do
+      described_class.upsert_stub!(github_id: 8484, full_name: "octocat/first",
+                                   now: frozen_time)
+      described_class.upsert_stub!(github_id: 8484, full_name: "octocat/second",
+                                   now: frozen_time)
+
+      expect(described_class.find_by(github_id: 8484).full_name).to eq("octocat/second")
+    end
+
     it "never regresses updated_at for a late-arriving envelope" do
       described_class.upsert_stub!(github_id: 8484, full_name: "octocat/hello-world",
                                    now: frozen_time + 300)
