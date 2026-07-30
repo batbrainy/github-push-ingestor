@@ -78,17 +78,28 @@ redact() {
 # Exactly one request per call, and the caller keeps the dump — re-fetching to read the
 # ETag back out would spend a fourth request and quietly weaken the arithmetic the whole
 # transcript rests on.
-fetch() {
-  local etag="${1:-}"
-  local -a conditional=()
-  [ -n "$etag" ] && conditional=(-H "If-None-Match: $etag")
-
+#
+# Extra headers ride in on "$@" rather than in an array. macOS ships bash 3.2, where
+# expanding an empty array under `set -u` is an unbound-variable error — so the obvious
+# `"${conditional[@]}"` aborts the probe on the very machine most likely to run it.
+# Positional parameters are special-cased and safe when empty.
+request() {
   curl --silent --show-error -o /dev/null -D - \
     -H "Accept: ${ACCEPT}" \
     -H "X-GitHub-Api-Version: ${API_VERSION}" \
     -H "User-Agent: ${USER_AGENT}" \
-    "${conditional[@]}" \
+    "$@" \
     "$URL" | tr -d '\r'
+}
+
+fetch() {
+  local etag="${1:-}"
+
+  if [ -n "$etag" ]; then
+    request -H "If-None-Match: ${etag}"
+  else
+    request
+  fi
 }
 
 etag_from() {
@@ -117,8 +128,8 @@ report() {
 
 echo "## Raw response headers"
 echo
-echo "Redacted in place, name kept: \`x-github-request-id\`, \`set-cookie\`. No response"
-echo "body was captured. No \`Authorization\` header was sent."
+echo "Redacted in place, name kept: \`x-github-request-id\`, \`set-cookie\`, \`x-runtime-rid\`."
+echo "No response body was captured. No \`Authorization\` header was sent."
 echo
 
 # The request headers are echoed alongside each response for a reason: a response dump on
