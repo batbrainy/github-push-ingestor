@@ -19,17 +19,20 @@ module Github
     class StateSummary < Data.define(
       :latest_run_at, :latest_run_id, :push_event_count,
       :pending_actor_count, :pending_repository_count,
-      :budget_resource, :budget_remaining, :budget_reset_at, :window_status
+      :budget_resource, :budget_remaining, :budget_reset_at, :window_status,
+      :source_present, :next_poll_at, :global_blocked_until
     )
       NONE_YET = "none yet".freeze
       NO_LEDGER = "not yet initialized".freeze
       UNKNOWN_REMAINING = "unknown (window uninitialized)".freeze
+      NO_SOURCE = "not yet provisioned".freeze
+      DUE_NOW = "due now".freeze
+      NO_BLOCK = "none".freeze
 
-      def self.capture
+      def self.capture(now: Time.current)
         latest_run_at, latest_run_id = IngestionRun.latest_successful.pick(:completed_at, :run_id)
-        resource, remaining, reset_at, window_status =
-          GithubApiBudget.where(id: GithubApiBudget::SINGLETON_ID)
-                         .pick(:resource, :remaining, :reset_at, :window_status)
+        budget = GithubApiBudget.find_by(id: GithubApiBudget::SINGLETON_ID)
+        event_source = EventSource.order(:id).first
 
         new(
           latest_run_at: latest_run_at, latest_run_id: latest_run_id,
@@ -40,10 +43,24 @@ module Github
           # pending/skipped split arrives with PR 10's /status.
           pending_actor_count: GithubActor.enrichment_candidates.count,
           pending_repository_count: GithubRepository.enrichment_candidates.count,
-          budget_resource: resource, budget_remaining: remaining, budget_reset_at: reset_at,
-          window_status: window_status
+          budget_resource: budget&.resource, budget_remaining: budget&.remaining,
+          budget_reset_at: budget&.reset_at, window_status: budget&.window_status,
+          source_present: !event_source.nil?,
+          next_poll_at: next_poll_at(event_source, budget, now: now),
+          global_blocked_until: budget&.global_blocked_until
         )
       end
+
+      # §9's unforced answer, the one the operator's next command will be judged against.
+      # A pure computation over two rows that were read anyway, so the class keeps its
+      # structural guarantee: no executor, no transport, no ledger, and nothing that
+      # writes.
+      def self.next_poll_at(event_source, budget, now:)
+        return nil if event_source.nil?
+
+        PollSchedule.for(event_source: event_source, budget: budget, now: now).effective_poll_time
+      end
+      private_class_method :next_poll_at
 
       # §9's block, and the reason every "unknown" below is spelled out rather than printed
       # as 0: §16 forbids a misleading guarantee, and a fabricated zero on a fresh install is
@@ -54,16 +71,50 @@ module Github
           Report.line("Persisted push events", Report.count(push_event_count)),
           Report.line("Pending actor enrichments", Report.count(pending_actor_count)),
           Report.line("Pending repository enrichments", Report.count(pending_repository_count)),
-          Report.line("Budget remaining (#{budget_resource || "core"})", budget)
+          # Two scheduling lines, and no more. The busy path is what earns them: on
+          # Errors::SourceBusy no run happened, so there is no deferral line at all and
+          # this block is the only place a reviewer can learn when the next poll is or why
+          # nothing is moving. §11 assigns the per-class counters, the coverage formulas,
+          # and the individual scheduling components to PR 10's /status.
+          Report.line("Next poll due", next_poll),
+          Report.line("Budget remaining (#{budget_resource || "core"})", budget),
+          Report.line("Global block", global_block)
         ].join("\n")
       end
 
       def to_log
         to_h.merge(latest_run_at: Report.timestamp(latest_run_at),
-                   budget_reset_at: Report.timestamp(budget_reset_at)).compact
+                   budget_reset_at: Report.timestamp(budget_reset_at),
+                   next_poll_at: Report.timestamp(next_poll_at),
+                   global_blocked_until: Report.timestamp(global_blocked_until)).compact
       end
 
       private
+
+      # A source that has never been polled has five nil components, so nil means "no
+      # constraint applies" rather than "unknown" — the same meaning it carries in
+      # PollSchedule, spelled out here so the reviewer does not have to infer it.
+      def next_poll
+        return NO_SOURCE unless source_present
+        return DUE_NOW if next_poll_at.nil?
+
+        Report.timestamp(next_poll_at)
+      end
+
+      # Reported separately from window_status because the two answer different questions:
+      # a block can outlive the window that produced it, and BudgetLedger derives blocking
+      # from this timestamp alone precisely so an expired label can never strand the row.
+      # Without this line, a window_status of globally_blocked has no explanation on
+      # stdout.
+      def global_block
+        return NO_BLOCK if global_blocked_until.nil?
+
+        "until #{Report.timestamp(global_blocked_until)}"
+      end
+
+      def no_source?
+        !EventSource.exists?
+      end
 
       def latest_run
         return NONE_YET if latest_run_at.nil?

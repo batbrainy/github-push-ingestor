@@ -24,13 +24,16 @@ RSpec.describe Github::Ingestion::SourceProvisioner do
       expect(described_class.ensure!(mode: :live).id).to eq(first.id)
     end
 
+    # "failed" rather than any other value on purpose: it is the one status an operator has
+    # to clear by hand (§10), so provisioning silently resetting it would put a source
+    # someone took out of service straight back into rotation.
     it "never changes a row it did not create" do
-      existing = create_event_source(source_type: "github_public_events", status: "polling",
+      existing = create_event_source(source_type: "github_public_events", status: "failed",
                                      configuration: { "endpoint" => "/events" })
 
       described_class.ensure!(mode: :live)
 
-      expect(existing.reload).to have_attributes(status: "polling",
+      expect(existing.reload).to have_attributes(status: "failed",
                                                  configuration: { "endpoint" => "/events" })
     end
 

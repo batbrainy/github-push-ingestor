@@ -40,11 +40,19 @@ module Github
 
       REFUSING_ERRORS = [ Errors::ConfigurationError, Errors::FixtureMiss, Errors::FixtureCorpusError ].freeze
 
-      # The two denial reasons the ledger's window reset genuinely governs: both clear when
-      # the counters and remaining are refreshed for the next window. The ledger's other two
-      # reasons do not — :globally_blocked clears on global_blocked_until, and
-      # :window_uninitialized is enrichment-only and unreachable from a poll.
-      RESET_BACKED_REASONS = %w[ class_allowance_exhausted reserve_reached ].freeze
+      # §9's instant comes from effective_poll_time, which the runner computes and puts on
+      # its Result — so this class names T for every reason but two.
+      #
+      # A held gate has no instant at all: it clears when whoever holds it lets go, and
+      # naming a time would be a confident wrong answer.
+      NO_INSTANT_REASONS = %w[ gate_unavailable ].freeze
+      # :reserve_reached is a ledger denial reflecting GitHub's own `remaining`, not a term
+      # of §9's formula — so effective_poll_time can sit in the past while the ledger still
+      # refuses, and the window reset is the honest instant. Making the reserve a
+      # scheduling component was the tempting simplification and is wrong: a co-tenant's
+      # window rolling can clear it at any moment, so it has no stable instant to schedule
+      # against.
+      RESET_BACKED_REASONS = %w[ reserve_reached ].freeze
 
       BUSY_MESSAGE = "source busy — poller cycle in progress".freeze
 
@@ -54,13 +62,16 @@ module Github
         Runs one ingestion cycle against the configured event source, then prints what it
         did and the persisted state of the system.
 
-            --force      Ignore the configured poll cadence and the stored ETag.
-                         No effect yet: cadence gating and ETag reuse land with the
-                         poller (IMPLEMENTATION_PLAN.md §13, PR 6).
+            --force      Ignore the configured poll cadence and omit the stored ETag.
+                         Nothing else: it does not bypass the source lock, GitHub's
+                         X-Poll-Interval floor, this source's own backoff, a global
+                         block, the poll class allowance, or the reserve
+                         (IMPLEMENTATION_PLAN.md §9).
             -h, --help   Print this message.
 
         Exit codes:
-            0  ran, or deferred — source busy, budget spent, gate held, rate limited
+            0  ran, or deferred — not yet due, source busy, budget spent, gate held,
+               rate limited, globally blocked
             1  the attempt failed
             2  refused to run — bad option, bad configuration, or a corpus gap
       TEXT
@@ -92,7 +103,12 @@ module Github
         result = @runner.call(event_source: event_source,
                               wait_seconds: @configuration.source_lock_wait_seconds, force: force)
 
-        report(result.tally) { |summary| outcome_line(result, summary) }
+        # No counters on a deferral. Nothing was fetched, so seven zeroes would suggest a
+        # run that produced nothing rather than a run that never happened — and under a
+        # five-minute cadence a deferral is the *common* outcome of this command, not an
+        # unusual one. A run truncated partway through a page walk is `completed`, not
+        # deferred, so it keeps its counts.
+        report(result.deferred? ? nil : result.tally) { |summary| outcome_line(result, summary) }
         Result.new(outcome: result.status.to_sym, exit_code: result.failed? ? FAILURE : SUCCESS)
       rescue Errors::SourceBusy
         # §9's wording, verbatim. No run row exists — the runner opens one inside the lock —
@@ -131,19 +147,26 @@ module Github
         end
       end
 
-      # §9's line is "Ingestion deferred until T", where T comes from effective_poll_time.
-      # PR 5 has no cadence to defer against, so the only instant it can honestly name is the
-      # one the ledger already knows — and only for the reasons that instant actually governs.
+      # §9's line is "Ingestion deferred until T", where T comes from effective_poll_time —
+      # computed by the runner against the same `force` the run used, so a forced run can
+      # never print an unforced instant.
       #
-      # A held gate has no instant at all; a secondary limit clears on a Retry-After and a
-      # global block on global_blocked_until, neither of which PR 5 persists (PR 6 owns both).
-      # Printing the window reset beside any of those would be a confident wrong answer, which
-      # is worse than printing no answer, so those deferrals state the reason alone.
+      # An instant is printed only when one is both known and still in the future. A
+      # constraint that has already passed while another still holds — a spent cadence
+      # under a live global block, say — would otherwise print a time in the past, which
+      # reads as a bug rather than as information.
       def deferred_line(result, summary)
-        reset_at = Report.timestamp(summary.budget_reset_at) if reset_backed?(result)
-        until_clause = reset_at ? " until #{reset_at}" : ""
+        instant = Report.timestamp(deferred_until(result, summary))
+        until_clause = instant ? " until #{instant}" : ""
 
         "Ingestion deferred#{until_clause} — #{result.deferral_reason}"
+      end
+
+      def deferred_until(result, summary)
+        return nil if NO_INSTANT_REASONS.include?(result.deferral_reason)
+        return summary.budget_reset_at if reset_backed?(result)
+
+        result.next_poll_at
       end
 
       def reset_backed?(result)

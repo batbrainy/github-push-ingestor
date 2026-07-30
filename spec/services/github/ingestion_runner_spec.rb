@@ -88,7 +88,10 @@ RSpec.describe Github::IngestionRunner do
   # reactivation occurs." A second transport instance restarts the scripted sequence, which
   # is a faithful model of a second one-shot process.
   describe "replaying the same page" do
-    let(:later) { frozen_time + 60 }
+    # Past the 300-second cadence the first run wrote, so the replay is genuinely due
+    # rather than deferred. §12's "duplicate poll results (fixture replay)" is about the
+    # write path absorbing duplicates, so the schedule must not be what stops it.
+    let(:later) { frozen_time + 301 }
 
     before do
       ingest
@@ -137,13 +140,17 @@ RSpec.describe Github::IngestionRunner do
 
   # The default scenario's second scripted response is a 304 with the same ETag, so a single
   # transport reaching for page one twice models a long-lived process.
+  #
+  # The second call is one cadence later rather than forced: §9 makes --force omit the
+  # stored ETag, so a forced second poll would send no If-None-Match and the conditional
+  # request this group exists to prove would never happen.
   describe "a 304 from GitHub" do
     let(:transport) { fixture_transport }
+    let(:later) { frozen_time + 301 }
 
     let!(:result) do
-      runner = fixture_runner(transport: transport)
-      runner.call(event_source: event_source)
-      runner.call(event_source: event_source)
+      fixture_runner(transport: transport).call(event_source: event_source)
+      fixture_runner(transport: transport, now: later).call(event_source: event_source)
     end
 
     it "records the run as not modified rather than as a failure" do
@@ -164,11 +171,25 @@ RSpec.describe Github::IngestionRunner do
       expect(current_budget.poll_used).to eq(2)
     end
 
-    # PR 5 never reads or writes event_sources.etag — that is PR 6 — so the 304 handling has
-    # to exist before the conditional request does.
-    it "sent no conditional header, so this 304 came from the corpus script and not from us" do
-      expect(transport.requests.map { |request| request[:headers]["if-none-match"] }).to all(be_nil)
-      expect(event_source.reload.etag).to be_nil
+    # §9 scopes the persisted ETag to the canonical first-page request. The corpus scripts
+    # its responses positionally rather than by matching If-None-Match, so the corpus can
+    # never prove the conditional request happened — only the transport's recorded requests
+    # can, which is why the assertion is made there.
+    it "sends the ETag the first poll stored, so this 304 is ours and not the script's" do
+      etag = 'W/"3f2a1c9d0b7e4a58c1d2e3f4a5b6c7d8"'
+
+      expect(transport.requests.map { |request| request[:headers]["if-none-match"] })
+        .to eq([ nil, etag ])
+      expect(event_source.reload.etag).to eq(etag)
+    end
+
+    # §10 files a 304 under successful handling: the poll succeeded and GitHub reported
+    # nothing new, so the source is demonstrably healthy and the spent attempt moves the
+    # cadence on.
+    it "counts as a healthy poll and schedules the next one" do
+      expect(event_source.reload).to have_attributes(
+        last_success_at: later, cadence_due_at: later + 300, consecutive_failures: 0
+      )
     end
   end
 
@@ -184,39 +205,109 @@ RSpec.describe Github::IngestionRunner do
 
   # §10: a budget denial and a busy gate "never happened" — so they are deferrals, not
   # failures, and must not burn a healthy source's failure count.
-  describe "a budget denial" do
+  #
+  # An exhausted poll class is caught *before* the request now, because §9 lists
+  # poll_class_blocked_until among the scheduling components. That is strictly better than
+  # discovering it at the reservation: no lock work, no run row, no log line per tick. The
+  # ledger's denial path stays live for everything the schedule cannot see coming — a
+  # co-tenant spending the shared budget, a reserve breach, a class that runs out partway
+  # through a multi-page walk.
+  describe "an exhausted poll allowance" do
+    let(:transport) { fixture_transport }
+
     let!(:result) do
       active_budget_window(now: frozen_time, poll_used: 12, poll_allowance: 12)
       ingest(fixture_runner(transport: transport))
     end
 
-    let(:transport) { fixture_transport }
-
-    it "defers the run and names the denial condition" do
+    it "defers before asking, naming the component that holds the poll back" do
       expect(result).to be_deferred
-      expect(result.deferral_reason).to eq("class_allowance_exhausted")
-      expect(IngestionRun.sole).to be_deferred
+      expect(result.deferral_reason).to eq("poll_class_blocked_until")
+      expect(result.next_poll_at).to eq(current_budget.reset_at)
     end
 
-    # §11 makes run_id the correlation identifier for the whole flow, and a deferral is
-    # exactly the line an operator greps for when a run produced no events — so it must not
-    # be the one ingestion line that cannot be joined to its run.
-    it "correlates the deferral line with the run it belongs to" do
-      allow(Rails.logger).to receive(:info)
-      active_budget_window(now: frozen_time, poll_used: 12, poll_allowance: 12)
-
-      deferred = ingest(fixture_runner(transport: fixture_transport))
-
-      expect(Rails.logger).to have_received(:info).with(
-        hash_including(event: "ingestion.deferred", run_id: deferred.run_id,
-                       reason: "class_allowance_exhausted")
-      )
+    # A run row records a poll attempt, and no attempt was made — §7 calls the row "one
+    # polling cycle", and none happened.
+    it "opens no run row, because nothing tried to reach GitHub" do
+      expect(IngestionRun.count).to eq(0)
+      expect(result.run_id).to be_nil
     end
 
     it "spends nothing and writes no events" do
       expect(transport.requests).to be_empty
       expect(PushEvent.count).to eq(0)
       expect(current_budget.poll_used).to eq(12)
+    end
+
+    it "leaves the source's own scheduling state exactly as it was" do
+      expect(event_source.reload).to have_attributes(last_polled_at: nil, cadence_due_at: nil,
+                                                     consecutive_failures: 0)
+    end
+  end
+
+  # The ledger's own denial, reached when the schedule could not have known: GitHub's
+  # `remaining` has fallen to the reserve because something else behind this IP spent it.
+  describe "a budget denial from the ledger" do
+    let(:transport) { fixture_transport }
+
+    let!(:result) do
+      active_budget_window(now: frozen_time, remaining: 8, reserve: 8)
+      ingest(fixture_runner(transport: transport))
+    end
+
+    it "defers the run and names the denial condition" do
+      expect(result).to be_deferred
+      expect(result.deferral_reason).to eq("reserve_reached")
+      expect(IngestionRun.sole).to be_deferred
+    end
+
+    it "spends nothing and leaves the cadence alone, because the request never happened" do
+      expect(transport.requests).to be_empty
+      expect(current_budget.poll_used).to eq(0)
+      expect(event_source.reload).to have_attributes(cadence_due_at: nil, consecutive_failures: 0)
+    end
+
+    # §10 lists "usable budget has reached the global reserve" among the three conditions
+    # that stop *every* live request, so the denial does not merely fail this attempt — it
+    # records a block, and the next attempt is turned away before it asks.
+    it "blocks every live request until the window resets" do
+      expect(current_budget.global_blocked_until).to eq(current_budget.reset_at)
+
+      again = ingest(fixture_runner(transport: fixture_transport, now: frozen_time + 600))
+
+      expect(again.deferral_reason).to eq("global_blocked_until")
+      expect(IngestionRun.count).to eq(1)
+    end
+  end
+
+  # §11 makes run_id the correlation identifier for the whole flow, and a deferral is
+  # exactly the line an operator greps for when a run produced no events — so it must not
+  # be the one ingestion line that cannot be joined to its run.
+  describe "the deferral log line" do
+    it "carries the run_id of the run it belongs to" do
+      allow(Rails.logger).to receive(:info)
+      active_budget_window(now: frozen_time, remaining: 8, reserve: 8)
+
+      deferred = ingest(fixture_runner(transport: fixture_transport))
+
+      expect(Rails.logger).to have_received(:info).with(
+        hash_including(event: "ingestion.deferred", run_id: deferred.run_id,
+                       reason: "reserve_reached")
+      )
+    end
+
+    # A pre-flight deferral has no run to belong to, so it reports the source instead. The
+    # asymmetry is deliberate and is the observable half of "a run row exists iff the
+    # process tried to reach GitHub".
+    it "reports the source, not a run, when the poll was never attempted" do
+      allow(Rails.logger).to receive(:info)
+      ingest
+      ingest(fixture_runner(now: frozen_time + 60))
+
+      expect(Rails.logger).to have_received(:info).with(
+        hash_including(event: "ingestion.not_due", event_source_id: event_source.id,
+                       deferral_reason: :cadence_due_at)
+      )
     end
   end
 
@@ -315,20 +406,177 @@ RSpec.describe Github::IngestionRunner do
   # transport is called, no application transaction is open. A future refactor that wrapped
   # the run in one would otherwise fail only in production, where the example transaction
   # does not mask it.
-  it "holds no application transaction across the fetch" do
-    observed = nil
-    transport = fixture_transport
+  #
+  # Collected over every fetch of a multi-page walk rather than the last one: a scalar
+  # would describe only the final request, and the page a loop is most likely to wrap in a
+  # transaction is the second one, where the writer has already run.
+  it "holds no application transaction across any fetch, on any page" do
+    observed = []
+    transport = fixture_transport(scenario: "paginated")
+    configuration = configuration_with("MAX_PAGES_PER_POLL" => "3", "GITHUB_MODE" => "fixture")
     watching = Class.new do
       define_method(:get) do |url, headers: {}|
         transaction = ActiveRecord::Base.lease_connection.current_transaction
-        observed = transaction.open? && transaction.joinable?
+        observed << (transaction.open? && transaction.joinable?)
         transport.get(url, headers: headers)
       end
     end.new
 
-    ingest(fixture_runner(executor: fixture_executor(transport: watching)))
+    ingest(fixture_runner(configuration: configuration,
+                          executor: fixture_executor(transport: watching, ledger: ledger_for(configuration))))
 
-    expect(observed).to be(false)
+    expect(observed.size).to eq(3)
+    expect(observed).to all(be(false))
+  end
+
+  # §9's poll cadence. Nothing fires it on a schedule until PR 8 — this is the gate every
+  # caller passes through, whoever calls it.
+  describe "the poll cadence" do
+    let(:transport) { fixture_transport }
+
+    before { ingest(fixture_runner(transport: transport)) }
+
+    it "defers a second poll inside the cadence window without asking GitHub" do
+      result = ingest(fixture_runner(transport: transport, now: frozen_time + 60))
+
+      expect(result).to be_deferred
+      expect(result.deferral_reason).to eq("cadence_due_at")
+      expect(result.next_poll_at).to eq(frozen_time + 300)
+      expect(transport.requests.size).to eq(1)
+      expect(current_budget.poll_used).to eq(1)
+    end
+
+    it "opens no run row for a poll it decided not to make" do
+      expect { ingest(fixture_runner(transport: transport, now: frozen_time + 60)) }
+        .not_to change(IngestionRun, :count).from(1)
+    end
+
+    it "polls again once the cadence has elapsed" do
+      result = ingest(fixture_runner(transport: transport, now: frozen_time + 300))
+
+      expect(result).to be_not_modified
+      expect(current_budget.poll_used).to eq(2)
+    end
+  end
+
+  # §9: "--force bypasses the application's configured cadence (cadence_due_at) and omits
+  # the stored ETag — nothing else." Both halves, and then the four things it must not
+  # touch. PollSchedule's spec proves the same rule as a unit; these prove the wiring.
+  describe "--force" do
+    let(:transport) { fixture_transport }
+
+    before { ingest(fixture_runner(transport: transport)) }
+
+    it "polls inside the cadence window" do
+      result = ingest(fixture_runner(transport: transport, now: frozen_time + 60), force: true)
+
+      expect(result).not_to be_deferred
+      expect(transport.requests.size).to eq(2)
+    end
+
+    it "omits the stored ETag, so the poll is unconditional" do
+      ingest(fixture_runner(transport: transport, now: frozen_time + 60), force: true)
+
+      expect(transport.requests.map { |request| request[:headers]["if-none-match"] }).to all(be_nil)
+    end
+
+    it "does not bypass the poll allowance" do
+      active_budget_window(now: frozen_time, poll_used: 12, poll_allowance: 12)
+
+      result = ingest(fixture_runner(transport: transport, now: frozen_time + 60), force: true)
+
+      expect(result).to be_deferred
+      expect(result.deferral_reason).to eq("poll_class_blocked_until")
+    end
+
+    it "does not bypass a global block" do
+      current_budget.update!(global_blocked_until: frozen_time + 1800)
+
+      result = ingest(fixture_runner(transport: transport, now: frozen_time + 60), force: true)
+
+      expect(result).to be_deferred
+      expect(result.deferral_reason).to eq("global_blocked_until")
+    end
+
+    it "does not bypass GitHub's own poll floor" do
+      # The corpus sends x-poll-interval: 60 on every response, so the first run already
+      # wrote one.
+      result = ingest(fixture_runner(transport: transport, now: frozen_time + 30), force: true)
+
+      expect(result).to be_deferred
+      expect(result.deferral_reason).to eq("poll_floor_until")
+    end
+
+    # SourceLock.acquire wraps the call before `force` is ever read, so this holds by
+    # construction rather than by a check anyone could remove.
+    it "does not bypass the source lock" do
+      other_session_holding(Github::AdvisoryLock::SOURCE_LOCK_NAMESPACE,
+                            Github::AdvisoryLock.key_for(event_source.id)) do
+        expect { ingest(fixture_runner(transport: transport), force: true) }
+          .to raise_error(Github::Errors::SourceBusy)
+      end
+    end
+  end
+
+  # §9's Link-driven walk, end to end and offline. The page-loop spec covers the stop
+  # conditions; this proves the runner threads one tally, one run row, and one poll-state
+  # write across all three pages.
+  describe "a multi-page poll" do
+    let(:configuration) { configuration_with("MAX_PAGES_PER_POLL" => "3", "GITHUB_MODE" => "fixture") }
+
+    let!(:result) do
+      ingest(fixture_runner(transport: fixture_transport(scenario: "paginated"),
+                            configuration: configuration))
+    end
+
+    it "records every page in one run" do
+      expect(result).to be_completed
+      expect(result.tally.to_h).to include(pages_fetched: 3, events_received: 11, events_created: 6,
+                                           duplicates_skipped: 1)
+      expect(IngestionRun.sole).to have_attributes(pages_fetched: 3, events_created: 6)
+    end
+
+    it "debits one poll attempt per page" do
+      expect(current_budget.poll_used).to eq(3)
+    end
+  end
+
+  # §9's persisted poll state, per terminal outcome. PollState's own spec covers the write
+  # matrix; these are the two ends of the wire.
+  describe "persisted poll state" do
+    it "records the schedule, the ETag, and the server floor after a healthy poll" do
+      ingest
+
+      expect(event_source.reload).to have_attributes(
+        last_polled_at: frozen_time, last_success_at: frozen_time,
+        cadence_due_at: frozen_time + 300, poll_floor_until: frozen_time + 60,
+        etag: 'W/"3f2a1c9d0b7e4a58c1d2e3f4a5b6c7d8"', consecutive_failures: 0,
+        retry_not_before_at: nil, next_poll_at: frozen_time + 300, status: "idle"
+      )
+    end
+
+    it "blocks globally and defers the source when GitHub reports the limit exhausted" do
+      ingest(fixture_runner(transport: fixture_transport(scenario: "rate_limited")))
+
+      expect(current_budget.global_blocked_until).to eq(frozen_time + 3600)
+      expect(event_source.reload).to have_attributes(consecutive_failures: 0,
+                                                     cadence_due_at: frozen_time + 300)
+    end
+
+    it "blocks globally from Retry-After on a secondary limit, and defers this source too" do
+      ingest(fixture_runner(transport: fixture_transport(scenario: "secondary_rate_limited")))
+
+      expect(current_budget.global_blocked_until).to eq(frozen_time + 60)
+      expect(event_source.reload).to have_attributes(retry_not_before_at: frozen_time + 60,
+                                                     consecutive_failures: 0)
+    end
+
+    it "counts a failure and backs off after a server error outlives its retries" do
+      ingest(fixture_runner(transport: fixture_transport(scenario: "transient_failure_exhausted")))
+
+      expect(event_source.reload).to have_attributes(consecutive_failures: 1, last_success_at: nil)
+      expect(event_source.retry_not_before_at).to be >= frozen_time + 60
+    end
   end
 
   describe "an unexpected error" do

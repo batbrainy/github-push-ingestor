@@ -33,7 +33,7 @@ RSpec.describe Github::Ingestion::Tally do
       expect(tally.events_received).to eq(8)
     end
 
-    it "accumulates across pages, so PR 6's page loop needs no change here" do
+    it "accumulates across pages, which is what the page loop threads through the writer" do
       tally = empty.record_page(events_received: 8).record_page(events_received: 3)
 
       expect(tally.pages_fetched).to eq(2)

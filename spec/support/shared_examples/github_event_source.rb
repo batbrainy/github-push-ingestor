@@ -38,9 +38,9 @@ RSpec.shared_examples "a GitHub event source" do
     expect(source.first_page_request(etag: 'W/"abc"').headers).to include("If-None-Match" => 'W/"abc"')
   end
 
-  # The pagination seam: PR 6 calls this with a URL from a Link header, and one
+  # The pagination seam: Github::Ingestion::PageLoop calls this with a URL from a Link header, and one
   # primitive serves both without a contract change.
-  it "builds a request for any URL it is handed, which is how PR 6 will paginate" do
+  it "builds a request for any URL it is handed, which is how the page loop paginates" do
     request = source.request_for("#{source.first_page_url}&page=2")
 
     expect(request.url).to end_with("page=2")

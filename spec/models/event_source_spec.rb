@@ -64,6 +64,51 @@ RSpec.describe EventSource do
     end
   end
 
+  # Two values, and the elimination is the point. Whether a poll is in flight is the source
+  # advisory lock's answer — authoritative and crash-safe, which a status column is not.
+  # When the next poll is due is effective_poll_time's, derived from four independent
+  # columns; storing a "deferred" beside them would be the collapsed timestamp §9 forbids.
+  # How badly a source is failing is consecutive_failures'. What is left is the one thing
+  # nothing else expresses: why a source is out of service.
+  describe "the poll state machine" do
+    it "accepts the status the provisioner has always written" do
+      expect(create_event_source(status: "idle")).to be_idle
+    end
+
+    # §10: "/events returns permanent 4xx → source failed/disabled". Terminal on first
+    # occurrence, and cleared by an operator rather than automatically — nothing in the
+    # plan defines a transition back, and inventing one would silently re-enable a source
+    # a human took out.
+    it "records a source taken out of service by a permanent client error" do
+      expect(create_event_source(status: "failed")).to be_failed
+    end
+
+    # `validate: true` on the enum, so an unknown value is a validation failure rather than
+    # the ArgumentError a bare Rails enum raises — matching IngestionRun and
+    # GithubApiBudget, and keeping an invalid assignment recoverable instead of fatal.
+    it "refuses a status outside the vocabulary" do
+      expect { create_event_source(status: "polling") }
+        .to raise_error(ActiveRecord::RecordInvalid, /Status is not included/)
+    end
+
+    # The validation is the guard for application writes; the constraint is the guard for
+    # everything else, matching the two vocabularies already in this schema
+    # (github_api_budget.window_status and the enrichment_status of both entity tables).
+    it "refuses one at the database too, where a validation cannot reach" do
+      expect_violation(ActiveRecord::StatementInvalid) do
+        described_class.insert!(event_source_attributes.merge(status: "polling"))
+      end
+    end
+
+    # enabled means an operator turned this off; status means the system took it out of
+    # service. Two representations of "off" would be the drift trap, so they stay distinct.
+    it "keeps `enabled` as a separate question from `status`" do
+      source = create_event_source(status: "failed")
+
+      expect(source).to be_enabled
+    end
+  end
+
   describe "database constraints" do
     it "requires a source type and a status" do
       %i[source_type status].each do |column|

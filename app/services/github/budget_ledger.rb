@@ -4,13 +4,14 @@ module Github
   # transactionally *before* execution, because the unauthenticated limit is keyed to
   # the outbound IP rather than to any one event source.
   #
-  # The division of labour with PR 6 is: **the ledger enforces, the policy decides.**
-  # This class refuses a reservation it has no capacity for, and it reads
-  # global_blocked_until — but it never sets that column, never derives
-  # poll_class_blocked_until for scheduling, and never handles a secondary limit. All
-  # of that is PR 6 (§13). Fairness shares between actors and repositories are PR 7;
-  # PR 4 maintains actor_share_used and repository_share_used accurately so PR 7 adds
-  # predicates over data that is already correct, with no back-fill.
+  # The division of labour is: **the ledger enforces and records, the policy decides.**
+  # This class refuses a reservation it has no capacity for, and it is the only writer of
+  # github_api_budget — but *which* condition warrants a global block, and until when, is
+  # Github::RateLimitPolicy's call, and it is the only caller of #block_globally!.
+  # Scheduling reads nothing from here beyond two columns: class blocking is derived on
+  # GithubApiBudget itself. Fairness shares between actors and repositories are PR 7;
+  # actor_share_used and repository_share_used are maintained accurately here so PR 7
+  # adds predicates over data that is already correct, with no back-fill.
   #
   # Three properties this class exists to hold:
   #
@@ -122,6 +123,29 @@ module Github
        WHERE id = ?
     SQL
 
+    # GREATEST here relies on the same PostgreSQL NULL behaviour DEBIT_SQL's comment warns
+    # about, but as the feature rather than the hazard: with no block stored, GREATEST
+    # ignores the NULL and takes the new instant; with one stored, it takes the later of
+    # the two. **A block can only ever move later.** Without that, a 60-second secondary
+    # limit landing after an hour-long primary exhaustion would shorten it, and the
+    # application would resume polling into a quota that is provably at zero and spend the
+    # rest of the window collecting 403s. The global gate orders *requests*, not the
+    # post-response writes that follow them, so that ordering is reachable.
+    #
+    # COALESCE on window_status keeps the label's fate in the policy's hands without a
+    # boolean bind: nil leaves it alone.
+    #
+    # lock_version is bumped by hand for the reason DEBIT_SQL gives — this is not an
+    # Active Record save, and a stale in-memory row must still raise StaleObjectError
+    # rather than clobber the counters.
+    BLOCK_SQL = <<~SQL.squish
+      UPDATE github_api_budget
+         SET global_blocked_until = GREATEST(global_blocked_until, ?),
+             window_status = COALESCE(?, window_status),
+             lock_version = lock_version + 1, updated_at = ?
+       WHERE id = ?
+    SQL
+
     def initialize(configuration: Github.configuration)
       @configuration = configuration
     end
@@ -228,7 +252,57 @@ module Github
       )
     end
 
+    # §10's three truly-global conditions — primary exhaustion, the reserve being reached,
+    # and a secondary rate limit — recorded so every live request stops until the instant
+    # passes. Enrichment has no source row to defer, and a secondary limit is IP-scoped
+    # and can arise on an enrichment request, which is why this is global rather than
+    # per-source (Appendix D item 2).
+    #
+    # It records; it does not decide. Github::RateLimitPolicy chooses the instant and the
+    # label, having read the response that justified them.
+    #
+    # Called after the request has returned and the gate has been released, never while
+    # holding it: the row lock taken here must stay the innermost lock in the system. A
+    # process holding it and then reaching for the gate, while another holds the gate and
+    # waits on this row, is a genuine cycle — PostgreSQL would abort one side, or the
+    # gate's lock_timeout would fire and report a gate that was never actually contended.
+    #
+    # @param until_at [Time] when live requests may resume
+    # @param reason [Symbol] :primary_rate_limit | :secondary_rate_limit | :reserve_reached
+    # @param window_status [String, nil] "globally_blocked", or nil to leave the label
+    #   untouched. See RateLimitPolicy for when each applies.
+    # @return [Symbol] :blocked, or :no_ledger when no row exists — this never creates one,
+    #   because a response arriving without a reservation would mean a request was made
+    #   without reserving.
+    def block_globally!(until_at:, reason:, window_status: nil, now: Time.current)
+      assert_committable!
+
+      uncached_transaction do
+        budget = GithubApiBudget.lock.find_by(id: SINGLETON_ID)
+        next :no_ledger if budget.nil?
+
+        apply_block!(budget, until_at: until_at, reason: reason,
+                             window_status: window_status, now: now)
+      end
+    end
+
     private
+
+    def apply_block!(budget, until_at:, reason:, window_status:, now:)
+      GithubApiBudget.connection.exec_update(
+        ActiveRecord::Base.sanitize_sql_array([ BLOCK_SQL, until_at, window_status, now, SINGLETON_ID ]),
+        "Github::BudgetLedger BlockGlobally"
+      )
+
+      # §11 lists "global_blocked_until set/cleared" among the budget state transitions
+      # that belong at INFO. The instant is the field an operator greps for when nothing
+      # is happening and nothing looks wrong.
+      Rails.logger.info(event: "budget.global_block_set", reason: reason,
+                        blocked_until: until_at.utc.iso8601,
+                        previous_blocked_until: budget.global_blocked_until&.utc&.iso8601,
+                        window_status: window_status || budget.window_status)
+      :blocked
+    end
 
     def assert_known_class!(request_class)
       return if DEBIT_SQL.key?(request_class)
@@ -288,7 +362,28 @@ module Github
               "a #{request_class} debit was rejected by the same guard that passed under the row lock"
       end
 
-      GithubApiBudget.find(SINGLETON_ID)
+      GithubApiBudget.find(SINGLETON_ID).tap { |budget| log_class_exhausted(budget, request_class) }
+    end
+
+    # §11 puts "class exhaustion" among the budget transitions that belong at INFO.
+    #
+    # Emitted from the debit that *reached* the allowance, not from denial_reason. A
+    # denial recurs on every attempt — under PR 8's recurring task that is a line a minute
+    # for the rest of the window, burying the stream §11 explicitly sizes. The debit that
+    # takes used to allowance happens exactly once per class per window, which is what a
+    # transition means.
+    def log_class_exhausted(budget, request_class)
+      used = class_used(budget, request_class)
+      allowance = class_allowance(budget, request_class)
+      return unless used == allowance
+
+      # reset_at, not a derived instant: this reports what the ledger knows. When it is
+      # nil the window has not been initialized, and the scheduler's own fallback — one
+      # cadence away — is GithubApiBudget#poll_class_blocked_until's business, not a
+      # number to guess at twice.
+      Rails.logger.info(event: "budget.class_exhausted", request_class: request_class,
+                        used: used, allowance: allowance, resource: budget.resource,
+                        reset_at: budget.reset_at&.utc&.iso8601)
     end
 
     # Clock-driven rollover: the stored window boundary has passed. Checked in reserve!
@@ -318,7 +413,24 @@ module Github
       )
 
       Rails.logger.info(event: "budget.window_rolled", carried_forward: carry_forward, **derived.to_log)
+      log_block_cleared(budget, now: now)
       GithubApiBudget.find(SINGLETON_ID)
+    end
+
+    # ROLL_WINDOW_SQL's CASE clears a block whose instant has passed and preserves one
+    # that outlives the window boundary. §11 asks for both halves of the transition, so
+    # the clearing half is reported here — this is the only path that clears.
+    #
+    # It logs the *write*, not the moment the block stopped biting: denial_reason derives
+    # blocking from the timestamp alone, so an expired block is already inert without any
+    # write at all. Emitting a synthetic event when the clock passed it would be inventing
+    # a transition nothing performed.
+    def log_block_cleared(budget, now:)
+      blocked_until = budget.global_blocked_until
+      return if blocked_until.nil? || blocked_until > now
+
+      Rails.logger.info(event: "budget.global_block_cleared",
+                        blocked_until: blocked_until.utc.iso8601, cleared_by: "window_rolled")
     end
 
     # Zeros unless a request is being carried into the new window, in which case its own
@@ -342,10 +454,16 @@ module Github
     def denial_reason(budget, request_class, now)
       if budget.global_blocked_until.present? && budget.global_blocked_until > now
         :globally_blocked
-      elsif enrichment?(request_class) && budget.window_status == "uninitialized"
+      elsif enrichment?(request_class) && budget.window_initialized_at.nil?
         # §7: enrichment is ineligible until the first real poll initializes the window
         # from authoritative headers. Another application behind the same IP may have
         # spent the budget the moment it reset, so 60 remaining is never assumed.
+        #
+        # Keyed on the fact rather than on window_status, because the label is no longer
+        # a two-valued flag: a globally blocked window that was never initialized would
+        # otherwise satisfy neither this guard nor :reserve_reached (remaining is NULL),
+        # and enrichment would spend its whole allowance blind the moment the block
+        # expired.
         :window_uninitialized
       elsif budget.remaining.present? && budget.remaining <= budget.reserve
         # The only condition that reflects GitHub's view rather than our own counters.
@@ -387,8 +505,20 @@ module Github
       true
     end
 
+    # Dispatches on reset_at rather than on window_status, and the difference is not
+    # cosmetic. window_status became a three-valued label once a global block could write
+    # "globally_blocked", and a block can land on a window that was never initialized — a
+    # 403 carrying only Retry-After is classified :secondary_limited, its snapshot is not
+    # quantitative?, so nothing here ever ran. Keying on the label then skipped this
+    # branch, fell past `snapshot.reset_at == budget.reset_at` (false against nil) and
+    # raised ArgumentError comparing a Time to nil — an error no rescue in the executor
+    # catches, and one nothing recovers from, because both rollover predicates require
+    # reset_at to be present.
+    #
+    # A NULL reset_at *is* what "uninitialized" means. window_status is a report for
+    # operators, never a dispatch key.
     def apply_observation(budget, snapshot, now:)
-      if budget.window_status == "uninitialized"
+      if budget.reset_at.nil?
         initialize_window!(budget, snapshot, now: now)
         :initialized
       elsif snapshot.reset_at == budget.reset_at

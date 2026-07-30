@@ -28,6 +28,16 @@ x-app-env: &app_env
   # would be worse than either setting.
   GITHUB_MODE: ${GITHUB_MODE:-live}
   GITHUB_FIXTURE_SCENARIO: ${GITHUB_FIXTURE_SCENARIO:-default}
+  # The four inputs to §10's allowance formula, forwarded so a reviewer can actually
+  # change them. Without these lines `MAX_PAGES_PER_POLL=3 docker compose run --rm ingest`
+  # sets the variable in the reviewer's shell and nothing at all inside the container, and
+  # the pagination walk the README documents cannot be reproduced. They belong in the
+  # shared anchor for the same reason GITHUB_MODE does: the formula must come out the same
+  # in every process, since one ledger serves all of them.
+  POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-300}
+  MAX_PAGES_PER_POLL: ${MAX_PAGES_PER_POLL:-1}
+  ENABLED_LIVE_SOURCE_COUNT: ${ENABLED_LIVE_SOURCE_COUNT:-1}
+  RATE_LIMIT_RESERVE: ${RATE_LIMIT_RESERVE:-8}
 
 services:
   db:

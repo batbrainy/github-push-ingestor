@@ -88,16 +88,18 @@ readable in one place.
 | Scenario | What it exercises |
 |---|---|
 | `default` | One page of events, then `304` with the same ETag forever. The reviewer scenario. |
-| `paginated` | `Link`-driven pagination: page 1 → page 2 → an empty page 3 (PR 6). |
-| `rate_limited` | `403` with `x-ratelimit-remaining: 0` — primary exhaustion (PR 6). |
-| `secondary_rate_limited` | `403` with `Retry-After` and quota remaining — a secondary limit (PR 6). |
+| `paginated` | `Link`-driven pagination: page 1 → page 2 → an empty page 3. Page 2 repeats page 1's first event on purpose, which is how the absence of a stop-on-known-event is proved. |
+| `paginated_final_page` | Page 1 → page 2, and page 2 carries no `Link` — the no-next-link stop, which `paginated` cannot show because its last page is empty first. |
+| `rate_limited` | `403` with `x-ratelimit-remaining: 0` — primary exhaustion, which blocks every live request until the window resets. |
+| `secondary_rate_limited` | `403` with `Retry-After` and quota remaining — a secondary limit, which blocks globally for the interval GitHub named. |
 | `transient_failure` | `500`, `500`, then `200`: two retries, each its own reservation. |
 | `transient_failure_exhausted` | `500` forever, so retries exhaust and the failure persists. |
 | `redirecting_repository` | `301` to a renamed repository, re-validated before it is followed. |
 | `hostile_redirect` | `301` off `api.github.com`, which `Github::UrlPolicy` must refuse. |
 
-Scenarios beyond `default` exist because §12 names them as corpus contents; PR 6 and PR 11
-are the PRs that consume most of them.
+Scenarios beyond `default` exist because §12 names them as corpus contents. The pagination
+and rate-limit ones are consumed by `Github::Ingestion::PageLoop` and
+`Github::RateLimitPolicy`; the redirect ones wait for PR 11.
 
 ## What is in `bodies/events/page-1.json`
 

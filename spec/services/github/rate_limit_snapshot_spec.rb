@@ -44,7 +44,7 @@ RSpec.describe Github::RateLimitSnapshot do
       expect(snapshot("x-ratelimit-reset" => "1785329520").reset_at).to eq(Time.zone.at(1_785_329_520))
     end
 
-    it "parses Retry-After, which PR 6 turns into a deferral" do
+    it "parses Retry-After, which the rate-limit policy turns into a global block" do
       expect(snapshot("retry-after" => "60").retry_after_seconds).to eq(60)
     end
   end

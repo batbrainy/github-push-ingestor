@@ -34,7 +34,8 @@ RSpec.describe Github::FetchResult do
       expect(fetched.location).to eq("https://api.github.com/x")
     end
 
-    # PR 6 parses Link into next/last. PR 4 only guarantees the raw value survives.
+    # Github::LinkHeader parses Link into next/last. This class only guarantees the raw
+    # value survives.
     it "carries the raw Link header through without parsing it" do
       link = '<https://api.github.com/events?page=2>; rel="next"'
 

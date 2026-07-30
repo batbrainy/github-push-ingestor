@@ -118,5 +118,21 @@ RSpec.describe "Core data model schema" do
         "cadence_due_at", "poll_floor_until", "retry_not_before_at", "next_poll_at"
       )
     end
+
+    # Every other status vocabulary in this schema carries both an `enum … validate: true`
+    # and a CHECK constraint. A NOT NULL column with no default and no constraint would
+    # make this table the sole exception.
+    it "constrains the poll status to its vocabulary" do
+      names = connection.check_constraints("event_sources").map(&:name)
+
+      expect(names).to include("event_sources_status_known")
+    end
+
+    # PR 8 adds the "which sources are due" query and should add the index that serves it
+    # in the same change, where its plan is checkable. Asserting the absence keeps that a
+    # visible decision rather than an oversight.
+    it "carries no index yet, because the query that would use one does not exist" do
+      expect(connection.indexes("event_sources")).to be_empty
+    end
   end
 end

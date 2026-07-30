@@ -10,24 +10,28 @@ and worker crashes.
 
 ## Status
 
-Ingestion stage (PR 5). The Rails 8.1 API, PostgreSQL, Docker Compose topology,
-health endpoints, and structured JSON logging landed in PR 2; the seven core
-tables and their idempotent write paths in PR 3; the chain every GitHub request
-flows through — request gate, class-aware budget ledger, SSRF URL policy, live and
-offline transports, fixture corpus, per-source advisory lock, event-source adapter
-— in PR 4.
+Poll budget and scheduling stage (PR 6). The Rails 8.1 API, PostgreSQL, Docker
+Compose topology, health endpoints, and structured JSON logging landed in PR 2; the
+seven core tables and their idempotent write paths in PR 3; the chain every GitHub
+request flows through — request gate, class-aware budget ledger, SSRF URL policy,
+live and offline transports, fixture corpus, per-source advisory lock, event-source
+adapter — in PR 4; the processor registry, the tolerant `PushEvent` parser, the
+quarantine taxonomy, the ingest transaction, and the one-shot command in PR 5.
 
-This stage closes the loop: **`docker compose run --rm ingest` fetches a page of
-public events and persists it.** It adds the processor registry and the tolerant
-`PushEvent` parser, the quarantine taxonomy with canonical fingerprints, the ingest
-transaction with its stub entity upserts and distinct-event activity gating, the
-ingestion-run summaries, and the one-shot command with the contention contract of
-plan §9.
+This stage makes a poll a **scheduled** act rather than an unconditional one. It
+adds `Link`-header pagination bounded by `MAX_PAGES_PER_POLL` and by the budget
+ledger, the page-one ETag and its conditional request, the five independent
+components behind `effective_poll_time`, `global_blocked_until` for the three
+conditions that must stop every live request, class blocking derived from the
+ledger's counters, and `Retry-After` handling for secondary limits. `--force` now
+does exactly what plan §9 says it does, and nothing else.
 
-**Polling is still manual.** Nothing runs on a schedule yet: the cadence,
-`Link`-header pagination and ETag reuse land in PR 6, and the always-on `worker`
-container in PR 8. Enrichment — filling in actor and repository details — is PR 7,
-so entities are persisted as stubs marked `pending`.
+**Nothing fires the schedule yet.** The cadence is real, but
+`docker compose run --rm ingest` is still the only thing that polls; the always-on
+`worker` container and its recurring task are PR 8. A one-shot run that is not yet
+due now reports the instant it becomes due instead of polling. Enrichment — filling
+in actor and repository details — is PR 7, so entities are persisted as stubs
+marked `pending`.
 
 Ingestion capabilities land PR by PR; each README section below is completed by
 the pull request that ships the capability it documents. The authoritative
@@ -88,8 +92,8 @@ docker compose down
 ## One-shot ingestion
 
 ```bash
-docker compose run --rm ingest                       # one cycle against live GitHub
-docker compose run --rm ingest --force               # see the note below
+docker compose run --rm ingest                       # one cycle against live GitHub, if one is due
+docker compose run --rm ingest --force               # ignore the cadence and the stored ETag
 docker compose run --rm ingest --help                # options and exit codes
 GITHUB_MODE=fixture docker compose run --rm ingest   # deterministic, no network
 ```
@@ -111,7 +115,9 @@ Latest successful run:            2026-07-30T14:34:12Z (run_id 2f5b9c3e-…)
 Persisted push events:            4
 Pending actor enrichments:        3
 Pending repository enrichments:   3
+Next poll due:                    2026-07-30T14:39:12Z
 Budget remaining (core):          59 (window resets 2026-07-30T15:34:12Z)
+Global block:                     none
 ```
 
 **The state summary prints on every path**, including the busy and failing ones —
@@ -126,13 +132,30 @@ budget ledger as every other process, so it can never blow the hourly budget.
 
 | Exit | Meaning |
 |---|---|
-| `0` | Ran, or deferred: source busy, poll allowance spent, request gate held, or GitHub reported a rate limit |
+| `0` | Ran, or deferred: not yet due, source busy, poll allowance spent, request gate held, a global block in force, or GitHub reported a rate limit |
 | `1` | The attempt failed — a transport failure, a non-success status after retries, or an unusable response body |
 | `2` | Refused to run: an unknown option, a configuration the process must not run with, or a gap in the fixture corpus |
 
-`--force` is accepted today and recorded on the run's log line, but it has **no
-effect yet**: what plan §9 says it bypasses — the configured poll cadence and the
-stored ETag — arrives with PR 6, and neither exists to bypass.
+A deferred run names the instant it becomes due, and which of plan §9's five
+constraints is holding it:
+
+```text
+Ingestion deferred until 2026-07-30T15:05:00Z — cadence_due_at
+```
+
+### What `--force` does, and what it does not
+
+`--force` bypasses **the configured poll cadence and the stored ETag, and nothing
+else** (plan §9). It does not bypass the source lock, GitHub's `X-Poll-Interval`
+floor, this source's own backoff, a global block, the poll class allowance, or the
+reserve — so a forced run can neither overspend the hourly budget nor poll faster
+than GitHub asks. It also omits `If-None-Match`, which is why a forced run can
+return a fresh `200` where an unforced one would have taken a `304`.
+
+The observable difference: without `--force`, a second run inside the cadence
+window prints `Ingestion deferred until … — cadence_due_at` and makes no request at
+all. With `--force`, it polls — and spends one of the twelve hourly poll attempts
+to do it.
 
 ### Deterministic verification
 
@@ -161,19 +184,130 @@ docker compose exec db psql -U postgres -d github_push_ingestor_development -c "
 #            4 |      3 |            3 |           3 |           3
 ```
 
-Run it a second time and nothing is created: the same page is absorbed as **4
-duplicates**, the three quarantine rows stay three rows with their occurrence
-counts at 2, and no entity's activity moves. Re-running ingestion is safe at any
-frequency — see [ADR 0005](docs/adr/0005-at-least-once-with-idempotent-writes.md).
+Run it again straight away and it does not poll at all — the first run set a cadence
+five minutes out, so the second reports
+`Ingestion deferred until … — cadence_due_at` and makes no request.
+
+To replay the page you need `--force`, and you need to wait about a minute:
+
+```bash
+sleep 60   # GitHub's X-Poll-Interval floor, which --force deliberately does not bypass
+GITHUB_MODE=fixture docker compose run --rm ingest --force
+```
+
+That wait is the demonstration, not an inconvenience. The corpus sends
+`x-poll-interval: 60` exactly as GitHub does, so the first run stored a server floor
+one minute out — and `--force` obeys it, reporting
+`Ingestion deferred until … — poll_floor_until` if you skip the wait. `--force`
+bypasses this application's cadence, never GitHub's floor.
+
+Once past it, nothing is created: the same page is absorbed as **4 duplicates**, the
+three quarantine rows stay three rows with their occurrence counts at 2, and no
+entity's activity moves. Re-running ingestion is safe at any frequency — see
+[ADR 0005](docs/adr/0005-at-least-once-with-idempotent-writes.md).
+
+### Pagination, offline
+
+The corpus also scripts a multi-page walk, so `Link`-driven pagination and its stop
+conditions are reproducible with no network:
+
+```bash
+GITHUB_MODE=fixture GITHUB_FIXTURE_SCENARIO=paginated MAX_PAGES_PER_POLL=3 \
+  docker compose run --rm ingest
+```
+
+```text
+Pages fetched:                    3
+Events seen:                      11
+Push events created:              6
+Duplicates skipped:               1
+Events quarantined:               3
+```
+
+Two things that look like accidents and are not. **The single duplicate is
+deliberate**: page 2 repeats page 1's first event, which is how the corpus proves
+plan §9's rule that every fetched page is processed in full and `github_event_id`
+uniqueness absorbs the overlap — there is no stop-on-known-event, because
+documented event latency is 30 seconds to 6 hours and a delayed event can surface
+beside one already seen. And **raising the cap is not free**: at
+`MAX_PAGES_PER_POLL=3` the poll allowance becomes 12 × 3 = 36 attempts an hour and
+enrichment drops from 40 to 60 − 8 − 36 = 16. That is plan §9's "raising it trades
+enrichment allowance for capture depth", as arithmetic.
+
+At `MAX_PAGES_PER_POLL=2` the counts are identical except `Pages fetched: 2` — page
+3 is empty — and the stop reason on the `ingestion.pagination_stopped` debug line
+changes from `empty_page` to `page_cap`.
+
+### Why a `304` costs a request here
+
+GitHub's events documentation states generally that `304` responses do not count
+against the rate limit; its REST best-practices documentation scopes that exemption
+to requests "correctly authorized with an `Authorization` header". This service
+sends no token, so the two statements disagree about exactly the population of
+requests it makes. A dated unauthenticated probe run under
+`X-GitHub-Api-Version: 2022-11-28` settles it for this configuration:
+`x-ratelimit-used` increments across a `304`. The transcript, with complete
+before-and-after headers and its own stated limits, is
+[`docs/evidence/2026-07-30-unauthenticated-304-quota-probe.md`](docs/evidence/2026-07-30-unauthenticated-304-quota-probe.md).
+
+So the ledger debits every outbound attempt, `304`s included, and the stored ETag
+is a bandwidth and correctness measure rather than a quota saver. The asymmetry
+justifies the choice: budgeting a `304` that turns out to be free wastes one
+attempt, while not budgeting one that is in fact charged overruns a sixty-request
+hour. The transcript claims nothing about authenticated requests — this project has
+no token and cannot test that case.
+
+### Expected time before records appear
+
+A push reaches the public feed with a documented latency of 30 seconds to 6 hours,
+and the default cadence polls every 5 minutes, so a given push may take hours to
+appear — or never, if it left the feed's 300-event window before a poll reached it.
+The feed retains 30 days. At `MAX_PAGES_PER_POLL=1` each poll sees at most the
+newest ~100 events, and the feed moves considerably faster than that. **This service
+samples the public feed rather than mirroring it**, and pagination deepens a single
+poll within the budget rather than backfilling: events that rolled out of the window
+while the service was down are not recoverable.
+
+### Recovering from a fixture rate-limit run
+
+The budget ledger is persisted and the corpus's rate-limit scenarios carry a real
+one-hour reset, so a single exploratory run leaves a genuine global block behind:
+
+```bash
+GITHUB_MODE=fixture GITHUB_FIXTURE_SCENARIO=rate_limited docker compose run --rm ingest
+```
+
+Every later request — in any scenario — is then deferred with `globally_blocked`
+until that hour elapses, and the `budget.global_block_set` log line names the
+instant. To clear it in development:
+
+```bash
+docker compose exec db psql -U postgres -d github_push_ingestor_development -c "
+  UPDATE github_api_budget
+     SET global_blocked_until = NULL, reset_at = NULL, remaining = NULL,
+         window_status = 'uninitialized'
+   WHERE id = 1;"
+```
 
 ### What a run logs
 
 At the default level (plan §11): `ingestion.run_started`,
 `ingestion.event_quarantined` — one per malformed event, carrying its GitHub event
-ID, classification and fingerprint — and `ingestion.run_completed` with every count.
-`LOG_LEVEL=debug` adds `github.request` and `ingestion.page_fetched`, plus a line
-per persisted, duplicate and ignored event. Every line carries the run's `run_id`,
-including the per-request ones.
+ID, classification and fingerprint — `ingestion.not_due` when a poll was not
+attempted, `ingestion.deferred` when GitHub or the ledger declined one,
+`ingestion.run_completed` with every count and the next poll instant, and the budget
+transitions `budget.window_initialized`, `budget.window_rolled`,
+`budget.class_exhausted`, `budget.global_block_set` and
+`budget.global_block_cleared`.
+
+`LOG_LEVEL=debug` adds `github.request`, `ingestion.page_fetched` and
+`ingestion.page_processed` per page, `ingestion.pagination_stopped` with its reason,
+`ingestion.not_modified` — which carries the `x-ratelimit-used` and
+`x-ratelimit-remaining` that make the `304` accounting visible in the running
+system — plus a line per persisted, duplicate and ignored event.
+
+Every line carries the run's `run_id`, except `ingestion.not_due`: a poll the
+schedule turned away opens no run, so it reports `event_source_id` instead.
 
 ## Environment variables
 
@@ -192,8 +326,8 @@ is [`.env.example`](.env.example).
 | `MAX_HTTP_RETRIES` | `2` | Retries after a 5xx or network timeout. Each retry is a fresh budget reservation (plan §10) |
 | `MAX_REDIRECTS` | `2` | Redirect hops followed per request, each re-validated and separately reserved |
 | `SOURCE_LOCK_WAIT_SECONDS` | `30` | How long the one-shot waits for a busy source lock; the poller attempts once (plan §9) |
-| `POLL_INTERVAL_SECONDS` | `300` | Allowance-formula input; already caps how many ingestion attempts an hour the ledger grants — one-shot runs included. Obeyed as the poll *cadence* from PR 6 |
-| `MAX_PAGES_PER_POLL` | `1` | Allowance-formula input. PR 5's ingestion fetches only the first page; the cap is enforced with `Link` pagination in PR 6 |
+| `POLL_INTERVAL_SECONDS` | `300` | The poll cadence, and an allowance-formula input. A source polled at T is due again at T + this; an unforced run before then is deferred rather than made. Nothing fires the cadence automatically until PR 8 (plan §9, §10) |
+| `MAX_PAGES_PER_POLL` | `1` | How many `Link`-followed pages one poll may fetch, and an allowance-formula input. Raising it trades enrichment allowance for capture depth: at `3` the poll allowance becomes 36 attempts an hour and enrichment drops to 16 (plan §9, §10) |
 | `ENABLED_LIVE_SOURCE_COUNT` | `1` | Allowance-formula input: live sources sharing one per-IP budget |
 | `RATE_LIMIT_RESERVE` | `8` | Requests per hour left deliberately unspent (plan §10) |
 
@@ -228,23 +362,39 @@ one-shot — takes one chain, and nothing outside it calls GitHub
 (`IMPLEMENTATION_PLAN.md` §5, §10):
 
 ```text
-IngestionRunner ──► SourceLock ──┐
-                                 ├──► RequestExecutor ──► RequestGate
-[enrichment]  ───────────────────┘                   ──► BudgetLedger.reserve!
-                                                     ──► UrlPolicy
-                                                     ──► Transport (Faraday | Fixture)
-                                                              │
-                                                              ▼
-                                             PageWriter: one transaction per event
-                                             stub upserts → INSERT … ON CONFLICT
-                                             DO NOTHING RETURNING id → activity
-                                             updates only when a row returned
+IngestionRunner ──► SourceLock ──► PollSchedule (due? — five components, §9)
+                                 │
+                                 ├──► PageLoop ──► RequestExecutor ──► RequestGate
+[enrichment]  ───────────────────┘      │ ▲                        ──► BudgetLedger.reserve!
+                                        │ │                        ──► UrlPolicy
+                                        │ └── LinkHeader.next_url  ──► Transport (Faraday | Fixture)
+                                        │                                   │
+                                        │                                   ▼
+                                        │                  PageWriter: one transaction per event
+                                        │                  stub upserts → INSERT … ON CONFLICT
+                                        │                  DO NOTHING RETURNING id → activity
+                                        │                  updates only when a row returned
+                                        ▼
+                              RateLimitPolicy ──► BudgetLedger#block_globally!
+                                        │
+                                        ▼
+                              PollState: the event_sources write
 ```
 
 - **`Github::IngestionRunner`** owns one polling operation: it holds the source lock
-  across the whole cycle, opens the `ingestion_runs` row inside that lock, fetches with no
-  transaction open — a database transaction must never span network I/O — and hands the
-  decoded page to the writer.
+  across the whole cycle, decides *inside* that lock whether a poll is due at all, opens
+  the `ingestion_runs` row only if one is, and fetches with no transaction open — a
+  database transaction must never span network I/O. A poll it turns away writes nothing:
+  a run row exists if and only if the process tried to reach GitHub.
+- **`Github::PollSchedule`** is §9's rule as a value — the maximum of `cadence_due_at`,
+  `poll_floor_until`, `retry_not_before_at`, `global_blocked_until` and a derived
+  `poll_class_blocked_until`. Five independent components rather than one collapsed
+  timestamp, so `--force` can drop exactly one of them and a routine `X-RateLimit-Reset`
+  cannot defer every poll to the top of the hour ([ADR 0006](docs/adr/0006-decomposed-poll-deferral-state.md)).
+- **`Github::Ingestion::PageLoop`** follows `rel="next"` until the page cap, a denied
+  reservation, an absent `Link`, or an empty page — and never because it recognised an
+  event. Each page's events are written before the next is fetched, so no transaction is
+  ever open across a request.
 - **`Github::SourceLock`** is a session advisory lock owning one event source for a whole
   polling operation. Enrichment requests belong to no source and never take it. The
   lock-order invariant — source lock, then gate, never the reverse — is enforced at
@@ -255,7 +405,13 @@ IngestionRunner ──► SourceLock ──┐
 - **`Github::BudgetLedger`** debits before the request is issued, per class. Failures stay
   spent, reconciliation against response headers is monotonic within a rate-limit window,
   and the first poll of each window bootstraps it from authoritative headers rather than
-  spending an extra request to discover the quota.
+  spending an extra request to discover the quota. It is also the only writer of
+  `global_blocked_until`, which only ever moves later.
+- **`Github::RateLimitPolicy`** decides *which* response warrants a global block and until
+  when — primary exhaustion to the reset GitHub named, a reserve breach to the same, a
+  secondary limit to `Retry-After` clamped between one minute and one hour. Class
+  exhaustion deliberately writes nothing there: it is derived from the counters, so
+  polling running out never stops enrichment and vice versa.
 - **`Github::UrlPolicy`** is the SSRF boundary. It rebuilds every URL from validated
   components, and a URL that arrived inside a GitHub payload or a `Link` header always
   clears the full live policy first.
@@ -269,11 +425,15 @@ IngestionRunner ──► SourceLock ──┐
   persisted beside it. Quarantine writes stand outside any transaction, and entity activity
   updates happen only when the insert actually returned a row, so a re-polled page refreshes
   identity fields but registers no new activity.
+- **`Github::Ingestion::PollState`** makes the one `event_sources` write per run, inside
+  the source lock. Its rule: the scheduling components move only when a poll attempt
+  actually happened, so a budget denial or a held gate can neither advance the cadence nor
+  burn a healthy source's failure count.
 
 Decisions behind this are recorded in
 [`docs/adr/`](docs/adr/): advisory locks and the gate (0002), the source and transport
-seams (0003), the class-aware ledger (0004), and at-least-once processing with idempotent
-writes (0005).
+seams (0003), the class-aware ledger (0004), at-least-once processing with idempotent
+writes (0005), and decomposed poll deferral state (0006).
 
 ## Planned contents
 
@@ -281,9 +441,7 @@ writes (0005).
 |---|---|
 | Enrichment flow | PR 7 |
 | Data model reference | PR 12 (design brief) |
-| Continuous ingestion behavior and expected time before records appear | PR 6, 8 |
-| Cadence gating and ETag reuse — when `--force` becomes observable and "deferred until T" comes from `effective_poll_time` | PR 6 |
-| Rate-limit behavior: allowance formula, budget table, global-vs-class blocking, per-window bootstrap | PR 6 |
+| Continuous ingestion behavior — what the always-on poller does on a schedule | PR 8 |
 | Full fixture scenario matrix (retries, rate limits, redirects) | PR 11 |
 | API and database inspection examples | PR 10, 12 |
 | Crash-recovery verification (container kills) | PR 11, 12 |

@@ -20,7 +20,8 @@ module Github
     # for the same shape from the other direction: its durability boundary is per event ("an
     # event is accepted only after its push_events row is committed") and step 9 calls the
     # transaction "short-lived — the advisory lock, not the transaction, spans the HTTP
-    # work". It also keeps PR 6 additive: no transaction is ever open across a fetch, so a
+    # work". It is also what makes a page loop possible at all: no transaction is ever open
+    # across a fetch, so a
     # Link-driven page loop needs no change here.
     #
     # What that gives up is page-level atomicity, and nothing needs it — github_event_id

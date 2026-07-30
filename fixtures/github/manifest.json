@@ -133,6 +133,33 @@
         ]
       }
     },
+    "paginated_final_page": {
+      "inherit": "default",
+      "responses": {
+        "/events?per_page=100": [
+          {
+            "status": 200,
+            "body": "events/page-1.json",
+            "headers": {
+              "etag": "W/\"3f2a1c9d0b7e4a58c1d2e3f4a5b6c7d8\"",
+              "x-ratelimit-remaining": "59",
+              "x-ratelimit-used": "1",
+              "link": "<https://api.github.com/events?per_page=100&page=2>; rel=\"next\""
+            }
+          }
+        ],
+        "/events?page=2&per_page=100": [
+          {
+            "status": 200,
+            "body": "events/page-2.json",
+            "headers": {
+              "x-ratelimit-remaining": "58",
+              "x-ratelimit-used": "2"
+            }
+          }
+        ]
+      }
+    },
     "rate_limited": {
       "inherit": "default",
       "responses": {

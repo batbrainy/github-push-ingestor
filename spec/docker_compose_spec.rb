@@ -50,5 +50,34 @@ RSpec.describe "docker-compose.yml" do
       expect(ingest.fetch("environment")).to include("GITHUB_MODE")
       expect(ingest.fetch("environment").fetch("GITHUB_MODE")).to eq("${GITHUB_MODE:-live}")
     end
+
+    # Without these, `MAX_PAGES_PER_POLL=3 docker compose run --rm ingest` sets a variable
+    # in the reviewer's shell and nothing at all inside the container, and the pagination
+    # walk the README documents cannot be reproduced. They are in the shared anchor for the
+    # same reason GITHUB_MODE is: §10's formula must come out the same in every process,
+    # because one ledger serves all of them.
+    it "forwards §10's allowance-formula inputs, so the documented overrides actually work" do
+      environment = ingest.fetch("environment")
+
+      expect(environment).to include(
+        "POLL_INTERVAL_SECONDS" => "${POLL_INTERVAL_SECONDS:-300}",
+        "MAX_PAGES_PER_POLL" => "${MAX_PAGES_PER_POLL:-1}",
+        "ENABLED_LIVE_SOURCE_COUNT" => "${ENABLED_LIVE_SOURCE_COUNT:-1}",
+        "RATE_LIMIT_RESERVE" => "${RATE_LIMIT_RESERVE:-8}"
+      )
+    end
+
+    # The defaults in the anchor and the defaults the application falls back to have to be
+    # the same numbers, or `docker compose run` and `bin/ingest` would disagree about the
+    # budget split with nothing to catch it.
+    it "declares the same defaults the application does" do
+      environment = ingest.fetch("environment")
+
+      Github::Configuration::DEFAULTS.slice("POLL_INTERVAL_SECONDS", "MAX_PAGES_PER_POLL",
+                                            "ENABLED_LIVE_SOURCE_COUNT", "RATE_LIMIT_RESERVE")
+                                     .each do |variable, default|
+        expect(environment.fetch(variable)).to eq("${#{variable}:-#{default}}")
+      end
+    end
   end
 end
