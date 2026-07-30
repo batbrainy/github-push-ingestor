@@ -1,0 +1,30 @@
+#!/usr/bin/env ruby
+# One-shot ingestion (IMPLEMENTATION_PLAN.md §9), the entry point behind
+#
+#   docker compose run --rm ingest
+#
+# Deliberately three lines of work. Everything testable lives in
+# Github::Ingestion::OneShot, which returns its exit code rather than calling exit — so the
+# whole §9 contract is a unit spec and this file is the only place in the application that
+# ends a process.
+#
+# config/environment rather than config/boot: this command uses models, so Rails has to be
+# initialized rather than merely loadable.
+begin
+  require_relative "../config/environment"
+rescue StandardError => error
+  # config/initializers/github.rb validates the budget configuration inside to_prepare, so a
+  # configuration the process must not run with raises here — before Github::Ingestion::OneShot
+  # is loaded and before any logger contract exists. Matched by name because the constant may
+  # not be autoloadable at the point boot failed.
+  raise unless error.class.name == "Github::Errors::ConfigurationError"
+
+  warn("Configuration error: #{error.message}")
+  exit 2
+end
+
+# The operator block and the JSON log stream share stdout (§11). Unbuffered, plus composing
+# the block and writing it once, is what keeps a log line from splitting it.
+$stdout.sync = true
+
+exit Github::Ingestion::OneShot.new(argv: ARGV).call.exit_code

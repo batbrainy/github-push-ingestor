@@ -60,6 +60,21 @@ RSpec.shared_examples "a GitHub event source" do
       .not_to raise_error
   end
 
+  # §11's correlation fields. Request#to_log merges context flat and FetchResult#to_log
+  # merges request.to_log, so a caller's run_id reaches the DEBUG github.request line
+  # without the executor or the formatter knowing about it.
+  it "carries a caller's correlation context onto the request's log line" do
+    request = source.first_page_request(context: { run_id: "2f5b9c3e" })
+
+    expect(request.to_log).to include(run_id: "2f5b9c3e", source_type: source.source_type)
+  end
+
+  it "will not let a caller's context overwrite the source type it reports" do
+    request = source.first_page_request(context: { source_type: "impersonated" })
+
+    expect(request.to_log[:source_type]).to eq(source.source_type)
+  end
+
   it "decodes a fetched page into raw event envelopes, untouched" do
     events = source.events(fetch_result_with('[{"id":"1","type":"PushEvent"},null]'))
 

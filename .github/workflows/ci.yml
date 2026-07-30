@@ -64,3 +64,16 @@ jobs:
 
       - name: Run RSpec
         run: bundle exec rspec
+
+      # The suite loads Rails through rails_helper, so it can never prove that the
+      # one-shot's own boot path works: its shebang, its config/environment require, and
+      # every stdlib the command depends on but the test harness happens to have loaded
+      # already. Running it once is the only thing that does — a missing `require
+      # "optparse"` survived the whole suite and died on the first real invocation.
+      #
+      # Fixture mode so it touches no network, and RAILS_ENV=test is already job-level so
+      # it uses the prepared test database and never a development one.
+      - name: Smoke test the one-shot ingestion command
+        env:
+          GITHUB_MODE: fixture
+        run: bin/ingest
