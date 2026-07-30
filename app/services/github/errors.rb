@@ -64,6 +64,16 @@ module Github
     # believe it owns the source.
     LockSessionChanged = Class.new(Error)
 
+    # Github::BudgetLedger#reserve! was called inside an application transaction. The
+    # debit has to be committed before the request is issued, or an outer rollback
+    # would refund a request GitHub has already counted (§7, "failures stay spent").
+    NestedTransaction = Class.new(Error)
+
+    # The ledger reached a state its own guards say is impossible — a debit rejected by
+    # the same predicate that just passed under a row lock, or a window that failed to
+    # roll. Raising beats continuing with accounting nobody can trust.
+    LedgerInvariantViolation = Class.new(Error)
+
     # No HTTP status was obtained.
     TransportError = Class.new(Error)
     ConnectionFailed = Class.new(TransportError)
