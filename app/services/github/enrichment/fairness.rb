@@ -119,9 +119,7 @@ module Github
       def refresh_choice(budget, requested, eligible, now:)
         return nil if eligible.values.any?
 
-        type = requested.find do |candidate|
-          selector.scope(candidate, pool: :refresh, now: now).exists?
-        end
+        type = requested.find { |candidate| selector.refresh_available?(candidate, now: now) }
         return nil if type.nil?
 
         borrow = !room_within_guarantee?(budget, type)

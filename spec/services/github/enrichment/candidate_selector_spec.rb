@@ -185,24 +185,129 @@ RSpec.describe Github::Enrichment::CandidateSelector do
     end
   end
 
-  describe "#earliest_retry_at" do
+  describe "#claimable?" do
+    it "is true while a pending candidate is eligible" do
+      pending_actor(github_id: 1)
+
+      expect(selector.claimable?(actor_type, now: now)).to be(true)
+    end
+
+    # The half that was missing, and the reason a fully enriched backlog reported "due
+    # now": a stale refresh is work, so a class holding one is not idle.
+    it "is true while only a TTL-stale refresh is waiting" do
+      create_actor(github_id: 1, enrichment_status: "complete", fetched_at: now - 90_000)
+
+      expect(selector.claimable?(actor_type, now: now)).to be(true)
+    end
+
+    it "is false when every record is enriched and still fresh" do
+      create_actor(github_id: 1, enrichment_status: "complete", fetched_at: now)
+
+      expect(selector.claimable?(actor_type, now: now)).to be(false)
+    end
+
+    it "is false when the only candidate is deferred" do
+      pending_actor(github_id: 1, next_retry_at: now + 60)
+
+      expect(selector.claimable?(actor_type, now: now)).to be(false)
+    end
+  end
+
+  describe "#earliest_pending_at" do
     it "names the soonest instant at which a deferred candidate becomes claimable" do
       pending_actor(github_id: 1, next_retry_at: now + 300)
       pending_actor(github_id: 2, next_retry_at: now + 60)
 
-      expect(selector.earliest_retry_at(actor_type, now: now)).to eq(now + 60)
+      expect(selector.earliest_pending_at(actor_type, now: now)).to eq(now + 60)
     end
 
-    it "is nil when something is already due, because the answer is now" do
+    it "is nil when nothing is deferred, because the answer is not a pending instant" do
       pending_actor(github_id: 1)
 
-      expect(selector.earliest_retry_at(actor_type, now: now)).to be_nil
+      expect(selector.earliest_pending_at(actor_type, now: now)).to be_nil
     end
 
+    # It will be swept into skipped_budget rather than enriched, so naming its retry
+    # instant would promise an enrichment that is never going to happen.
     it "ignores a candidate that has aged out, which will never become claimable" do
       pending_actor(github_id: 1, next_retry_at: now + 60, last_seen_at: now - 3601)
 
-      expect(selector.earliest_retry_at(actor_type, now: now)).to be_nil
+      expect(selector.earliest_pending_at(actor_type, now: now)).to be_nil
+    end
+  end
+
+  describe "#earliest_refresh_at" do
+    def complete_actor(github_id:, fetched_at:, **overrides)
+      create_actor(github_id: github_id, enrichment_status: "complete", fetched_at: fetched_at, **overrides)
+    end
+
+    it "names the instant the freshness cache lets go" do
+      complete_actor(github_id: 1, fetched_at: now)
+
+      expect(selector.earliest_refresh_at(actor_type, now: now)).to eq(now + 86_400)
+    end
+
+    it "names the earliest across every enriched record" do
+      complete_actor(github_id: 1, fetched_at: now)
+      complete_actor(github_id: 2, fetched_at: now - 600)
+
+      expect(selector.earliest_refresh_at(actor_type, now: now)).to eq(now + 85_800)
+    end
+
+    # A complete row can carry a retry instant: a retryable failure on a refresh keeps the
+    # status (a network blip must not drop coverage) and backs the row off. The next legal
+    # fetch is the later of the two.
+    it "defers to a failed refresh's backoff when it outlasts the TTL" do
+      complete_actor(github_id: 1, fetched_at: now - 90_000, next_retry_at: now + 300)
+
+      expect(selector.earliest_refresh_at(actor_type, now: now)).to eq(now + 300)
+    end
+
+    it "ignores a retry instant that has already passed, which no longer defers anything" do
+      complete_actor(github_id: 1, fetched_at: now, next_retry_at: now - 300)
+
+      expect(selector.earliest_refresh_at(actor_type, now: now)).to eq(now + 86_400)
+    end
+
+    # The minimum is taken over the whole expression rather than over fetched_at alone,
+    # because the oldest document may be the one carrying the longest backoff.
+    it "takes the minimum over both columns together, not over the oldest fetch" do
+      complete_actor(github_id: 1, fetched_at: now - 86_000, next_retry_at: now + 9_000)
+      complete_actor(github_id: 2, fetched_at: now - 85_000)
+
+      expect(selector.earliest_refresh_at(actor_type, now: now)).to eq(now + 1_400)
+    end
+
+    it "reads each class's own TTL" do
+      short = described_class.new(configuration: configuration_with(REPOSITORY_REFRESH_TTL_SECONDS: "60"))
+      create_repository(github_id: 1, enrichment_status: "complete", fetched_at: now)
+
+      expect(short.earliest_refresh_at(repository_type, now: now)).to eq(now + 60)
+    end
+
+    it "is nil when nothing has been enriched, because there is no refresh to name" do
+      pending_actor(github_id: 1)
+
+      expect(selector.earliest_refresh_at(actor_type, now: now)).to be_nil
+    end
+  end
+
+  describe "#earliest_claimable_at" do
+    it "takes whichever pool comes back first" do
+      pending_actor(github_id: 1, next_retry_at: now + 300)
+      create_actor(github_id: 2, enrichment_status: "complete", fetched_at: now - 86_340)
+
+      expect(selector.earliest_claimable_at(actor_type, now: now)).to eq(now + 60)
+    end
+
+    it "falls back to the refresh pool when nothing is pending at all" do
+      create_actor(github_id: 1, enrichment_status: "complete", fetched_at: now)
+
+      expect(selector.earliest_claimable_at(actor_type, now: now)).to eq(now + 86_400)
+    end
+
+    it "is nil for a class with nothing at all in either pool" do
+      expect(selector.earliest_claimable_at(actor_type, now: now)).to be_nil
     end
   end
 

@@ -40,6 +40,9 @@ module Github
       # its own words to "Among pending candidates", so the refresh pool needs its own.
       REFRESH_ORDER = "fetched_at ASC, id ASC".freeze
 
+      # When a complete row next becomes refreshable. See #earliest_refresh_at.
+      REFRESH_DUE_AT = "GREATEST(fetched_at + make_interval(secs => ?), next_retry_at)".freeze
+
       def initialize(configuration: Github.configuration)
         @configuration = configuration
       end
@@ -71,16 +74,57 @@ module Github
         pending_scope(entity_type, now: now).exists?
       end
 
-      # The one component this half contributes to §9's effective_enrichment_time: when
-      # nothing is due, the soonest instant at which something will be.
+      # Whether either pool could hand out work for this class right now. Asked before any
+      # "when next?" question, because the two are different questions and deriving one
+      # from the other is what makes a report say "due now" while the command it sits next
+      # to says there is nothing to enrich.
+      def claimable?(entity_type, now:)
+        pending_available?(entity_type, now: now) || refresh_available?(entity_type, now: now)
+      end
+
+      def refresh_available?(entity_type, now:)
+        scope(entity_type, pool: :refresh, now: now).exists?
+      end
+
+      # The soonest instant at which *either* pool will have work for this class, for a
+      # caller that has already established neither has any now.
+      # @return [Time, nil] nil when nothing will ever become claimable without new activity
+      def earliest_claimable_at(entity_type, now:)
+        [ earliest_pending_at(entity_type, now: now),
+          earliest_refresh_at(entity_type, now: now) ].compact.min
+      end
+
+      # A pending candidate held back only by its own backoff or a secondary-limit
+      # deferral. One aged past the eligibility window is excluded: it will be swept into
+      # skipped_budget rather than enriched, so naming its retry instant would promise an
+      # enrichment that is never going to happen.
       # @return [Time, nil]
-      def earliest_retry_at(entity_type, now:)
+      def earliest_pending_at(entity_type, now:)
         entity_type.model
                    .where(enrichment_status: Enrichable::CANDIDATE_STATUSES)
                    .where.not(next_retry_at: nil)
                    .where(next_retry_at: now..)
                    .where(eligible_since_clause, floor: eligibility_floor(now))
                    .minimum(:next_retry_at)
+      end
+
+      # When the freshness cache next lets go. A complete row's next legal fetch is the
+      # later of its TTL expiry and any retry instant a failed refresh left behind — so
+      # GREATEST, not the minimum of two independent columns, and the minimum is taken over
+      # that expression rather than over fetched_at alone: the oldest document may be the
+      # one carrying the longest backoff.
+      #
+      # GREATEST ignores NULL in PostgreSQL, which is the behaviour rather than the hazard
+      # here — a complete row with no retry instant is due at its TTL expiry, full stop.
+      # A NULL fetched_at is excluded for the same reason #refresh_scope excludes it: the
+      # refresh predicate could never match such a row, so it has no next refresh to name.
+      # @return [Time, nil]
+      def earliest_refresh_at(entity_type, now:)
+        expression = ActiveRecord::Base.sanitize_sql_array(
+          [ REFRESH_DUE_AT, entity_type.refresh_ttl_seconds(configuration) ]
+        )
+
+        entity_type.model.complete.where.not(fetched_at: nil).minimum(Arel.sql(expression))
       end
 
       # Candidates whose activity has aged past §10's eligibility window and are therefore

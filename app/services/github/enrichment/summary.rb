@@ -61,13 +61,25 @@ module Github
         end
 
         # §9's effective_enrichment_time, answered for the *pool* rather than for one row:
-        # when nothing is currently claimable, the soonest instant at which something will
-        # be. A pure computation over rows that were read anyway.
+        # nil when something is claimable right now, otherwise the soonest instant at which
+        # something will be.
+        #
+        # Both pools, and the claimable question asked first. Reading "due now" off an
+        # absent *pending* retry instant was wrong three ways, and all three are states the
+        # deterministic fixture run reaches: a fully enriched backlog reported "due now"
+        # while `bin/enrich` in the same breath reported nothing to enrich, because the next
+        # legal action was a refresh at fetched_at + TTL and nothing looked there; a
+        # complete row deferred by a failed refresh was invisible for the same reason; and
+        # one candidate due now beside one deferred printed the deferred instant while work
+        # was in fact claimable.
         def next_enrichment_at(budget, selector, now:)
+          # A global block or a spent class outranks every per-entity instant, and is the
+          # one case where an answer exists without reading a single entity row.
           global = [ budget&.global_blocked_until, budget&.enrichment_class_blocked_until(now: now) ].compact.max
           return global if global&.>(now)
+          return nil if EntityType.all.any? { |type| selector.claimable?(type, now: now) }
 
-          EntityType.all.filter_map { |type| selector.earliest_retry_at(type, now: now) }.min
+          EntityType.all.filter_map { |type| selector.earliest_claimable_at(type, now: now) }.min
         end
       end
 

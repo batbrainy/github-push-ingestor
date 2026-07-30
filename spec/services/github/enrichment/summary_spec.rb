@@ -62,6 +62,51 @@ RSpec.describe Github::Enrichment::Summary do
       expect(described_class.capture(now: now).next_enrichment_at).to eq(now + 120)
     end
 
+    # The state the deterministic fixture run actually reaches, and the one that made this
+    # line contradict the command it is printed beside: with every entity enriched and
+    # inside its TTL, the next legal action is a refresh, not an enrichment now.
+    it "names the refresh instant when the whole backlog is enriched and fresh" do
+      active_budget_window(now: now)
+      create_actor(github_id: 1, enrichment_status: "complete", fetched_at: now, last_seen_at: now - 60)
+
+      expect(described_class.capture(now: now).next_enrichment_at).to eq(now + 86_400)
+    end
+
+    # A retryable failure on a refresh keeps the row complete, so it is invisible to the
+    # pending pool while still being genuinely deferred.
+    it "names the backoff of a refresh that failed, which the pending pool cannot see" do
+      active_budget_window(now: now)
+      create_actor(github_id: 1, enrichment_status: "complete", fetched_at: now - 90_000,
+                   next_retry_at: now + 300, last_seen_at: now - 60)
+
+      expect(described_class.capture(now: now).next_enrichment_at).to eq(now + 300)
+    end
+
+    # Deriving "claimable now" from "no deferred pending row" got this backwards: work was
+    # available, and the report named an instant instead of saying so.
+    it "is nil when one candidate is due even though another is deferred" do
+      active_budget_window(now: now)
+      create_actor(github_id: 1, last_seen_at: now - 60)
+      create_actor(github_id: 2, last_seen_at: now - 60, next_retry_at: now + 300)
+
+      expect(described_class.capture(now: now).next_enrichment_at).to be_nil
+    end
+
+    it "is nil when a stale refresh is the work that is waiting" do
+      active_budget_window(now: now)
+      create_actor(github_id: 1, enrichment_status: "complete", fetched_at: now - 90_000)
+
+      expect(described_class.capture(now: now).next_enrichment_at).to be_nil
+    end
+
+    it "takes the earliest across both classes" do
+      active_budget_window(now: now)
+      create_actor(github_id: 1, enrichment_status: "complete", fetched_at: now)
+      create_repository(github_id: 2, last_seen_at: now - 60, next_retry_at: now + 90)
+
+      expect(described_class.capture(now: now).next_enrichment_at).to eq(now + 90)
+    end
+
     # §9's effective_enrichment_time, answered for the pool: a global block or an exhausted
     # class outranks any individual entity's retry.
     it "names the window reset when the class allowance is spent" do
