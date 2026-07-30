@@ -19,8 +19,21 @@ module Github
       @configuration ||= Configuration.new
     end
 
+    # Memoised per process. The fixture transport's scripted sequences advance across
+    # requests, so a fresh transport per call would restart every script; the live
+    # transport would rebuild its Faraday connection each time.
+    def transport
+      @transport ||= configuration.fixture? ? Transports::Fixture.new : Transports::Faraday.new
+    end
+
+    def executor
+      @executor ||= RequestExecutor.new(transport: transport)
+    end
+
     def reset!
       @configuration = nil
+      @transport = nil
+      @executor = nil
       FixtureCorpus.reset!
     end
   end

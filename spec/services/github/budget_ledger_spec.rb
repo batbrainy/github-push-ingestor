@@ -5,20 +5,10 @@ RSpec.describe Github::BudgetLedger do
 
   let(:window_reset) { frozen_time + 3600 }
 
-  def budget
-    GithubApiBudget.find(GithubApiBudget::SINGLETON_ID)
-  end
-
-  # A window already initialized from headers, which is where most reservations happen.
-  def active_window(**overrides)
-    ledger.bootstrap!(now: frozen_time)
-    GithubApiBudget.where(id: GithubApiBudget::SINGLETON_ID).update_all({
-      window_status: "active", window_initialized_at: frozen_time,
-      limit: 60, remaining: 55, reset_at: window_reset, observed_at: frozen_time,
-      poll_allowance: 12, enrichment_allowance: 40, reserve: 8
-    }.merge(overrides))
-    budget
-  end
+  # Both defined in spec/support/budget_helpers.rb, so "what an active window looks
+  # like" is stated once and the executor's specs use the same definition.
+  def budget = current_budget
+  def active_window(**overrides) = active_budget_window(**overrides)
 
   def snapshot(**overrides)
     Github::RateLimitSnapshot.from_headers({
