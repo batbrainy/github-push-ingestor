@@ -338,7 +338,7 @@ RSpec.describe Github::RequestExecutor do
     # naming the missing entry.
     it "raises a corpus gap instead of reporting it as a failed fetch" do
       active_budget_window
-      offline = Github::Transports::Fixture.new(corpus: corpus)
+      offline = Github::Transports::Fixture.new(corpus: corpus, clock: -> { frozen_time })
 
       expect {
         executor(offline, mode: :fixture).call(
@@ -350,7 +350,7 @@ RSpec.describe Github::RequestExecutor do
 
     it "runs the same chain offline, spending the ledger against corpus headers" do
       active_budget_window(remaining: 60)
-      offline = Github::Transports::Fixture.new(corpus: corpus)
+      offline = Github::Transports::Fixture.new(corpus: corpus, clock: -> { frozen_time })
 
       # The offline source's own fixture:// location: application-origin, so it is
       # validated against fixture mode directly rather than through the payload path.

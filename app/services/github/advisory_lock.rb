@@ -98,9 +98,13 @@ module Github
           "Github::AdvisoryLock LockTimeout"
         )
 
+        # pg_advisory_lock returns void, and Active Record warns "unknown OID 2278" on
+        # stderr for every void column it is handed — noise outside the JSON log stream
+        # §11 specifies. The subquery keeps it out of the result columns entirely.
         connection.exec_query(
           ActiveRecord::Base.sanitize_sql_array([
-            "SELECT pg_advisory_lock(?::int, ?::int), pg_backend_pid() AS pid", namespace, key
+            "SELECT pg_backend_pid() AS pid FROM (SELECT pg_advisory_lock(?::int, ?::int)) AS acquired",
+            namespace, key
           ]),
           "Github::AdvisoryLock Lock"
         ).first.fetch("pid")

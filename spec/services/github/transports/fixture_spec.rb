@@ -51,6 +51,32 @@ RSpec.describe Github::Transports::Fixture do
     end
   end
 
+  describe "the rate-limit reset header" do
+    # A fixed epoch in the corpus is in the past by the time anyone runs the demo, and
+    # the ledger then correctly rolls the window on every poll — so counters never
+    # accumulate and fixture mode stops demonstrating the accounting it exists to
+    # demonstrate. Only this header shape is relative; bodies stay byte-static.
+    it "resolves a relative reset against the clock, so the window is always current" do
+      offline = described_class.new(corpus: corpus, clock: -> { frozen_time })
+
+      expect(offline.get(ok_url).header("x-ratelimit-reset")).to eq((frozen_time + 3600).to_i.to_s)
+    end
+
+    it "leaves an absolute header value untouched" do
+      offline = described_class.new(corpus: corpus, clock: -> { frozen_time })
+
+      expect(offline.get(ok_url).header("x-ratelimit-limit")).to eq("60")
+    end
+
+    it "produces a snapshot the ledger can bootstrap a window from" do
+      offline = described_class.new(corpus: corpus, clock: -> { frozen_time })
+      snapshot = Github::RateLimitSnapshot.from_headers(offline.get(ok_url).headers, observed_at: frozen_time)
+
+      expect(snapshot).to be_quantitative
+      expect(snapshot.reset_at).to eq(frozen_time + 3600)
+    end
+  end
+
   describe "scripted sequences" do
     # §12's "304 with ETag" scenario. Positional scripting keeps it deterministic
     # without the corpus having to match on If-None-Match.

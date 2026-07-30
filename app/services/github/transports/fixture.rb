@@ -13,11 +13,22 @@ module Github
     class Fixture
       MODE = :fixture
 
+      # A header value of "+N" resolves to N seconds from now, in epoch seconds.
+      #
+      # x-ratelimit-reset needs this. A fixed epoch in the corpus is in the past by the
+      # time anyone runs the demo, and the ledger then correctly rolls the window on
+      # every single poll — so counters never accumulate and fixture mode stops
+      # demonstrating the accounting it exists to demonstrate. Bodies stay byte-static;
+      # only this one header shape is relative, and the clock is injectable so specs
+      # stay deterministic.
+      RELATIVE_SECONDS = /\A\+(\d+)\z/
+
       # Cursors live on the instance, never at class level, so two transports never
       # share a script position and one spec cannot advance another's sequence under
       # random ordering.
-      def initialize(corpus: FixtureCorpus.load)
+      def initialize(corpus: FixtureCorpus.load, clock: -> { Time.current })
         @corpus = corpus
+        @clock = clock
         @cursors = Hash.new(0)
         @requests = []
         @mutex = Mutex.new
@@ -47,13 +58,20 @@ module Github
           @cursors[key] += 1
 
           scripted.fetch(index).then do |response|
-            Response.new(status: response.status, headers: response.headers,
+            Response.new(status: response.status, headers: resolve(response.headers),
                          body: response.body, url: validated_url, duration_ms: 0.0)
           end
         end
       end
 
       private
+
+      def resolve(headers)
+        headers.to_h do |name, value|
+          relative = RELATIVE_SECONDS.match(value)
+          [ name, relative ? (@clock.call.to_i + relative[1].to_i).to_s : value ]
+        end.freeze
+      end
 
       def assert_usable!(validated_url)
         return if validated_url.is_a?(UrlPolicy::ValidatedUrl) && validated_url.mode == MODE

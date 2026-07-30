@@ -44,6 +44,17 @@ whose body path escapes `bodies/`.
 An unknown key raises `Github::Errors::FixtureMiss`. Fixture mode **fails closed** — it
 never falls back to live GitHub (§6).
 
+## Relative header values
+
+A header value of `+N` resolves to `N` seconds from now, in epoch seconds. Only
+`x-ratelimit-reset` uses it, and it is the one thing in the corpus that is not
+byte-static.
+
+A fixed reset epoch would be in the past by the time anyone runs the demo, and the
+ledger would then correctly roll the window on every single poll — so counters would
+never accumulate and fixture mode would stop demonstrating the very accounting it exists
+to demonstrate. The transport's clock is injectable, so specs stay deterministic.
+
 ## Sequences
 
 A key's value is an ordered list. The *n*th request for that key gets the *n*th entry,
