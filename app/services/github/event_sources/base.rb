@@ -84,26 +84,31 @@ module Github
       #
       # @param origin [Symbol] :application for a location this adapter constructed,
       #   :payload for one GitHub supplied (a Link target)
+      # @param context [Hash] extra correlation fields for the request's log line. PR 5's
+      #   runner passes run_id here: Request#to_log merges context flat and
+      #   FetchResult#to_log merges request.to_log, so the DEBUG github.request line gains
+      #   the run correlation with no change to the executor or the formatter. This
+      #   adapter's own source_type merges last, so a caller cannot overwrite it.
       # @return [Github::Request]
-      def request_for(url, etag: nil, origin: :application)
+      def request_for(url, etag: nil, origin: :application, context: {})
         Request.new(url: url, request_class: REQUEST_CLASS, etag: etag, origin: origin,
-                    context: { source_type: source_type })
+                    context: context.merge(source_type: source_type))
       end
 
       # The adapter's own endpoint, so application-origin by definition — which is what
       # lets the offline source address the corpus with a scheme no payload could supply.
       #
       # @return [Github::Request]
-      def first_page_request(etag: nil)
-        request_for(first_page_url, etag: etag, origin: :application)
+      def first_page_request(etag: nil, context: {})
+        request_for(first_page_url, etag: etag, origin: :application, context: context)
       end
 
       # A page GitHub pointed at through a Link header. Named separately from
       # #request_for so the origin is not something a caller has to remember.
       #
       # @return [Github::Request]
-      def linked_page_request(url)
-        request_for(url, origin: :payload)
+      def linked_page_request(url, context: {})
+        request_for(url, origin: :payload, context: context)
       end
 
       # Decodes one fetched page into raw GitHub event envelopes. This is the seam PR 5's

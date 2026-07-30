@@ -17,9 +17,9 @@ RSpec.describe JsonLogFormatter do
   end
 
   it "merges hash messages into the JSON root for structured events" do
-    line = formatter.call("INFO", Time.now, nil, { event: "ingestion_run_started", run_id: "1e3d" })
+    line = formatter.call("INFO", Time.now, nil, { event: "ingestion.run_started", run_id: "1e3d" })
 
-    expect(JSON.parse(line)).to include("event" => "ingestion_run_started", "run_id" => "1e3d")
+    expect(JSON.parse(line)).to include("event" => "ingestion.run_started", "run_id" => "1e3d")
   end
 
   it "captures exception class and message" do
