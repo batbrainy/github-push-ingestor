@@ -89,6 +89,26 @@ RSpec.describe GithubActor do
       expect(actor.last_error).to eq("enrichment allowance exhausted")
     end
 
+    it "never regresses updated_at for a late-arriving envelope" do
+      described_class.upsert_stub!(github_id: 4242, login: "octocat", now: frozen_time + 300)
+      described_class.upsert_stub!(github_id: 4242, login: "octocat", now: frozen_time)
+
+      expect(described_class.find_by(github_id: 4242).updated_at).to eq(frozen_time + 300)
+    end
+
+    # upsert goes straight to PostgreSQL, so without the guard a malformed envelope would
+    # raise NotNullViolation and abort the ingest transaction, taking the rest of the
+    # batch with it rather than quarantining one event.
+    it "refuses a malformed envelope before reaching the database" do
+      expect { described_class.upsert_stub!(github_id: nil, login: "octocat") }
+        .to raise_error(ActiveRecord::RecordInvalid)
+
+      expect { described_class.upsert_stub!(github_id: 4242, login: nil) }
+        .to raise_error(ActiveRecord::RecordInvalid)
+
+      expect(described_class.count).to eq(0)
+    end
+
     it "does not touch activity fields, which are gated on a newly inserted event" do
       described_class.upsert_stub!(github_id: 4242, login: "octocat", now: frozen_time)
       described_class.upsert_stub!(github_id: 4242, login: "octocat", now: frozen_time + 60)

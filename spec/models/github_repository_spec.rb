@@ -49,6 +49,25 @@ RSpec.describe GithubRepository do
       expect(described_class.find_by(github_id: 8484).name).to eq("hello-world")
     end
 
+    it "never regresses updated_at for a late-arriving envelope" do
+      described_class.upsert_stub!(github_id: 8484, full_name: "octocat/hello-world",
+                                   now: frozen_time + 300)
+      described_class.upsert_stub!(github_id: 8484, full_name: "octocat/hello-world",
+                                   now: frozen_time)
+
+      expect(described_class.find_by(github_id: 8484).updated_at).to eq(frozen_time + 300)
+    end
+
+    it "refuses a malformed envelope before reaching the database" do
+      expect { described_class.upsert_stub!(github_id: nil, full_name: "octocat/hello") }
+        .to raise_error(ActiveRecord::RecordInvalid)
+
+      expect { described_class.upsert_stub!(github_id: 8484, full_name: nil) }
+        .to raise_error(ActiveRecord::RecordInvalid)
+
+      expect(described_class.count).to eq(0)
+    end
+
     it "never clears enrichment-owned fields" do
       described_class.upsert_stub!(github_id: 8484, full_name: "octocat/hello-world",
                                    now: frozen_time)

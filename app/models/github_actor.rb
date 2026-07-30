@@ -7,6 +7,8 @@ class GithubActor < ApplicationRecord
            inverse_of: :github_actor,
            dependent: :restrict_with_error
 
+  validates :login, presence: true
+
   # §7 merge rule 1. Envelope values refresh identity fields on any observation,
   # including a duplicate replay — but an envelope upsert must never clear a
   # previously stored enrichment payload or name, so raw_payload, name, and every
@@ -21,11 +23,18 @@ class GithubActor < ApplicationRecord
     display_login = COALESCE(EXCLUDED.display_login, github_actors.display_login),
     api_url       = COALESCE(EXCLUDED.api_url,       github_actors.api_url),
     avatar_url    = COALESCE(EXCLUDED.avatar_url,    github_actors.avatar_url),
-    updated_at    = EXCLUDED.updated_at
+    updated_at    = GREATEST(github_actors.updated_at, EXCLUDED.updated_at)
   SQL
 
+  # The explicit validate! mirrors PushEvent.insert_if_new: upsert goes straight to
+  # PostgreSQL, so without it a nil github_id or login would surface as a
+  # NotNullViolation that aborts the ingest transaction, taking the rest of the batch
+  # with it instead of letting the caller quarantine one malformed envelope.
   def self.upsert_stub!(github_id:, login:, display_login: nil, api_url: nil,
                         avatar_url: nil, now: Time.current)
+    new(github_id: github_id, login: login, display_login: display_login,
+        api_url: api_url, avatar_url: avatar_url).validate!
+
     upsert(
       {
         github_id: github_id,

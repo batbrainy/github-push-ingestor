@@ -7,6 +7,8 @@ class GithubRepository < ApplicationRecord
            inverse_of: :github_repository,
            dependent: :restrict_with_error
 
+  validates :full_name, presence: true
+
   # §7 merge rule 1, same non-clobbering shape as GithubActor::IDENTITY_MERGE:
   # raw_payload, description, language, and owner_github_id are enrichment-owned and
   # therefore absent from this SET list.
@@ -19,11 +21,16 @@ class GithubRepository < ApplicationRecord
     full_name  = EXCLUDED.full_name,
     name       = COALESCE(EXCLUDED.name,    github_repositories.name),
     api_url    = COALESCE(EXCLUDED.api_url, github_repositories.api_url),
-    updated_at = EXCLUDED.updated_at
+    updated_at = GREATEST(github_repositories.updated_at, EXCLUDED.updated_at)
   SQL
 
+  # See GithubActor.upsert_stub! — the explicit validate! keeps a malformed envelope
+  # from aborting the ingest transaction before it can be quarantined.
   def self.upsert_stub!(github_id:, full_name:, name: nil, api_url: nil,
                         now: Time.current)
+    new(github_id: github_id, full_name: full_name, name: name,
+        api_url: api_url).validate!
+
     upsert(
       {
         github_id: github_id,

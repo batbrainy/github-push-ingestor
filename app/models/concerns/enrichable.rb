@@ -21,6 +21,11 @@ module Enrichable
   included do
     enum :enrichment_status, ENRICHMENT_STATUSES.index_by(&:itself), validate: true
 
+    # Guards upsert_stub!, which otherwise reaches PostgreSQL directly and turns a
+    # malformed envelope into a NotNullViolation that aborts the ingest transaction
+    # before the caller can route the event to quarantine.
+    validates :github_id, presence: true
+
     scope :enrichment_candidates, -> { where(enrichment_status: CANDIDATE_STATUSES) }
   end
 

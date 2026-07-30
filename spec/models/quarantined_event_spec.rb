@@ -63,6 +63,45 @@ RSpec.describe QuarantinedEvent do
       expect(event.occurrence_count).to eq(2)
     end
 
+    it "never regresses updated_at for a late-arriving repeat" do
+      described_class.record!(payload_fingerprint: fingerprint,
+                              raw_payload: { "type" => "PushEvent" },
+                              received_at: frozen_time + 300)
+      described_class.record!(payload_fingerprint: fingerprint,
+                              raw_payload: { "type" => "PushEvent" },
+                              received_at: frozen_time)
+
+      expect(described_class.sole.updated_at).to eq(frozen_time + 300)
+    end
+
+    # §7's taxonomy quarantines an event with an invalid envelope. A valid JSON events
+    # array can contain null or an empty object/array as an element — each is a parsed
+    # value with no usable envelope, and each must survive quarantine rather than
+    # raising inside the ingest transaction.
+    it "preserves an envelope that parsed to a value carrying no fields" do
+      [ nil, {}, [] ].each_with_index do |payload, index|
+        id = described_class.record!(
+          payload_fingerprint: "empty#{index}".ljust(64, "0"),
+          raw_payload: payload,
+          error_code: "invalid_envelope",
+          received_at: frozen_time
+        )
+
+        expect(described_class.find(id).raw_payload).to eq(payload)
+      end
+
+      expect(described_class.count).to eq(3)
+    end
+
+    it "counts repeats of a null envelope like any other payload" do
+      2.times do
+        described_class.record!(payload_fingerprint: fingerprint, raw_payload: nil,
+                                received_at: frozen_time)
+      end
+
+      expect(described_class.sole.occurrence_count).to eq(2)
+    end
+
     # Plan §7: a malformed event may be malformed precisely because it lacks an event
     # ID, so the fingerprint is the sole identity.
     it "accepts a payload with no event id at all" do
@@ -107,12 +146,19 @@ RSpec.describe QuarantinedEvent do
       expect(index.unique).to be(false)
     end
 
-    it "requires a fingerprint, a payload, and both receipt timestamps" do
-      %i[payload_fingerprint raw_payload first_received_at last_received_at].each do |column|
+    it "requires a fingerprint and both receipt timestamps" do
+      %i[payload_fingerprint first_received_at last_received_at].each do |column|
         expect_violation(ActiveRecord::NotNullViolation) do
           described_class.insert!(quarantined_event_attributes.except(column))
         end
       end
+    end
+
+    it "leaves the payload nullable so a null envelope can be quarantined" do
+      column = described_class.connection.columns(:quarantined_events)
+                              .find { |c| c.name == "raw_payload" }
+
+      expect(column.null).to be(true)
     end
 
     it "rejects an occurrence count below one" do

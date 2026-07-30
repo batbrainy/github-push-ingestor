@@ -158,7 +158,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_07_29_210007) do
     t.datetime "last_received_at", null: false
     t.integer "occurrence_count", default: 1, null: false
     t.text "payload_fingerprint", null: false
-    t.jsonb "raw_payload", null: false
+    t.jsonb "raw_payload"
     t.datetime "updated_at", null: false
     t.index ["github_event_id"], name: "index_quarantined_events_on_github_event_id"
     t.index ["payload_fingerprint"], name: "index_quarantined_events_on_payload_fingerprint", unique: true

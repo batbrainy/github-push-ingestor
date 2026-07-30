@@ -6,17 +6,22 @@
 # with a different malformed payload is a different quarantine row, not a conflict —
 # hence github_event_id is indexed but not unique.
 #
-# raw_payload is NOT NULL, a deliberate tightening past §7's bare `jsonb`: an entire
-# response body that is invalid JSON is an ingestion failure rather than a quarantine
-# row (§7 taxonomy), so every quarantined event has a parsed payload — and the NOT
-# NULL fingerprint is derived from it.
+# raw_payload is deliberately nullable. §7's taxonomy quarantines an event with an
+# invalid envelope, and a valid JSON events array can legitimately contain `null`, `{}`,
+# or `[]` as an element — all parsed values with no usable envelope. Rejecting them here
+# would raise a NotNullViolation inside the ingest transaction and destroy the very
+# malformed event quarantine exists to preserve. Only a wholly unparseable response body
+# is an ingestion failure rather than a quarantine row.
+#
+# payload_fingerprint stays NOT NULL regardless: the canonical fingerprint of `null` is
+# as well defined as any other, so identity survives a null payload.
 class CreateQuarantinedEvents < ActiveRecord::Migration[8.1]
   def change
     create_table :quarantined_events do |t|
       t.text :github_event_id
       t.text :payload_fingerprint, null: false
       t.text :event_type
-      t.jsonb :raw_payload, null: false
+      t.jsonb :raw_payload
 
       t.text :error_code
       t.text :error_message
