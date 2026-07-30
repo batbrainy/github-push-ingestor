@@ -351,6 +351,85 @@ RSpec.describe Github::BudgetLedger do
     end
   end
 
+  describe "a window that moves on while a request is in flight" do
+    let(:next_window) { window_reset + 3600 }
+
+    def superseding_snapshot
+      snapshot("x-ratelimit-reset" => next_window.to_i.to_s, "x-ratelimit-remaining" => "59")
+    end
+
+    # The Active Record query cache wraps select_all, so GithubApiBudget.find is
+    # cacheable — while the raw exec_update statements this class writes with do not
+    # invalidate it. A reservation's post-debit read would populate the cache, and the
+    # rollover that followed would be handed the pre-rollover row: the window would roll
+    # twice and then fall through apply_observation's branches and raise.
+    it "reads the ledger uncached, so a rollover is never handed a pre-rollover row" do
+      active_window
+
+      ActiveRecord::Base.cache do
+        ledger.reserve!(:poll, now: window_reset - 1)
+
+        expect(ledger.reconcile!(superseding_snapshot, request_class: :poll, now: window_reset + 1))
+          .to eq(:initialized)
+      end
+    end
+
+    it "rolls the window exactly once, however the move is detected" do
+      active_window
+      ledger.reserve!(:poll, now: window_reset - 1)
+
+      rolls = 0
+      allow(Rails.logger).to receive(:info) { |payload| rolls += 1 if payload[:event] == "budget.window_rolled" }
+
+      ledger.reconcile!(superseding_snapshot, request_class: :poll, now: window_reset + 1)
+
+      expect(rolls).to eq(1)
+    end
+
+    # The request was reserved against the window that has just ended, but a superseding
+    # reset_at is GitHub saying it counted the request in the new one. Zeroing the
+    # counters outright would let this window issue one more request than GitHub honours.
+    it "carries the in-flight reservation into the window GitHub counted it in" do
+      active_window
+      ledger.reserve!(:poll, now: window_reset - 1)
+
+      ledger.reconcile!(superseding_snapshot, request_class: :poll, now: window_reset + 1)
+
+      expect(budget).to have_attributes(poll_used: 1, window_status: "active",
+                                        reset_at: next_window, remaining: 59)
+    end
+
+    it "carries an enrichment request into its own class and share" do
+      active_window
+      ledger.reserve!(:repository, now: window_reset - 1)
+
+      ledger.reconcile!(superseding_snapshot, request_class: :repository, now: window_reset + 1)
+
+      expect(budget).to have_attributes(enrichment_used: 1, repository_share_used: 1,
+                                        actor_share_used: 0, poll_used: 0)
+    end
+
+    # A caller with nothing in flight — a future /status refresh — must not invent a debit.
+    it "carries nothing when no request produced the response" do
+      active_window
+      ledger.reserve!(:poll, now: window_reset - 1)
+
+      ledger.reconcile!(superseding_snapshot, now: window_reset + 1)
+
+      expect(budget.poll_used).to eq(0)
+    end
+
+    # The clock-driven rollover inside reserve! has no in-flight request to carry, so it
+    # still starts the window clean.
+    it "still starts a clean window when the rollover happens before a reservation" do
+      active_window(poll_used: 12, enrichment_used: 40)
+
+      ledger.reserve!(:poll, now: window_reset + 1)
+
+      expect(budget).to have_attributes(poll_used: 1, enrichment_used: 0)
+    end
+  end
+
   describe "failures stay spent (plan §7)" do
     # The guarantee is structural: there is no code path that gives a request back.
     it "exposes no way to credit a reservation back" do

@@ -83,10 +83,14 @@ module Github
     # The CASE on global_blocked_until clears a primary-exhaustion block, which was set
     # to the reset that has now passed, while preserving a secondary-limit block that
     # extends beyond it — the two conditions §10 distinguishes.
+    #
+    # The four counters are parameters rather than literal zeros so a rollover
+    # discovered *during* reconciliation can carry the request that produced the
+    # response into the window GitHub says it belongs to. See #reconcile!.
     ROLL_WINDOW_SQL = <<~SQL.squish
       UPDATE github_api_budget
-         SET poll_used = 0, enrichment_used = 0,
-             actor_share_used = 0, repository_share_used = 0,
+         SET poll_used = ?, enrichment_used = ?,
+             actor_share_used = ?, repository_share_used = ?,
              remaining = NULL, reset_at = NULL,
              window_status = 'uninitialized', window_initialized_at = NULL,
              global_blocked_until = CASE WHEN global_blocked_until <= ? THEN NULL ELSE global_blocked_until END,
@@ -135,7 +139,7 @@ module Github
       assert_committable!
       bootstrap!(now: now)
 
-      budget, reason = GithubApiBudget.transaction do
+      budget, reason = uncached_transaction do
         budget = GithubApiBudget.lock.find(SINGLETON_ID)
         budget = roll_window!(budget, now: now) if window_elapsed?(budget, now)
 
@@ -160,19 +164,32 @@ module Github
     # conservative — over-counted usage, a stale-high remaining that the next success
     # clamps. That is the same posture as failures-stay-spent, and it beats swallowing
     # the exception, which would hide accounting bugs behind a slowly drifting ledger.
-    def reconcile!(snapshot, now: Time.current)
+    # @param request_class [Symbol, nil] the class of the request that produced this
+    #   response. Supplied by Github::RequestExecutor; nil only for a caller that is
+    #   reconciling without an in-flight request.
+    def reconcile!(snapshot, request_class: nil, now: Time.current)
       assert_committable!
       return :no_headers if snapshot.nil?
 
-      GithubApiBudget.transaction do
+      uncached_transaction do
         budget = GithubApiBudget.lock.find_by(id: SINGLETON_ID)
         # reconcile! never creates the row. Only a reservation does, and a response
         # arriving without one would mean a request was made without reserving.
         next :no_ledger if budget.nil?
         next :resource_mismatch if resource_mismatch?(budget, snapshot)
 
-        budget = roll_window!(budget, now: now) if window_elapsed?(budget, now)
-        budget = roll_window!(budget, now: now) if window_superseded?(budget, snapshot)
+        # One decision, not two sequential ones. The clock predicate and the header
+        # predicate describe the same event — the window moved on — and evaluating them
+        # in sequence made a second rollover reachable, which then fell through
+        # apply_observation's branches and raised.
+        if window_elapsed?(budget, now) || window_superseded?(budget, snapshot)
+          # The request that produced this response was reserved against the window that
+          # has just ended, but GitHub counted it in the new one — that is precisely
+          # what a superseding reset_at means. Zeroing the counters outright would let
+          # this window issue one more request than GitHub will honour, so the debit is
+          # carried forward rather than discarded.
+          budget = roll_window!(budget, now: now, carry_forward: request_class)
+        end
 
         # An error page, a proxy response, or a partial header set carries nothing to
         # apply. Not an error.
@@ -242,6 +259,16 @@ module Github
             "rollback would refund a request GitHub has already counted"
     end
 
+    # Every ledger read has to see the row as it is *now*, and the Active Record query
+    # cache does not guarantee that: it wraps select_all, so GithubApiBudget.find is
+    # cacheable, while the raw exec_update statements this class writes with do not
+    # invalidate it. A reservation's post-debit read would then populate the cache and a
+    # later rollover would be handed the pre-rollover row — which is exactly how a
+    # reconcile could roll the window twice and then raise.
+    def uncached_transaction(&)
+      GithubApiBudget.uncached { GithubApiBudget.transaction(&) }
+    end
+
     # Pessimistic SELECT ... FOR UPDATE, not an optimistic lock_version retry.
     # Contention on this one row is the design rather than an anomaly — every outbound
     # request in the system passes through it — so optimistic locking would degrade
@@ -278,19 +305,31 @@ module Github
       budget.reset_at.present? && snapshot.reset_at.present? && snapshot.reset_at > budget.reset_at
     end
 
-    def roll_window!(budget, now:)
+    def roll_window!(budget, now:, carry_forward: nil)
       derived = derived_allowances(budget.limit)
+      carried = carried_counters(carry_forward)
 
       GithubApiBudget.connection.exec_update(
         ActiveRecord::Base.sanitize_sql_array([
-          ROLL_WINDOW_SQL, now, derived.poll_allowance, derived.enrichment_allowance,
-          derived.reserve, now, SINGLETON_ID
+          ROLL_WINDOW_SQL, *carried.values, now, derived.poll_allowance,
+          derived.enrichment_allowance, derived.reserve, now, SINGLETON_ID
         ]),
         "Github::BudgetLedger RollWindow"
       )
 
-      Rails.logger.info(event: "budget.window_rolled", **derived.to_log)
+      Rails.logger.info(event: "budget.window_rolled", carried_forward: carry_forward, **derived.to_log)
       GithubApiBudget.find(SINGLETON_ID)
+    end
+
+    # Zeros unless a request is being carried into the new window, in which case its own
+    # class starts at one.
+    def carried_counters(request_class)
+      {
+        poll_used: request_class == :poll ? 1 : 0,
+        enrichment_used: enrichment?(request_class) ? 1 : 0,
+        actor_share_used: request_class == :actor ? 1 : 0,
+        repository_share_used: request_class == :repository ? 1 : 0
+      }
     end
 
     # §10's denial conditions, in order of how actionable they are to an operator.

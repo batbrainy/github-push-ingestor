@@ -95,7 +95,11 @@ module Github
 
         # Inside the hold, per §2A's "perform one request -> reconcile headers ->
         # release gate".
-        @ledger.reconcile!(rate_limit_from(response), now: @clock.call)
+        # The class travels with the reconciliation so that a response proving the
+        # rate-limit window has moved on can carry this request's debit into the window
+        # GitHub actually counted it in.
+        @ledger.reconcile!(rate_limit_from(response), request_class: request.request_class,
+                           now: @clock.call)
 
         log_result(FetchResult.from_response(
           request: request, status: response.status, headers: response.headers,

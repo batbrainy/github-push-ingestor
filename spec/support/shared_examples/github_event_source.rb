@@ -38,13 +38,26 @@ RSpec.shared_examples "a GitHub event source" do
     expect(source.first_page_request(etag: 'W/"abc"').headers).to include("If-None-Match" => 'W/"abc"')
   end
 
-  # The pagination seam: PR 6 calls request_for with a URL from the Link header, and one
+  # The pagination seam: PR 6 calls this with a URL from a Link header, and one
   # primitive serves both without a contract change.
   it "builds a request for any URL it is handed, which is how PR 6 will paginate" do
     request = source.request_for("#{source.first_page_url}&page=2")
 
     expect(request.url).to end_with("page=2")
     expect(request.request_class).to eq(:poll)
+  end
+
+  # A Link target is a URL GitHub supplied, so it has to clear the live policy and then
+  # be projected — an application-origin request built from one is refused as
+  # scheme_not_allowed offline, which would make Link-driven pagination impossible
+  # through this contract.
+  it "marks a Link target as payload-supplied, so it survives the URL policy in either mode" do
+    link_target = "https://api.github.com/events?per_page=100&page=2"
+    request = source.linked_page_request(link_target)
+
+    expect(request).to be_payload_supplied
+    expect { Github::UrlPolicy.validate_payload_url!(request.url, mode: expected_mode) }
+      .not_to raise_error
   end
 
   it "decodes a fetched page into raw event envelopes, untouched" do

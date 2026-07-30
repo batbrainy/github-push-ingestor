@@ -11,10 +11,10 @@ module Github
     #   * PushEvent filtering and normalisation, or the processor registry — PR 5. This
     #     returns raw event envelopes and nothing more.
     #   * Link-header pagination — PR 6. The seam is #request_for, which builds a
-    #     request for *any* URL: PR 6 calls it with a URL extracted from the Link
-    #     header, and PR 4 calls it only via #first_page_request. Making pagination a
-    #     parameter rather than a method means PR 6 needs no contract change and PR 4
-    #     ships no abstract method without a caller.
+    #     request for *any* URL, with #linked_page_request naming the Link case so its
+    #     payload origin is not something a caller has to remember. PR 4 exercises both
+    #     against the corpus, so neither is an abstract method without a caller, and PR 6
+    #     adds the Link *parsing* without a contract change.
     #   * ETag persistence and 304 scheduling — PR 6. #first_page_request accepts an
     #     etag: because the corpus contains a scripted "304 with ETag" scenario (§12)
     #     that cannot be authored without conditional-header construction, but nothing
@@ -76,15 +76,34 @@ module Github
         self.class.source_type
       end
 
+      # PR 6 calls this with a URL extracted from a Link header, which GitHub supplied
+      # and which therefore has to be validated as payload-origin: the corpus publishes
+      # real https://api.github.com Link targets, so an application-origin request built
+      # from one would be refused as scheme_not_allowed in fixture mode and offline
+      # pagination could not work through this contract at all.
+      #
+      # @param origin [Symbol] :application for a location this adapter constructed,
+      #   :payload for one GitHub supplied (a Link target)
       # @return [Github::Request]
-      def request_for(url, etag: nil)
-        Request.new(url: url, request_class: REQUEST_CLASS, etag: etag,
+      def request_for(url, etag: nil, origin: :application)
+        Request.new(url: url, request_class: REQUEST_CLASS, etag: etag, origin: origin,
                     context: { source_type: source_type })
       end
 
+      # The adapter's own endpoint, so application-origin by definition — which is what
+      # lets the offline source address the corpus with a scheme no payload could supply.
+      #
       # @return [Github::Request]
       def first_page_request(etag: nil)
-        request_for(first_page_url, etag: etag)
+        request_for(first_page_url, etag: etag, origin: :application)
+      end
+
+      # A page GitHub pointed at through a Link header. Named separately from
+      # #request_for so the origin is not something a caller has to remember.
+      #
+      # @return [Github::Request]
+      def linked_page_request(url)
+        request_for(url, origin: :payload)
       end
 
       # Decodes one fetched page into raw GitHub event envelopes. This is the seam PR 5's
