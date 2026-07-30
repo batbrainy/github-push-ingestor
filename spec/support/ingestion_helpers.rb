@@ -98,6 +98,29 @@ module IngestionHelpers
   def fixture_event_source
     Github::Ingestion::SourceProvisioner.ensure!(mode: :fixture, now: frozen_time)
   end
+
+  # The enrichment counterpart of #fixture_runner: the real ledger, gate and URL policy
+  # over the offline transport, with only the clocks and the sleeper replaced. The same
+  # ledger_for caveat applies — a custom configuration has to reach the ledger, or the
+  # runner and the ledger would disagree in specs while agreeing in production.
+  def fixture_enrichment_runner(transport: fixture_transport, now: frozen_time,
+                                configuration: nil, executor: nil, **overrides)
+    configuration ||= Github.configuration
+    selector = Github::Enrichment::CandidateSelector.new(configuration: configuration)
+
+    Github::EnrichmentRunner.new(
+      executor: executor || fixture_executor(transport: transport, ledger: ledger_for(configuration)),
+      configuration: configuration,
+      clock: -> { now },
+      monotonic: -> { 0.0 },
+      selector: selector,
+      # No jitter, so a scheduled retry is an instant a spec can name rather than a range.
+      entity_state: Github::Enrichment::EntityState.new(
+        backoff: Github::Enrichment::Backoff.new(random: Struct.new(:value) { def rand(*) = 0.0 }.new)
+      ),
+      **overrides
+    )
+  end
 end
 
 RSpec.configure do |config|

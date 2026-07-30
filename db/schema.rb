@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_07_30_120000) do
+ActiveRecord::Schema[8.1].define(version: 2026_07_31_090000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -53,6 +53,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_07_30_120000) do
     t.jsonb "raw_payload"
     t.datetime "skipped_at"
     t.datetime "updated_at", null: false
+    t.index ["fetched_at", "next_retry_at"], name: "index_github_actors_on_enrichment_refresh", where: "(enrichment_status = 'complete'::text)"
     t.index ["github_id"], name: "index_github_actors_on_github_id", unique: true
     t.index ["next_retry_at", "last_seen_at"], name: "index_github_actors_on_enrichment_candidates", where: "(enrichment_status = ANY (ARRAY['pending'::text, 'retryable_failure'::text]))"
     t.check_constraint "enrichment_attempts >= 0", name: "github_actors_enrichment_attempts_nonnegative"
@@ -103,6 +104,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_07_30_120000) do
     t.jsonb "raw_payload"
     t.datetime "skipped_at"
     t.datetime "updated_at", null: false
+    t.index ["fetched_at", "next_retry_at"], name: "index_github_repositories_on_enrichment_refresh", where: "(enrichment_status = 'complete'::text)"
     t.index ["github_id"], name: "index_github_repositories_on_github_id", unique: true
     t.index ["next_retry_at", "last_seen_at"], name: "index_github_repositories_on_enrichment_candidates", where: "(enrichment_status = ANY (ARRAY['pending'::text, 'retryable_failure'::text]))"
     t.check_constraint "enrichment_attempts >= 0", name: "github_repositories_enrichment_attempts_nonnegative"

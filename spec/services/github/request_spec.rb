@@ -31,6 +31,32 @@ RSpec.describe Github::Request do
     end
   end
 
+  describe "the fairness borrow (plan §10)" do
+    it "carries no borrow by default, so fairness binds unless a caller asks to spend past it" do
+      expect(request(request_class: :actor).borrow).to be(false)
+    end
+
+    it "refuses a borrowing poll, because borrowing is a concept between the two enrichment classes" do
+      expect { request(request_class: :poll, borrow: true) }
+        .to raise_error(ArgumentError, /borrow/)
+    end
+
+    # The reason the flag rides on the request rather than on a RequestExecutor argument:
+    # a redirect hop reserves again, and re-reserving a borrowed request under the
+    # guarantee cap would deny mid-chain after the first hop was already spent.
+    it "keeps the borrow across a redirect hop, which is reserved again under the same authorization" do
+      hop = request(request_class: :actor, borrow: true)
+              .redirected_to("https://api.github.com/users/octocat")
+
+      expect(hop.borrow).to be(true)
+    end
+
+    it "logs the borrow only when there is one, so twelve poll lines an hour carry no false" do
+      expect(request(request_class: :actor, borrow: true).to_log).to include(borrow: true)
+      expect(request(request_class: :poll).to_log.keys).not_to include(:borrow)
+    end
+  end
+
   describe "protocol headers (plan §2A)" do
     it "sends the three headers GitHub requires on every request" do
       expect(request.headers).to include(

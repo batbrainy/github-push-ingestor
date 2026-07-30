@@ -87,7 +87,11 @@ module Github
       validate(request)
 
       RequestGate.hold(wait_seconds: @request_gate_wait) do
-        @ledger.reserve!(request.request_class, now: @clock.call)
+        # The borrow travels on the request so a redirect hop and a retry — both of
+        # which reserve again — stay authorized under the same fairness decision the
+        # caller made once (§10). This class does not interpret it and could not
+        # compute it: it is a fact about the entity tables.
+        @ledger.reserve!(request.request_class, now: @clock.call, borrow: request.borrow)
 
         # Authoritative, in-chain validation: its return value is what the transport
         # receives, so an unvalidated URL cannot physically reach a socket.

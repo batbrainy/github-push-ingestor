@@ -121,11 +121,12 @@ module Github
           # RETURNING produced a row. On a duplicate the transaction still commits, carrying
           # rule 1's identity refresh and nothing else, so rule 4 — "a duplicate event
           # replay can never reactivate enrichment" — holds structurally rather than by a
-          # later check. PR 7 adds the skipped_budget reactivation transition at this one
-          # call site; PR 5 owns the gate.
+          # later check. PR 5 owns this gate; PR 7 put the skipped_budget reactivation
+          # behind it, which is why that guarantee needed no code of its own.
           next nil if id.nil?
 
           touch_activity(outcome, received_at: received_at)
+          reactivate(outcome, run_id: run_id, received_at: received_at)
           id
         end
 
@@ -142,6 +143,26 @@ module Github
           github_id: outcome.repository_attributes.fetch(:github_id),
           seen_at: received_at, event_occurred_at: outcome.occurred_at
         )
+      end
+
+      # §7's reactivation rule, behind the same RETURNING gate as the activity update
+      # above — which is the whole of rule 4's guarantee. Actor before repository, keeping
+      # the ordering the stub upserts established so two concurrent pages touching the
+      # same pair cannot deadlock.
+      #
+      # §11 puts "reactivated" at INFO, and it belongs there rather than at DEBUG: an
+      # entity coming back from skipped_budget is the observable half of §10's bounded
+      # backlog, and reviewer verification step 7 asks for exactly this to be absent on a
+      # replay.
+      def reactivate(outcome, run_id:, received_at:)
+        [ [ GithubActor, outcome.actor_attributes, :github_actor_id ],
+          [ GithubRepository, outcome.repository_attributes, :github_repository_id ] ].each do |model, attributes, log_key|
+          github_id = attributes.fetch(:github_id)
+          next if model.reactivate_skipped!(github_id: github_id, now: received_at).zero?
+
+          Rails.logger.info(event: "enrichment.reactivated", run_id: run_id, log_key => github_id,
+                            github_event_id: outcome.github_event_id)
+        end
       end
 
       def log_persisted(outcome, run_id:, created_id:)

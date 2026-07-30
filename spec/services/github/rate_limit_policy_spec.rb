@@ -137,8 +137,8 @@ RSpec.describe Github::RateLimitPolicy do
   describe "a budget denial" do
     before { active_budget_window(now: now) }
 
-    def denied(reason)
-      fetched(status: nil, error: Github::Errors::BudgetExhausted.new(:poll, reason),
+    def denied(reason, request_class: :poll)
+      fetched(status: nil, error: Github::Errors::BudgetExhausted.new(request_class, reason),
               classification: :budget_denied)
     end
 
@@ -163,6 +163,16 @@ RSpec.describe Github::RateLimitPolicy do
 
     it "writes nothing for a block that is already in force" do
       expect(policy.apply!(denied(:globally_blocked), now: now).kind).to eq(:none)
+    end
+
+    # §10: "Actor/repository share exhaustion lives inside BudgetLedger.reserve!(:actor |
+    # :repository) and never touches the global block." A fairness refusal between the two
+    # enrichment classes is the furthest thing from a condition that should stop polling.
+    it "writes no global block when only one enrichment class has spent its share" do
+      decision = policy.apply!(denied(:share_exhausted, request_class: :actor), now: now)
+
+      expect(decision.kind).to eq(:none)
+      expect(current_budget.global_blocked_until).to be_nil
     end
   end
 

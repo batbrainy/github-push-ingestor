@@ -38,6 +38,15 @@ x-app-env: &app_env
   MAX_PAGES_PER_POLL: ${MAX_PAGES_PER_POLL:-1}
   ENABLED_LIVE_SOURCE_COUNT: ${ENABLED_LIVE_SOURCE_COUNT:-1}
   RATE_LIMIT_RESERVE: ${RATE_LIMIT_RESERVE:-8}
+  # §10's enrichment policy, in the shared anchor for a sharper version of the same
+  # reason. ACTOR_ENRICHMENT_SHARE decides how the ledger splits the enrichment allowance
+  # under its row lock, and the three timings decide which candidates are *currently
+  # eligible* — which is the input to the borrow decision the ledger then acts on. Two
+  # processes reading different values would enforce different policies against one row.
+  ACTOR_ENRICHMENT_SHARE: ${ACTOR_ENRICHMENT_SHARE:-0.50}
+  ENRICHMENT_ELIGIBILITY_WINDOW_SECONDS: ${ENRICHMENT_ELIGIBILITY_WINDOW_SECONDS:-3600}
+  ACTOR_REFRESH_TTL_SECONDS: ${ACTOR_REFRESH_TTL_SECONDS:-86400}
+  REPOSITORY_REFRESH_TTL_SECONDS: ${REPOSITORY_REFRESH_TTL_SECONDS:-86400}
 
 services:
   db:
@@ -116,6 +125,29 @@ services:
     profiles: ["tools"]
     restart: "no"
     entrypoint: ["bin/ingest"]
+    command: []
+    environment: *app_env
+    depends_on:
+      db:
+        condition: service_healthy
+      setup:
+        condition: service_completed_successfully
+
+  # The enrichment half of §5's two request paths, and a separate service rather than a
+  # flag on `ingest` for the same reason bin/enrich is a separate file: enrichment belongs
+  # to no event source, takes no source lock, and spends a different class of the budget.
+  #
+  # Identical plumbing to `ingest` otherwise, entrypoint included, so both bare and flagged
+  # invocations work:
+  #
+  #   docker compose run --rm enrich
+  #   docker compose run --rm enrich --limit 6 --class actor
+  enrich:
+    build: .
+    image: github-push-ingestor-app
+    profiles: ["tools"]
+    restart: "no"
+    entrypoint: ["bin/enrich"]
     command: []
     environment: *app_env
     depends_on:

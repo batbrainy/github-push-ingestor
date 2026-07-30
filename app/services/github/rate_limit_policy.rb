@@ -15,8 +15,14 @@ module Github
   # counters and keeps it out of the global column, because one timestamp cannot serve
   # both — enrichment spending its 40 attempts would stop polling, and polling spending
   # its 12 would stop enrichment (Appendix D item 2). A :class_allowance_exhausted denial
-  # therefore writes nothing here; GithubApiBudget#poll_class_blocked_until already
-  # expresses it.
+  # therefore writes nothing here; GithubApiBudget#poll_class_blocked_until and
+  # #enrichment_class_blocked_until already express it.
+  #
+  # Nor is the fairness share, for the same reason one level down. §10: "Actor/repository
+  # share exhaustion lives inside BudgetLedger.reserve!(:actor | :repository) and never
+  # touches the global block." A :share_exhausted denial is a refusal between two
+  # enrichment classes; treating it as a condition that stops polling would be absurd,
+  # and #reserve_breach's allowlist is what makes that structural rather than a comment.
   class RateLimitPolicy
     # §10: "≥ 1 minute with exponential backoff when the header is absent". Also the
     # floor for a Retry-After GitHub sends that is shorter, or zero.

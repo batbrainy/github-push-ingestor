@@ -51,4 +51,33 @@ class GithubApiBudget < ApplicationRecord
 
     reset_at || now + cadence_seconds
   end
+
+  # §10's second derivation, the mirror of the one above:
+  #
+  #     enrichment_class_blocked_until = enrichment_used >= enrichment_allowance ? reset_at : nil
+  #
+  # The fallback is load-bearing here for the same reason and one more.
+  # Allowances#clamped yields enrichment_allowance = 0 whenever the observed limit leaves
+  # nothing after the reserve and polling, and both a fresh install and every window
+  # rollover leave reset_at NULL. The plan's literal ternary then reports "not blocked"
+  # for a class that provably cannot spend, and PR 8's enrichment job re-attempts every
+  # tick for the rest of the window, taking the global request gate each time to be told
+  # no.
+  #
+  # One *poll* cadence, and not an enrichment-specific knob, because of what the unknown
+  # actually is: reset_at is NULL precisely when the window has not been initialized, and
+  # §7 says only a poll can initialize it. "After the next poll could plausibly have
+  # happened" is therefore the honest instant, and that is POLL_INTERVAL_SECONDS.
+  #
+  # Derived from the class cap, never from actor_share_used or repository_share_used.
+  # §9's formula names enrichment_used, and the reasoning is that a share exhaustion is a
+  # denial rather than a deferral: it is relieved either by the window rolling *or* by the
+  # other class running out of eligible candidates, and the second has no instant to name.
+  # Deferring on it would also make §10's borrowing unreachable — Github::EnrichmentSchedule
+  # would report "not due" before the runner ever computed a borrow.
+  def enrichment_class_blocked_until(now:, cadence_seconds: Github.configuration.poll_interval_seconds)
+    return nil if enrichment_used < enrichment_allowance
+
+    reset_at || now + cadence_seconds
+  end
 end
