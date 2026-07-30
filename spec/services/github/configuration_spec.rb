@@ -54,9 +54,12 @@ RSpec.describe Github::Configuration do
         .to raise_error(Github::Errors::ConfigurationError, /GITHUB_MODE/)
     end
 
-    it "resolves the corpus directory from the selected scenario" do
+    # One corpus, one manifest: the scenario names a section inside it rather than a
+    # directory of its own, so scenarios can inherit and share body files.
+    it "points at the single corpus directory whatever scenario is selected" do
       expect(configuration(GITHUB_FIXTURE_SCENARIO: "paginated").fixture_root.to_s)
-        .to end_with("fixtures/github/paginated")
+        .to end_with("fixtures/github")
+      expect(configuration(GITHUB_FIXTURE_SCENARIO: "paginated").fixture_scenario).to eq("paginated")
     end
   end
 

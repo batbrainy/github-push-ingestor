@@ -75,8 +75,11 @@ module Github
     def live? = mode == "live"
     def fixture? = mode == "fixture"
 
+    # One corpus directory holding one manifest; fixture_scenario selects a scenario
+    # *inside* it rather than a directory of its own, so scenarios can inherit from
+    # each other and share one set of body files.
     def fixture_root
-      Rails.root.join("fixtures", "github", fixture_scenario)
+      Rails.root.join("fixtures", "github")
     end
 
     # The limit to plan against: the last authoritative observation when there is one,

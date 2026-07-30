@@ -21,6 +21,7 @@ module Github
 
     def reset!
       @configuration = nil
+      FixtureCorpus.reset!
     end
   end
 end
