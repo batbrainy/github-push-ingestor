@@ -6,6 +6,12 @@ gem "rails", "~> 8.1.3"
 gem "pg", "~> 1.1"
 # Use the Puma web server [https://github.com/puma/puma]
 gem "puma", ">= 5.0"
+
+# HTTP client for every live GitHub request, pinned by IMPLEMENTATION_PLAN.md §2A.
+# Reached only through Github::Transports::Faraday, and configured with no middleware:
+# retries and redirects belong to Github::RequestExecutor because every attempt
+# re-reserves budget and every redirect target is re-validated (§10, docs/adr/0003).
+gem "faraday", "~> 2.14"
 # Build JSON APIs with ease [https://github.com/rails/jbuilder]
 # gem "jbuilder"
 
@@ -27,6 +33,10 @@ group :development, :test do
 
   # RSpec is the test framework pinned by IMPLEMENTATION_PLAN.md §2A
   gem "rspec-rails"
+
+  # Refuses every outbound socket the suite has not stubbed, so no spec can reach live
+  # GitHub (§12, CLAUDE.md). Pairs with the static corpus under fixtures/github/.
+  gem "webmock", require: false
 
   # Audits gems for known security defects (use config/bundler-audit.yml to ignore issues)
   gem "bundler-audit", require: false
