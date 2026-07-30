@@ -10,28 +10,36 @@ and worker crashes.
 
 ## Status
 
-Poll budget and scheduling stage (PR 6). The Rails 8.1 API, PostgreSQL, Docker
+Enrichment budget and fairness stage (PR 7). The Rails 8.1 API, PostgreSQL, Docker
 Compose topology, health endpoints, and structured JSON logging landed in PR 2; the
 seven core tables and their idempotent write paths in PR 3; the chain every GitHub
 request flows through — request gate, class-aware budget ledger, SSRF URL policy,
 live and offline transports, fixture corpus, per-source advisory lock, event-source
 adapter — in PR 4; the processor registry, the tolerant `PushEvent` parser, the
-quarantine taxonomy, the ingest transaction, and the one-shot command in PR 5.
+quarantine taxonomy, the ingest transaction, and the one-shot command in PR 5;
+`Link`-header pagination, the page-one ETag, the five independent components behind
+`effective_poll_time`, and global-versus-class blocking in PR 6.
 
-This stage makes a poll a **scheduled** act rather than an unconditional one. It
-adds `Link`-header pagination bounded by `MAX_PAGES_PER_POLL` and by the budget
-ledger, the page-one ETag and its conditional request, the five independent
-components behind `effective_poll_time`, `global_blocked_until` for the three
-conditions that must stop every live request, class blocking derived from the
-ledger's counters, and `Retry-After` handling for secondary limits. `--force` now
-does exactly what plan §9 says it does, and nothing else.
+This stage fills the stubs in. Actors and repositories are now fetched from the
+URLs their own push events carried, under an hourly allowance split fairly between
+the two classes — because one observed live page referenced ~89 distinct actors
+against ~92 distinct repositories, and a queue ordered purely by recency would
+starve actor enrichment to zero. It adds the entity state machine and its write
+matrix, the per-class fairness guarantees with eligibility-aware borrowing,
+newest-first eligibility, the freshness cache and its refresh TTLs, `skipped_budget`
+with distinct-event reactivation, error classification that tells an entity failure
+from a source failure, and `effective_enrichment_time`.
 
-**Nothing fires the schedule yet.** The cadence is real, but
-`docker compose run --rm ingest` is still the only thing that polls; the always-on
-`worker` container and its recurring task are PR 8. A one-shot run that is not yet
-due now reports the instant it becomes due instead of polling. Enrichment — filling
-in actor and repository details — is PR 7, so entities are persisted as stubs
-marked `pending`.
+**Enrichment is bounded best-effort sampling, and says so.** Against ~2,172 cold
+entity requests an hour of demand and 40 available, partial coverage is the design
+rather than a shortfall — `skipped_budget` is a normal documented outcome, and
+`bin/enrich` prints the per-class usage so the sampling rate is visible instead of a
+mysteriously growing queue (plan §10).
+
+**Nothing fires either schedule yet.** `docker compose run --rm ingest` and
+`docker compose run --rm enrich` are still the only things that poll and enrich; the
+always-on `worker` container, its recurring task, and the entity-scoped reconciler
+are PR 8.
 
 Ingestion capabilities land PR by PR; each README section below is completed by
 the pull request that ships the capability it documents. The authoritative
@@ -203,8 +211,52 @@ bypasses this application's cadence, never GitHub's floor.
 
 Once past it, nothing is created: the same page is absorbed as **4 duplicates**, the
 three quarantine rows stay three rows with their occurrence counts at 2, and no
-entity's activity moves. Re-running ingestion is safe at any frequency — see
+entity's activity moves — and **no skipped entity is reactivated**, which is the
+half of plan §7's merge rules a re-polled window would otherwise break. Re-running
+ingestion is safe at any frequency — see
 [ADR 0005](docs/adr/0005-at-least-once-with-idempotent-writes.md).
+
+### Enrichment, offline
+
+The same corpus resolves every entity the page referenced, so the whole flow — poll,
+persist, stub, enrich — runs with no network:
+
+```bash
+GITHUB_MODE=fixture docker compose run --rm ingest
+GITHUB_MODE=fixture docker compose run --rm enrich --limit 6
+```
+
+Four of the six entities resolve, and two are gone. That is deliberate: corpus event
+`58000000008` references an actor and a repository that both `404`, because §10
+requires a dead enrichment target to fail the *entity* and leave the source running.
+
+```bash
+docker compose exec db psql -U postgres -d github_push_ingestor_development -c "
+  SELECT 'actor' AS class, enrichment_status, COUNT(*) FROM github_actors GROUP BY 2
+  UNION ALL
+  SELECT 'repository', enrichment_status, COUNT(*) FROM github_repositories GROUP BY 2;"
+#    class    | enrichment_status  | count
+#  actor      | complete           |     2
+#  actor      | permanent_failure  |     1
+#  repository | complete           |     2
+#  repository | permanent_failure  |     1
+```
+
+Six requests, split evenly, and the event source untouched by either `404`:
+
+```bash
+docker compose exec db psql -U postgres -d github_push_ingestor_development -c "
+  SELECT enrichment_used, actor_share_used, repository_share_used FROM github_api_budget;
+  SELECT status, enabled FROM event_sources;"
+#  enrichment_used | actor_share_used | repository_share_used
+#                6 |                3 |                     3
+#  status | enabled
+#  idle   | t
+```
+
+Run `enrich` again and it reports `Nothing to enrich — no eligible candidate`: every
+entity is either enriched and inside its refresh TTL, or permanently failed. That is
+the freshness cache, and it costs nothing.
 
 ### Pagination, offline
 
@@ -320,8 +372,16 @@ ID, classification and fingerprint — `ingestion.not_due` when a poll was not
 attempted, `ingestion.deferred` when GitHub or the ledger declined one,
 `ingestion.run_completed` with every count and the next poll instant, and the budget
 transitions `budget.window_initialized`, `budget.window_rolled`,
-`budget.class_exhausted`, `budget.global_block_set` and
+`budget.class_exhausted`, `budget.share_exhausted` — once per class per window, from
+the request that reached its fairness guarantee — `budget.global_block_set` and
 `budget.global_block_cleared`.
+
+Enrichment adds `enrichment.completed` and `enrichment.failed`, each carrying the
+entity type, its GitHub id, the response classification and the resulting entity
+status; `enrichment.aged_out`, one summary line per class per sweep rather than one
+per row; `enrichment.reactivated` when a genuinely new push event brings a
+`skipped_budget` entity back; and `enrichment.lease_lost` at warning level when an
+outcome arrived after another worker had claimed the row.
 
 `LOG_LEVEL=debug` adds `github.request`, `ingestion.page_fetched` and
 `ingestion.page_processed` per page, `ingestion.pagination_stopped` with its reason,
@@ -353,8 +413,13 @@ is [`.env.example`](.env.example).
 | `MAX_PAGES_PER_POLL` | `1` | How many `Link`-followed pages one poll may fetch, and an allowance-formula input. Raising it trades enrichment allowance for capture depth: at `3` the poll allowance becomes 36 attempts an hour and enrichment drops to 16 (plan §9, §10) |
 | `ENABLED_LIVE_SOURCE_COUNT` | `1` | Allowance-formula input: live sources sharing one per-IP budget |
 | `RATE_LIMIT_RESERVE` | `8` | Requests per hour left deliberately unspent (plan §10) |
+| `ACTOR_ENRICHMENT_SHARE` | `0.50` | How the enrichment allowance splits between actors and repositories: `floor(allowance x this)` guarantees actors, the remainder goes to repositories. A guarantee, not a cap — either class may borrow the other's unused capacity when the other has no *currently eligible* candidate. Both ends of `[0, 1]` are legal (plan §10) |
+| `ENRICHMENT_ELIGIBILITY_WINDOW_SECONDS` | `3600` | How long a candidate stays worth enriching. Past it, the entity transitions to `skipped_budget` — which is what bounds the backlog — until a genuinely new push event reactivates it (plan §10, B8) |
+| `ACTOR_REFRESH_TTL_SECONDS` | `86400` | How long an enriched actor is reused before it is re-fetched. Never-enriched candidates always take priority over refreshes (plan §10) |
+| `REPOSITORY_REFRESH_TTL_SECONDS` | `86400` | The same, for repositories |
 
-The last four feed the one authoritative allowance formula (plan §10):
+`POLL_INTERVAL_SECONDS`, `MAX_PAGES_PER_POLL`, `ENABLED_LIVE_SOURCE_COUNT` and
+`RATE_LIMIT_RESERVE` feed the one authoritative allowance formula (plan §10):
 
 ```text
 poll_attempt_allowance = ceil(3600 / POLL_INTERVAL_SECONDS)
@@ -372,11 +437,20 @@ variable there would make the SSRF boundary a deployment setting; the API versio
 is pinned to `2022-11-28`, the version every live probe behind this plan was run
 under.
 
+The enrichment allowance is then split by `ACTOR_ENRICHMENT_SHARE` (plan §10):
+
+```text
+actor_guarantee      = floor(enrichment_allowance x ACTOR_ENRICHMENT_SHARE)
+repository_guarantee = enrichment_allowance - actor_guarantee
+```
+
+With the defaults: 20 actor and 20 repository attempts an hour. The remainder
+always goes to repositories, because the formula floors one side and subtracts for
+the other — so the two always add up to the whole allowance.
+
 Database connection settings (`POSTGRES_HOST`, `POSTGRES_PORT`,
 `POSTGRES_USER`, `POSTGRES_PASSWORD`) are managed by the compose topology
 itself and matter only when running the app outside compose.
-
-Fairness shares and enrichment refresh TTLs arrive with PR 7.
 
 ## The request path
 
@@ -388,20 +462,21 @@ one-shot — takes one chain, and nothing outside it calls GitHub
 IngestionRunner ──► SourceLock ──► PollSchedule (due? — five components, §9)
                                  │
                                  ├──► PageLoop ──► RequestExecutor ──► RequestGate
-[enrichment]  ───────────────────┘      │ ▲                        ──► BudgetLedger.reserve!
-                                        │ │                        ──► UrlPolicy
-                                        │ └── LinkHeader.next_url  ──► Transport (Faraday | Fixture)
-                                        │                                   │
-                                        │                                   ▼
+EnrichmentRunner ────────────────┘      │ ▲                        ──► BudgetLedger.reserve!
+  AgeOut → skipped_budget               │ │                        ──► UrlPolicy
+  Fairness → class, pool, borrow        │ └── LinkHeader.next_url  ──► Transport (Faraday | Fixture)
+  Claim → lease on next_retry_at        │                                   │
+  (never a SourceLock, §8 step 1)       │                                   ▼
                                         │                  PageWriter: one transaction per event
                                         │                  stub upserts → INSERT … ON CONFLICT
                                         │                  DO NOTHING RETURNING id → activity
-                                        │                  updates only when a row returned
+                                        │                  updates and reactivation only when
+                                        │                  a row returned
                                         ▼
                               RateLimitPolicy ──► BudgetLedger#block_globally!
                                         │
-                                        ▼
-                              PollState: the event_sources write
+                                        ├──► PollState: the event_sources write
+                                        └──► EntityState: the one entity write, lease-guarded
 ```
 
 - **`Github::IngestionRunner`** owns one polling operation: it holds the source lock
@@ -452,17 +527,44 @@ IngestionRunner ──► SourceLock ──► PollSchedule (due? — five compo
   the source lock. Its rule: the scheduling components move only when a poll attempt
   actually happened, so a budget denial or a held gate can neither advance the cadence nor
   burn a healthy source's failure count.
+- **`Github::EnrichmentRunner`** owns one enrichment cycle and enriches at most one
+  entity: it ages overdue candidates into `skipped_budget` first — unconditionally, because
+  §12's sequence needs skipping to keep happening precisely while the budget is exhausted —
+  then asks fairness which class works next, leases that row, fetches through the same
+  chain, and writes one outcome. It never takes a source lock and opens no transaction
+  across the request.
+- **`Github::Enrichment::Fairness`** applies §10's ladder: a never-enriched candidate in a
+  class still inside its guarantee, then the same borrowing when the other class has no
+  *currently eligible* candidate, then a TTL-stale refresh only when no pending candidate
+  is eligible anywhere. It decides; the ledger enforces, so a wrong answer produces a
+  refused reservation rather than an overspend
+  ([ADR 0007](docs/adr/0007-enrichment-fairness-shares-and-borrowing.md)).
+- **`Github::Enrichment::Claim`** prevents two workers enriching one entity by leasing the
+  row — a conditional `UPDATE` that pushes `next_retry_at` forward. One column, one
+  meaning: the same predicate excludes leases, backoffs and secondary-limit deferrals from
+  both candidate pools and from the age-out sweep, so the four queries cannot drift apart.
+  A crashed worker leaves nothing to clean up; the lease expires.
+- **`Github::Enrichment::EntityState`** is §10's response behaviour resolved onto one
+  entity row, and `PollState`'s twin. Its rules: an attempt is counted only for an outcome
+  that says something about *this entity* — a rate limit is a fact about the IP — and a
+  retryable failure never downgrades an already-enriched record, so a transient `500` on a
+  refresh cannot drop coverage.
+- **`Github::EnrichmentSchedule`** is §9's enrichment rule as a value: the maximum of the
+  entity's `next_retry_at`, `global_blocked_until` and a derived
+  `enrichment_class_blocked_until`. Three components, no `--force` — §9 licenses that
+  against a poll cadence, and enrichment has none — and no per-class share, because a share
+  exhaustion is a denial rather than a deferral.
 
 Decisions behind this are recorded in
 [`docs/adr/`](docs/adr/): advisory locks and the gate (0002), the source and transport
 seams (0003), the class-aware ledger (0004), at-least-once processing with idempotent
-writes (0005), and decomposed poll deferral state (0006).
+writes (0005), decomposed poll deferral state (0006), and enrichment fairness shares
+and borrowing (0007).
 
 ## Planned contents
 
 | Section | Lands with |
 |---|---|
-| Enrichment flow | PR 7 |
 | Data model reference | PR 12 (design brief) |
 | Continuous ingestion behavior — what the always-on poller does on a schedule | PR 8 |
 | Full fixture scenario matrix (retries, rate limits, redirects) | PR 11 |
@@ -477,7 +579,9 @@ docker compose up --build                             # available now
 docker compose run --rm test                          # available now (real suite; runs in CI too)
 docker compose logs -f                                # available now
 docker compose run --rm ingest                        # available now — one ingestion cycle
+docker compose run --rm enrich --limit 6              # available now — up to six enrichment cycles
 GITHUB_MODE=fixture docker compose run --rm ingest    # available now — deterministic, no network
+GITHUB_MODE=fixture docker compose run --rm enrich --limit 6
 ```
 
 ## Development

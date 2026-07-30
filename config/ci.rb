@@ -13,6 +13,12 @@ CI.run do
   # mode, so it touches no network.
   step "Tests: One-shot ingestion smoke", "env RAILS_ENV=test GITHUB_MODE=fixture bin/ingest"
 
+  # Ordered after the ingestion smoke on purpose, and worth more than its own boot check:
+  # that step has already initialized the rate-limit window and persisted the corpus's
+  # stub entities, so this one exercises the whole §12 chain — poll, persist, stub,
+  # enrich — across two real processes, offline and deterministically.
+  step "Tests: One-shot enrichment smoke", "env RAILS_ENV=test GITHUB_MODE=fixture bin/enrich"
+
   step "Style: Ruby", "bin/rubocop"
 
   step "Security: Gem audit", "bin/bundler-audit"

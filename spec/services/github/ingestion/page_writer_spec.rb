@@ -143,12 +143,81 @@ RSpec.describe Github::Ingestion::PageWriter do
       )
     end
 
-    # The structural assertion, not just its side effects: the gate is the call site.
-    it "never calls the activity update at all" do
+    # The structural assertion, not just its side effects: the gate is the call site, and
+    # both halves of merge rule 3 sit behind it.
+    it "never calls the activity update or the reactivation at all" do
       expect(GithubActor).not_to receive(:touch_activity!)
       expect(GithubRepository).not_to receive(:touch_activity!)
+      expect(GithubActor).not_to receive(:reactivate_skipped!)
+      expect(GithubRepository).not_to receive(:reactivate_skipped!)
 
       write(well_formed_envelope, at: later)
+    end
+  end
+
+  # The other side of the same gate, and the pair is the assertion: §7's reactivation rule
+  # says "a **newly persisted** push event referencing the entity … may transition it back
+  # to pending", while rule 4 says a replay never may. The two examples above and below
+  # differ only in whether the event is genuinely new.
+  describe "a genuinely new event referencing a skipped entity" do
+    let(:later) { frozen_time + 60 }
+
+    before do
+      write(well_formed_envelope)
+
+      GithubActor.where(github_id: 583_231)
+                 .update_all(enrichment_status: "skipped_budget", skipped_at: frozen_time,
+                             enrichment_attempts: 3, updated_at: frozen_time)
+      GithubRepository.where(github_id: 1_296_269)
+                      .update_all(enrichment_status: "skipped_budget", skipped_at: frozen_time,
+                                  updated_at: frozen_time)
+    end
+
+    def distinct_event(at:)
+      write(well_formed_envelope("id" => "58000000099", "payload" => { "push_id" => 27_500_000_099 }), at: at)
+    end
+
+    it "reactivates both entities, because a distinct event id proves new activity" do
+      distinct_event(at: later)
+
+      expect(GithubActor.sole).to have_attributes(enrichment_status: "pending", skipped_at: nil)
+      expect(GithubRepository.sole).to have_attributes(enrichment_status: "pending", skipped_at: nil)
+    end
+
+    # §7's reactivation rule covers delayed-but-new events explicitly: "even with an old
+    # created_at (documented 30s-6h latency), a distinct event ID proves new activity".
+    it "moves the activity timestamps that drive newest-first ordering" do
+      distinct_event(at: later)
+
+      expect(GithubActor.sole.last_seen_at).to eq(later)
+    end
+
+    # An inbound envelope performed no fetch, so writing last_error = NULL or resetting the
+    # attempt count would assert something that did not happen.
+    it "keeps the failure history, because no fetch occurred" do
+      distinct_event(at: later)
+
+      expect(GithubActor.sole.enrichment_attempts).to eq(3)
+    end
+
+    it "logs the reactivation at INFO, which §11 lists among the enrichment events" do
+      allow(Rails.logger).to receive(:info)
+
+      distinct_event(at: later)
+
+      expect(Rails.logger).to have_received(:info)
+        .with(hash_including(event: "enrichment.reactivated", github_actor_id: 583_231))
+    end
+
+    it "logs nothing when there was nothing to reactivate" do
+      GithubActor.update_all(enrichment_status: "pending", skipped_at: nil)
+      GithubRepository.update_all(enrichment_status: "pending", skipped_at: nil)
+      allow(Rails.logger).to receive(:info)
+
+      distinct_event(at: later)
+
+      expect(Rails.logger).not_to have_received(:info)
+        .with(hash_including(event: "enrichment.reactivated"))
     end
   end
 

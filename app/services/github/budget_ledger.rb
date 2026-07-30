@@ -9,9 +9,15 @@ module Github
   # github_api_budget — but *which* condition warrants a global block, and until when, is
   # Github::RateLimitPolicy's call, and it is the only caller of #block_globally!.
   # Scheduling reads nothing from here beyond two columns: class blocking is derived on
-  # GithubApiBudget itself. Fairness shares between actors and repositories are PR 7;
-  # actor_share_used and repository_share_used are maintained accurately here so PR 7
-  # adds predicates over data that is already correct, with no back-fill.
+  # GithubApiBudget itself.
+  #
+  # §10's fairness split between actors and repositories is enforced here, under the same
+  # row lock as the debit, because ADR 0004 makes this the only writer of the row. The one
+  # fact it cannot establish is whether the *other* class has a currently eligible
+  # candidate — that lives in github_actors and github_repositories, and reaching for two
+  # more tables from inside the most contended row lock in the application would invert
+  # the locking discipline. So the caller asserts it (`borrow:`) and this class enforces
+  # the arithmetic.
   #
   # Three properties this class exists to hold:
   #
@@ -25,8 +31,13 @@ module Github
   class BudgetLedger
     SINGLETON_ID = GithubApiBudget::SINGLETON_ID
 
+    # :share_exhausted rather than :class_share_exhausted. In this file "class" already
+    # means poll-versus-enrichment (class_used, class_allowance,
+    # :class_allowance_exhausted); the share sits *inside* the enrichment class, between
+    # actor and repository, so reusing the word would overload it with the wrong scope.
     DENIAL_REASONS = %i[
       globally_blocked window_uninitialized reserve_reached class_allowance_exhausted
+      share_exhausted
     ].freeze
 
     # One statement per class rather than an interpolated column list: this is the most
@@ -47,6 +58,12 @@ module Github
     # The WHERE guard repeats the check denial_reason already made under the row lock.
     # It is defence in depth: if it ever rejects, the two disagree and that is a bug,
     # not a denial.
+    #
+    # The two enrichment statements carry a third bind, the class's share cap, which
+    # reserve! computes once and hands to both denial_reason and this statement — so the
+    # guard stays a literal repeat rather than a second, separately derived predicate
+    # that could drift. Under a borrow that cap is enrichment_allowance, so the guard
+    # degenerates into the class check, which is what borrowing means spelled in SQL.
     DEBIT_SQL = {
       poll: <<~SQL.squish,
         UPDATE github_api_budget
@@ -63,7 +80,7 @@ module Github
                remaining = CASE WHEN remaining IS NULL THEN NULL ELSE GREATEST(remaining - 1, 0) END,
                lock_version = lock_version + 1,
                updated_at = ?
-         WHERE id = ? AND enrichment_used < enrichment_allowance
+         WHERE id = ? AND enrichment_used < enrichment_allowance AND actor_share_used < ?
       SQL
       repository: <<~SQL.squish
         UPDATE github_api_budget
@@ -72,7 +89,7 @@ module Github
                remaining = CASE WHEN remaining IS NULL THEN NULL ELSE GREATEST(remaining - 1, 0) END,
                lock_version = lock_version + 1,
                updated_at = ?
-         WHERE id = ? AND enrichment_used < enrichment_allowance
+         WHERE id = ? AND enrichment_used < enrichment_allowance AND repository_share_used < ?
       SQL
     }.freeze
 
@@ -156,10 +173,15 @@ module Github
     # request is performed.
     #
     # @param request_class [Symbol] :poll, :actor, or :repository
+    # @param borrow [Boolean] §10's fairness borrowing: the caller's assertion that the
+    #   other enrichment class has no *currently eligible* candidate, so this one may
+    #   spend past its guarantee. See the class comment for why this is asserted rather
+    #   than established here.
     # @return [GithubApiBudget] the row after the debit
     # @raise [Github::Errors::BudgetExhausted] carrying the denial reason
-    def reserve!(request_class, now: Time.current)
+    def reserve!(request_class, now: Time.current, borrow: false)
       assert_known_class!(request_class)
+      assert_borrowable!(request_class, borrow)
       assert_committable!
       bootstrap!(now: now)
 
@@ -167,13 +189,19 @@ module Github
         budget = GithubApiBudget.lock.find(SINGLETON_ID)
         budget = roll_window!(budget, now: now) if window_elapsed?(budget, now)
 
-        denial = denial_reason(budget, request_class, now)
+        # Computed once and handed to both the predicate and the statement. That is what
+        # keeps DEBIT_SQL's guard a *repeat* of denial_reason's check rather than a
+        # second derivation, and it is why a granted reservation can never then be
+        # rejected by the SQL.
+        cap = share_cap(budget, request_class, borrow: borrow)
+
+        denial = denial_reason(budget, request_class, now, share_cap: cap)
         # The rollover above commits even when the reservation is refused, so the reason
         # is carried out of the transaction and raised after it: a denial must not undo
         # a window reset that has genuinely happened.
         next [ budget, denial ] if denial
 
-        [ debit!(request_class, now: now), nil ]
+        [ debit!(request_class, now: now, share_cap: cap, borrow: borrow), nil ]
       end
 
       raise Errors::BudgetExhausted.new(request_class, reason) if reason
@@ -310,6 +338,16 @@ module Github
       raise ArgumentError, "unknown request class #{request_class.inspect}"
     end
 
+    # Borrowing is a fairness concept between the two enrichment classes. Asking for it
+    # on a poll is a programming error, and ignoring it silently would let a mis-plumbed
+    # caller believe fairness was being bypassed when it never was.
+    def assert_borrowable!(request_class, borrow)
+      return unless borrow && !enrichment?(request_class)
+
+      raise ArgumentError,
+            "borrowing applies to #{Request::ENRICHMENT_CLASSES.inspect}, not #{request_class.inspect}"
+    end
+
     # The debit must be durable before the HTTP request is issued: a caller's rollback
     # must not refund a request GitHub has already counted. ActiveRecord::Base.transaction
     # joins an open transaction by default, and requires_new: true would only give a
@@ -351,18 +389,28 @@ module Github
     # and only then debits, and a zero-row conditional UPDATE could not report *why* it
     # refused. The cost is nil because the reservation runs inside the request gate, so
     # at most one process is ever in here, holding one known row for microseconds.
-    def debit!(request_class, now:)
+    #
+    # The two enrichment statements take a third bind and the poll statement does not.
+    # Building the binds from the same three names in the same order and dropping the nil
+    # keeps one sanitize_sql_array call rather than a branch per class; share_cap is the
+    # only one of the three that is ever legitimately nil.
+    def debit!(request_class, now:, share_cap:, borrow:)
+      binds = [ now, SINGLETON_ID, share_cap ].compact
+
       updated = GithubApiBudget.connection.exec_update(
-        ActiveRecord::Base.sanitize_sql_array([ DEBIT_SQL.fetch(request_class), now, SINGLETON_ID ]),
+        ActiveRecord::Base.sanitize_sql_array([ DEBIT_SQL.fetch(request_class), *binds ]),
         "Github::BudgetLedger Debit"
       )
 
       if updated != 1
         raise Errors::LedgerInvariantViolation,
-              "a #{request_class} debit was rejected by the same guard that passed under the row lock"
+              "a #{request_class} debit was rejected by the same guards that passed under the row lock"
       end
 
-      GithubApiBudget.find(SINGLETON_ID).tap { |budget| log_class_exhausted(budget, request_class) }
+      GithubApiBudget.find(SINGLETON_ID).tap do |budget|
+        log_class_exhausted(budget, request_class)
+        log_share_transitions(budget, request_class, borrow: borrow)
+      end
     end
 
     # §11 puts "class exhaustion" among the budget transitions that belong at INFO.
@@ -384,6 +432,39 @@ module Github
       Rails.logger.info(event: "budget.class_exhausted", request_class: request_class,
                         used: used, allowance: allowance, resource: budget.resource,
                         reset_at: budget.reset_at&.utc&.iso8601)
+    end
+
+    # The share's two transitions, emitted for the same reason and on the same terms as
+    # log_class_exhausted above: from the debit that *reached* the number, so each fires
+    # once per class per window instead of once per denied attempt.
+    #
+    # Two edges worth naming. With a guarantee of zero the INFO never fires — the
+    # post-debit share is 1 and never 0 — which is correct, because nothing transitioned:
+    # that class was borrowing from its first request. And under a sustained borrow the
+    # INFO still fires exactly once, at the guarantee, with budget.class_exhausted
+    # following later at the class cap.
+    def log_share_transitions(budget, request_class, borrow:)
+      return unless enrichment?(request_class)
+
+      guarantee = Allowances.split(budget.enrichment_allowance, configuration.actor_enrichment_share)
+                            .fetch(request_class)
+      used = share_used(budget, request_class)
+
+      if used == guarantee
+        Rails.logger.info(event: "budget.share_exhausted", request_class: request_class,
+                          share_used: used, guarantee: guarantee,
+                          enrichment_used: budget.enrichment_used,
+                          enrichment_allowance: budget.enrichment_allowance,
+                          reset_at: budget.reset_at&.utc&.iso8601)
+      elsif borrow && used > guarantee
+        # DEBUG, and only when the borrow actually mattered: §11 puts per-request lines
+        # there, and a quiet system would otherwise log a borrow that changed nothing on
+        # every single enrichment request.
+        Rails.logger.debug(event: "budget.share_borrowed", request_class: request_class,
+                           share_used: used, guarantee: guarantee,
+                           enrichment_used: budget.enrichment_used,
+                           enrichment_allowance: budget.enrichment_allowance)
+      end
     end
 
     # Clock-driven rollover: the stored window boundary has passed. Checked in reserve!
@@ -451,7 +532,7 @@ module Github
     # Blocking is derived from timestamps alone, never from window_status: a
     # globally_blocked row whose timestamp had passed would otherwise be an
     # unrecoverable state, and the plan names no transition out of it.
-    def denial_reason(budget, request_class, now)
+    def denial_reason(budget, request_class, now, share_cap:)
       if budget.global_blocked_until.present? && budget.global_blocked_until > now
         :globally_blocked
       elsif enrichment?(request_class) && budget.window_initialized_at.nil?
@@ -472,6 +553,19 @@ module Github
         :reserve_reached
       elsif class_used(budget, request_class) >= class_allowance(budget, request_class)
         :class_allowance_exhausted
+      elsif share_cap && share_used(budget, request_class) >= share_cap
+        # Last, and unlike :window_uninitialized versus :reserve_reached this ordering is
+        # *not* arbitrary — the condition above overlaps with this one rather than being
+        # disjoint from it, so the order chooses which of two true statements is reported.
+        #
+        # The class cap wins because it is the broader and more actionable fact: once
+        # enrichment_used has reached enrichment_allowance, no share retune and no quiet
+        # backlog in the other class changes anything, and naming the share would send an
+        # operator to ACTOR_ENRICHMENT_SHARE when the answer is the window. It also
+        # matters to callers — :class_allowance_exhausted means "no enrichment until the
+        # window resets" and is already expressed by enrichment_class_blocked_until,
+        # while :share_exhausted means "not this class right now" and defers nothing.
+        :share_exhausted
       end
     end
 
@@ -485,6 +579,35 @@ module Github
 
     def class_allowance(budget, request_class)
       enrichment?(request_class) ? budget.enrichment_allowance : budget.poll_allowance
+    end
+
+    def share_used(budget, request_class)
+      request_class == :actor ? budget.actor_share_used : budget.repository_share_used
+    end
+
+    # nil for :poll — that statement carries no share bind and that class has no share
+    # predicate, so `share_cap &&` in denial_reason short-circuits by construction rather
+    # than by a repeated enrichment? test. A zero cap is truthy, so a zero guarantee
+    # correctly denies (0 >= 0).
+    #
+    # Under a borrow the cap is the whole enrichment allowance rather than
+    # `guarantee + the other class's unused capacity`. The two authorize exactly the same
+    # reservations: actor_share_used + repository_share_used == enrichment_used is an
+    # invariant of these statements, so the class guard already limits this class to
+    # enrichment_allowance - other_share_used, which is what §10's phrasing computes.
+    # Taking the simpler of two equivalent caps means the borrowed statement's guard
+    # degenerates into the class check — the shape "only the class cap binds" should have.
+    #
+    # Derived from the row's *stored* enrichment_allowance, never from a fresh
+    # Allowances.derive: ADR 0004 fixes the allowances at initialization and rollover, and
+    # a guarantee computed from a different total than class_allowance checks against
+    # could exceed it.
+    def share_cap(budget, request_class, borrow:)
+      return nil unless enrichment?(request_class)
+      return budget.enrichment_allowance if borrow
+
+      Allowances.split(budget.enrichment_allowance, configuration.actor_enrichment_share)
+                .fetch(request_class)
     end
 
     # A present but different resource means the response belongs to another rate-limit

@@ -19,6 +19,7 @@ RSpec.describe "docker-compose.yml" do
 
   it "keeps the one-shots behind the tools profile" do
     expect(services.fetch("ingest").fetch("profiles")).to eq([ "tools" ])
+    expect(services.fetch("enrich").fetch("profiles")).to eq([ "tools" ])
     expect(services.fetch("test").fetch("profiles")).to eq([ "tools" ])
   end
 
@@ -67,17 +68,60 @@ RSpec.describe "docker-compose.yml" do
       )
     end
 
+    # ACTOR_ENRICHMENT_SHARE decides how the ledger splits the enrichment allowance under
+    # its row lock, and the three timings decide which candidates are *currently eligible*
+    # — which is the input to the borrow decision the ledger then acts on. Two processes
+    # reading different values would enforce different policies against one row.
+    it "forwards §10's fairness share and enrichment timings, so one ledger sees one policy" do
+      environment = ingest.fetch("environment")
+
+      expect(environment).to include(
+        "ACTOR_ENRICHMENT_SHARE" => "${ACTOR_ENRICHMENT_SHARE:-0.50}",
+        "ENRICHMENT_ELIGIBILITY_WINDOW_SECONDS" => "${ENRICHMENT_ELIGIBILITY_WINDOW_SECONDS:-3600}",
+        "ACTOR_REFRESH_TTL_SECONDS" => "${ACTOR_REFRESH_TTL_SECONDS:-86400}",
+        "REPOSITORY_REFRESH_TTL_SECONDS" => "${REPOSITORY_REFRESH_TTL_SECONDS:-86400}"
+      )
+    end
+
     # The defaults in the anchor and the defaults the application falls back to have to be
     # the same numbers, or `docker compose run` and `bin/ingest` would disagree about the
     # budget split with nothing to catch it.
-    it "declares the same defaults the application does" do
+    #
+    # Sliced by what the anchor actually forwards rather than by a hardcoded list, so a
+    # variable added to one side and not the other cannot slip past unasserted.
+    it "declares the same defaults the application does, for every variable it forwards" do
       environment = ingest.fetch("environment")
 
-      Github::Configuration::DEFAULTS.slice("POLL_INTERVAL_SECONDS", "MAX_PAGES_PER_POLL",
-                                            "ENABLED_LIVE_SOURCE_COUNT", "RATE_LIMIT_RESERVE")
-                                     .each do |variable, default|
+      Github::Configuration::DEFAULTS.slice(*environment.keys).each do |variable, default|
         expect(environment.fetch(variable)).to eq("${#{variable}:-#{default}}")
       end
+    end
+  end
+
+  # §5's two request paths, and §13's PR 7. A separate service rather than a flag on
+  # `ingest`, because enrichment belongs to no event source, takes no source lock, and
+  # spends a different class of the budget.
+  describe "the enrich service" do
+    let(:enrich) { services.fetch("enrich") }
+
+    it "never restarts, because a one-shot that restarts is a worker" do
+      expect(enrich.fetch("restart")).to eq("no")
+    end
+
+    it "waits for the schema the development databases need" do
+      expect(enrich.dig("depends_on", "setup", "condition")).to eq("service_completed_successfully")
+      expect(enrich.dig("depends_on", "db", "condition")).to eq("service_healthy")
+    end
+
+    it "runs bin/enrich and passes any arguments straight through" do
+      expect(enrich.fetch("entrypoint")).to eq([ "bin/enrich" ])
+      expect(enrich.fetch("command")).to eq([])
+    end
+
+    # The deterministic reviewer path depends on GITHUB_MODE=fixture reaching this
+    # container, exactly as it does for ingest.
+    it "inherits the same shared environment the ingest one-shot does" do
+      expect(enrich.fetch("environment")).to eq(services.fetch("ingest").fetch("environment"))
     end
   end
 end

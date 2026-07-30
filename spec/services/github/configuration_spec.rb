@@ -21,8 +21,21 @@ RSpec.describe Github::Configuration do
         http_read_timeout_seconds: 15,
         max_http_retries: 2,
         max_redirects: 2,
-        source_lock_wait_seconds: 30
+        source_lock_wait_seconds: 30,
+        # §10's enrichment block. Rational("0.50") == 0.5, so the literal reads naturally
+        # while the arithmetic stays exact.
+        actor_enrichment_share: 0.5,
+        enrichment_eligibility_window_seconds: 3600,
+        actor_refresh_ttl_seconds: 86_400,
+        repository_refresh_ttl_seconds: 86_400
       )
+    end
+
+    # §10 prints ENRICHMENT_COVERAGE_WINDOW_SECONDS in the same block as the three above,
+    # but it is an input to §11's coverage percentages, which §13 assigns to PR 10. §16
+    # forbids speculative infrastructure, so it is absent until something reads it.
+    it "carries no coverage window, which is PR 10's input and has no consumer yet" do
+      expect(described_class::DEFAULTS.keys).not_to include("ENRICHMENT_COVERAGE_WINDOW_SECONDS")
     end
 
     it "reads an override from the environment it was given" do
@@ -88,6 +101,65 @@ RSpec.describe Github::Configuration do
     it "rejects a negative retry or redirect count" do
       expect { configuration(MAX_REDIRECTS: "-1").validate! }
         .to raise_error(Github::Errors::ConfigurationError, /MAX_REDIRECTS/)
+    end
+  end
+
+  describe "the enrichment fairness share (plan §10)" do
+    # "abc".to_f is 0.0 — a perfectly legal share that would starve actor enrichment for
+    # the life of the deployment without a single error anywhere.
+    it "rejects a share that is not a number, rather than coercing it to the zero that starves actors" do
+      expect { configuration(ACTOR_ENRICHMENT_SHARE: "abc") }
+        .to raise_error(Github::Errors::ConfigurationError, /ACTOR_ENRICHMENT_SHARE/)
+    end
+
+    # A negative share gives a negative actor guarantee, and therefore a repository
+    # guarantee *above* the class allowance — an over-commitment only the class guard
+    # would catch.
+    it "rejects a negative share, which would put the repository guarantee above the allowance" do
+      expect { configuration(ACTOR_ENRICHMENT_SHARE: "-0.1").validate! }
+        .to raise_error(Github::Errors::ConfigurationError, /ACTOR_ENRICHMENT_SHARE/)
+    end
+
+    it "rejects a share above one, which is the same over-commitment mirrored" do
+      expect { configuration(ACTOR_ENRICHMENT_SHARE: "1.1").validate! }
+        .to raise_error(Github::Errors::ConfigurationError, /ACTOR_ENRICHMENT_SHARE/)
+    end
+
+    # The interval is closed on purpose. A zero guarantee is reachable by arithmetic
+    # anyway — an allowance of 1 floors to 0/1 at the pinned share — and §10 relieves it
+    # through borrowing rather than through the split, so refusing the input while
+    # permitting the derived state would only pretend it is impossible.
+    it "accepts both ends of the closed interval, because borrowing relieves a zero guarantee" do
+      %w[ 0.0 1.0 ].each do |share|
+        expect { configuration(ACTOR_ENRICHMENT_SHARE: share).validate! }.not_to raise_error
+      end
+    end
+
+    it "parses the share exactly, so a two-decimal fraction floors to the number on the page" do
+      expect(configuration(ACTOR_ENRICHMENT_SHARE: "0.29").actor_enrichment_share).to eq(Rational(29, 100))
+    end
+
+    it "rejects a non-positive eligibility window, which would skip every candidate on sight" do
+      expect { configuration(ENRICHMENT_ELIGIBILITY_WINDOW_SECONDS: "0").validate! }
+        .to raise_error(Github::Errors::ConfigurationError, /ENRICHMENT_ELIGIBILITY_WINDOW_SECONDS/)
+    end
+
+    it "rejects a zero refresh TTL, which would turn the freshness cache off from a number alone" do
+      expect { configuration(ACTOR_REFRESH_TTL_SECONDS: "0").validate! }
+        .to raise_error(Github::Errors::ConfigurationError, /ACTOR_REFRESH_TTL_SECONDS/)
+    end
+  end
+
+  describe "#refresh_ttl_seconds" do
+    it "answers per request class, so a caller holding an entity type asks once" do
+      config = configuration(ACTOR_REFRESH_TTL_SECONDS: "60", REPOSITORY_REFRESH_TTL_SECONDS: "120")
+
+      expect(config.refresh_ttl_seconds(:actor)).to eq(60)
+      expect(config.refresh_ttl_seconds(:repository)).to eq(120)
+    end
+
+    it "refuses a class that has no TTL rather than returning a silent default" do
+      expect { configuration.refresh_ttl_seconds(:poll) }.to raise_error(ArgumentError, /poll/)
     end
   end
 

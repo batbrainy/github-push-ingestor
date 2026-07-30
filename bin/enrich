@@ -1,0 +1,35 @@
+#!/usr/bin/env ruby
+# One-shot enrichment (IMPLEMENTATION_PLAN.md §10, §13's PR 7), the entry point behind
+#
+#   docker compose run --rm enrich
+#
+# bin/ingest's file, with the class swapped, and for the same reasons: everything testable
+# lives in Github::Enrichment::OneShot, which returns its exit code rather than calling
+# exit, so the whole contract is a unit spec and this file is the only place in it that
+# ends a process.
+#
+# Separate from bin/ingest rather than a flag on it, because §5 gives enrichment its own
+# path: it belongs to no event source, never takes a source lock, and spends a different
+# class of the budget. PR 8 wraps the same Github::EnrichmentRunner in EnrichActorJob and
+# EnrichRepositoryJob; this is the operator's handle on it until then, and after.
+#
+# config/environment rather than config/boot: this command uses models, so Rails has to be
+# initialized rather than merely loadable.
+begin
+  require_relative "../config/environment"
+rescue StandardError => error
+  # config/initializers/github.rb validates the budget configuration inside to_prepare, so a
+  # configuration the process must not run with raises here — before Github::Enrichment::OneShot
+  # is loaded and before any logger contract exists. Matched by name because the constant may
+  # not be autoloadable at the point boot failed.
+  raise unless error.class.name == "Github::Errors::ConfigurationError"
+
+  warn("Configuration error: #{error.message}")
+  exit 2
+end
+
+# The operator block and the JSON log stream share stdout (§11). Unbuffered, plus composing
+# the block and writing it once, is what keeps a log line from splitting it.
+$stdout.sync = true
+
+exit Github::Enrichment::OneShot.new(argv: ARGV).call.exit_code

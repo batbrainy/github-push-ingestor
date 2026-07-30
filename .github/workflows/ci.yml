@@ -77,3 +77,12 @@ jobs:
         env:
           GITHUB_MODE: fixture
         run: bin/ingest
+
+      # Ordered after the ingestion smoke deliberately: that step has already initialized
+      # the rate-limit window and persisted the corpus's stub entities, so this one runs
+      # the whole §12 chain — poll, persist, stub, enrich — across two real processes with
+      # no network at all.
+      - name: Smoke test the one-shot enrichment command
+        env:
+          GITHUB_MODE: fixture
+        run: bin/enrich --limit 6

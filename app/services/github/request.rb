@@ -9,7 +9,8 @@ module Github
   # Subclassing Data.define rather than passing it a block: a constant assigned inside
   # that block would be scoped to the enclosing module, so CLASSES would silently
   # become Github::CLASSES.
-  class Request < Data.define(:url, :request_class, :origin, :http_method, :custom_headers, :etag, :context)
+  class Request < Data.define(:url, :request_class, :origin, :http_method, :custom_headers, :etag,
+                              :context, :borrow)
     # §7: every outbound attempt debits its class counter. :poll comes from an event
     # source, :actor and :repository from enrichment (PR 7).
     CLASSES = %i[ poll actor repository ].freeze
@@ -34,12 +35,27 @@ module Github
       "User-Agent" => "github-push-ingestor"
     }.freeze
 
+    # @param borrow [Boolean] §10's fairness borrowing: the caller's assertion that the
+    #   *other* enrichment class has no currently eligible candidate, so this one may
+    #   spend past its guarantee. It rides on the request rather than on a
+    #   Github::RequestExecutor argument for one reason beyond tidiness — #redirected_to
+    #   uses `with`, and a retry reuses the request unchanged, so the authorization
+    #   survives both. Re-reserving a borrowed request under the guarantee cap mid-chain
+    #   would deny after the first hop had already been spent.
     def initialize(url:, request_class:, origin: :application, http_method: :get,
-                   custom_headers: {}, etag: nil, context: {})
+                   custom_headers: {}, etag: nil, context: {}, borrow: false)
       unless CLASSES.include?(request_class)
         raise ArgumentError, "request_class must be one of #{CLASSES.inspect}, got #{request_class.inspect}"
       end
       raise ArgumentError, "origin must be one of #{ORIGINS.inspect}, got #{origin.inspect}" unless ORIGINS.include?(origin)
+
+      # Validated here as well as in Github::BudgetLedger#reserve!, for the reason
+      # Github::RequestExecutor validates a URL twice: the earlier of the two guards
+      # fails before the gate is ever taken.
+      if borrow && !ENRICHMENT_CLASSES.include?(request_class)
+        raise ArgumentError,
+              "borrow applies to #{ENRICHMENT_CLASSES.inspect}, got #{request_class.inspect}"
+      end
 
       super(
         url: url.to_s.freeze,
@@ -48,7 +64,8 @@ module Github
         http_method: http_method,
         custom_headers: custom_headers.freeze,
         etag: etag&.to_s&.freeze,
-        context: context.freeze
+        context: context.freeze,
+        borrow: borrow
       )
     end
 
@@ -80,8 +97,11 @@ module Github
       with(url: location.to_s.freeze, etag: nil, origin: :payload)
     end
 
+    # The borrow appears only when there is one: twelve poll lines an hour carrying
+    # `borrow: false` is noise §11 does not need.
     def to_log
-      { request_class: request_class, http_method: http_method, url: url, origin: origin }.merge(context)
+      { request_class: request_class, http_method: http_method, url: url, origin: origin,
+        borrow: (true if borrow) }.compact.merge(context)
     end
   end
 end

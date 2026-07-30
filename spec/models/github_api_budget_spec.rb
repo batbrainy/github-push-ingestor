@@ -159,5 +159,60 @@ RSpec.describe GithubApiBudget do
         expect(budget.poll_class_blocked_until(now: frozen_time)).to be < frozen_time
       end
     end
+
+    # The same derivation for the other class, and the reason there are two rather than one
+    # shared timestamp: §10 requires enrichment spending its forty attempts never to stop
+    # polling, and polling spending its twelve never to stop enrichment.
+    describe "#enrichment_class_blocked_until" do
+      it "is nil while the class still has allowance left" do
+        budget = create_budget(enrichment_used: 39, enrichment_allowance: 40, reset_at: frozen_time + 3600)
+
+        expect(budget.enrichment_class_blocked_until(now: frozen_time)).to be_nil
+      end
+
+      it "defers to the window reset once the allowance is spent" do
+        budget = create_budget(enrichment_used: 40, enrichment_allowance: 40, reset_at: frozen_time + 3600)
+
+        expect(budget.enrichment_class_blocked_until(now: frozen_time)).to eq(frozen_time + 3600)
+      end
+
+      it "is nil on a window that has not been initialized" do
+        budget = create_budget(enrichment_used: 0, enrichment_allowance: 40, reset_at: nil)
+
+        expect(budget.enrichment_class_blocked_until(now: frozen_time)).to be_nil
+      end
+
+      # One *poll* cadence, because of what the unknown actually is: reset_at is NULL
+      # exactly when the window has not been initialized, and §7 says only a poll can
+      # initialize it. "After the next poll could plausibly have happened" is the honest
+      # instant.
+      it "falls back to one poll cadence when the allowance is spent and no reset is known" do
+        budget = create_budget(enrichment_used: 0, enrichment_allowance: 0, reset_at: nil)
+
+        expect(budget.enrichment_class_blocked_until(now: frozen_time, cadence_seconds: 300))
+          .to eq(frozen_time + 300)
+      end
+
+      # §9's third term names enrichment_used, not a share. A share exhaustion is a denial
+      # and not a deferral: it is relieved either by the window rolling or by the other
+      # class running out of eligible candidates, and the second has no instant to name.
+      # Deferring on it would also make §10's borrowing unreachable — the schedule would
+      # answer "not due" before the runner ever computed a borrow.
+      it "ignores the per-class shares, because a share exhaustion is a denial and not a deferral" do
+        budget = create_budget(enrichment_used: 20, enrichment_allowance: 40,
+                               actor_share_used: 20, repository_share_used: 0,
+                               reset_at: frozen_time + 3600)
+
+        expect(budget.enrichment_class_blocked_until(now: frozen_time)).to be_nil
+      end
+
+      it "leaves polling unaffected when enrichment is the class that is spent" do
+        budget = create_budget(enrichment_used: 40, enrichment_allowance: 40,
+                               poll_used: 3, poll_allowance: 12, reset_at: frozen_time + 3600)
+
+        expect(budget.poll_class_blocked_until(now: frozen_time)).to be_nil
+        expect(budget.enrichment_class_blocked_until(now: frozen_time)).to eq(frozen_time + 3600)
+      end
+    end
   end
 end

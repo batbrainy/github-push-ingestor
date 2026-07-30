@@ -60,9 +60,7 @@ RSpec.describe Github::BudgetLedger do
       expect(budget).to have_attributes(enrichment_used: 2, actor_share_used: 1, repository_share_used: 1)
     end
 
-    # PR 7 adds the fairness guarantees on top of these counters. PR 4 only has to
-    # record them accurately, so PR 7 has no back-fill problem.
-    it "records the shares without enforcing a split between them, which is PR 7's" do
+    it "records each enrichment request against its own class share" do
       active_window
 
       3.times { ledger.reserve!(:actor, now: frozen_time) }
@@ -132,7 +130,7 @@ RSpec.describe Github::BudgetLedger do
     it "names only the documented denial reasons" do
       expect(described_class::DENIAL_REASONS)
         .to contain_exactly(:globally_blocked, :window_uninitialized, :reserve_reached,
-                            :class_allowance_exhausted)
+                            :class_allowance_exhausted, :share_exhausted)
     end
   end
 
@@ -604,6 +602,119 @@ RSpec.describe Github::BudgetLedger do
                         now: frozen_time)
 
       expect(budget).to have_attributes(poll_allowance: 7, enrichment_allowance: 0, limit: 15)
+    end
+  end
+
+  describe "fairness shares (plan §10)" do
+    # §10's reason for the split, in one example: one observed live page held ~92
+    # repositories against ~89 actors, so a repository-first policy would spend the whole
+    # hourly allowance before a single actor was enriched.
+    it "stops a repository flood at its guarantee, leaving the actor share untouched" do
+      active_window
+
+      20.times { ledger.reserve!(:repository, now: frozen_time) }
+
+      expect { ledger.reserve!(:repository, now: frozen_time) }
+        .to raise_error(Github::Errors::BudgetExhausted, /share_exhausted/)
+      expect { ledger.reserve!(:actor, now: frozen_time) }.not_to raise_error
+    end
+
+    it "grants an actor reservation right up to its guarantee" do
+      active_window(actor_share_used: 19, enrichment_used: 19)
+
+      expect { ledger.reserve!(:actor, now: frozen_time) }
+        .to change { budget.actor_share_used }.from(19).to(20)
+    end
+
+    it "refuses the next one while the caller has not reported the other class quiet" do
+      active_window(actor_share_used: 20, enrichment_used: 20)
+
+      expect { ledger.reserve!(:actor, now: frozen_time) }
+        .to raise_error(Github::Errors::BudgetExhausted, /share_exhausted/)
+    end
+
+    it "spends nothing when it refuses a share, so a denied reservation costs no quota" do
+      active_window(actor_share_used: 20, enrichment_used: 20)
+
+      expect { suppress(Github::Errors::BudgetExhausted) { ledger.reserve!(:actor, now: frozen_time) } }
+        .not_to change { budget.enrichment_used }.from(20)
+    end
+
+    it "grants the same reservation once the caller reports no eligible repository candidate" do
+      active_window(actor_share_used: 20, enrichment_used: 20)
+
+      expect { ledger.reserve!(:actor, now: frozen_time, borrow: true) }
+        .to change { budget.actor_share_used }.from(20).to(21)
+    end
+
+    # The plan's phrasing is "borrow the other's unused capacity", and capping at the whole
+    # enrichment allowance authorizes exactly that set: actor_share_used +
+    # repository_share_used == enrichment_used is an invariant of the debit statements, so
+    # the class guard already limits a borrower to allowance - other_share_used.
+    it "lets a borrowing class spend the whole enrichment allowance and not one request more" do
+      active_window(actor_share_used: 20, repository_share_used: 5, enrichment_used: 25)
+
+      15.times { ledger.reserve!(:actor, now: frozen_time, borrow: true) }
+
+      expect(budget).to have_attributes(actor_share_used: 35, repository_share_used: 5, enrichment_used: 40)
+      expect { ledger.reserve!(:actor, now: frozen_time, borrow: true) }
+        .to raise_error(Github::Errors::BudgetExhausted, /class_allowance_exhausted/)
+    end
+
+    # The ordering is not arbitrary: both conditions are true here, and naming the share
+    # would send an operator to ACTOR_ENRICHMENT_SHARE when the answer is the window.
+    it "names the class allowance rather than the share once the whole budget is gone" do
+      active_window(actor_share_used: 40, enrichment_used: 40)
+
+      expect { ledger.reserve!(:actor, now: frozen_time) }
+        .to raise_error(Github::Errors::BudgetExhausted, /class_allowance_exhausted/)
+    end
+
+    it "never applies a share to a poll, which has none to spend" do
+      active_window(actor_share_used: 40, repository_share_used: 40)
+
+      expect { ledger.reserve!(:poll, now: frozen_time) }.to change { budget.poll_used }.from(0).to(1)
+    end
+
+    it "derives the guarantees from the configured share rather than from a fixed half" do
+      quarter = described_class.new(configuration: configuration_with(ACTOR_ENRICHMENT_SHARE: "0.25"))
+      active_window(actor_share_used: 10, repository_share_used: 10, enrichment_used: 20)
+
+      expect { quarter.reserve!(:actor, now: frozen_time) }
+        .to raise_error(Github::Errors::BudgetExhausted, /share_exhausted/)
+      expect { quarter.reserve!(:repository, now: frozen_time) }.not_to raise_error
+    end
+
+    # A zero guarantee is a legal operating point rather than a broken configuration:
+    # §10 gates borrowing on the other class having no eligible candidate, not on its
+    # counters, so "repository first, actors during the quiet periods" is expressible.
+    it "gives a zero-guarantee class nothing on its own and everything under a borrow" do
+      starved = described_class.new(configuration: configuration_with(ACTOR_ENRICHMENT_SHARE: "0.0"))
+      active_window
+
+      expect { starved.reserve!(:actor, now: frozen_time) }
+        .to raise_error(Github::Errors::BudgetExhausted, /share_exhausted/)
+      expect { starved.reserve!(:actor, now: frozen_time, borrow: true) }.not_to raise_error
+    end
+
+    it "refuses to borrow on behalf of a poll, which is a programming error and not a denial" do
+      active_window
+
+      expect { ledger.reserve!(:poll, now: frozen_time, borrow: true) }
+        .to raise_error(ArgumentError, /poll/)
+    end
+
+    # The invariant the borrow cap rests on: capping a borrower at enrichment_allowance is
+    # equivalent to §10's "the other's unused capacity" only because the two shares always
+    # account for exactly the class counter. A debit that bumped one without the other
+    # would silently widen every borrow.
+    it "keeps the two shares summing to the class counter, whichever class spends" do
+      active_window
+
+      3.times { ledger.reserve!(:actor, now: frozen_time) }
+      2.times { ledger.reserve!(:repository, now: frozen_time) }
+
+      expect(budget.actor_share_used + budget.repository_share_used).to eq(budget.enrichment_used)
     end
   end
 

@@ -38,9 +38,10 @@ module Github
           latest_run_at: latest_run_at, latest_run_id: latest_run_id,
           push_event_count: PushEvent.count,
           # The scope whose WHERE clause matches index_*_on_enrichment_candidates exactly, so
-          # both counts are partial-index counts. In PR 5 it is numerically identical to
-          # "pending", because nothing transitions an entity until PR 7; §11's finer
-          # pending/skipped split arrives with PR 10's /status.
+          # both counts are partial-index counts. It counts pending *and* retryable_failure,
+          # which is what "still to enrich" means; Github::Enrichment::Summary prints the
+          # per-status split that bin/enrich needs, and §11's coverage percentages arrive
+          # with PR 10's /status.
           pending_actor_count: GithubActor.enrichment_candidates.count,
           pending_repository_count: GithubRepository.enrichment_candidates.count,
           budget_resource: budget&.resource, budget_remaining: budget&.remaining,
