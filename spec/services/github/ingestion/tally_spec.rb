@@ -152,8 +152,11 @@ RSpec.describe Github::Ingestion::Tally do
     end
 
     it "aligns every value on the shared report column" do
+      column = Github::Ingestion::Report::LABEL_WIDTH
+
       rendered.each do |line|
-        expect(line.index(/\S+\z/)).to eq(Github::Ingestion::Report::LABEL_WIDTH)
+        expect(line[column - 1]).to eq(" "), "expected padding before the value in #{line.inspect}"
+        expect(line[column]).not_to eq(" "), "expected the value to start at column #{column}"
       end
     end
 
