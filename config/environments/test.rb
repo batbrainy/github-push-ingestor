@@ -31,6 +31,15 @@ Rails.application.configure do
   # Print deprecation notices to the stderr.
   config.active_support.deprecation = :stderr
 
+  # §2A: "Ordinary specs use Active Job's test adapter; only dedicated queue integration
+  # tests touch the queue test database." The suite would otherwise write solid_queue_jobs
+  # rows from every ingestion spec — rows no example transaction on the *primary*
+  # connection would necessarily clean up, and enqueue volume nobody asserted.
+  #
+  # spec/support/queue_helpers.rb swaps this per example for the handful tagged :queue, and
+  # spec/job_boundary_spec.rb fails loudly if this override ever stops applying.
+  config.active_job.queue_adapter = :test
+
   # Raises error for missing translations.
   # config.i18n.raise_on_missing_translations = true
 

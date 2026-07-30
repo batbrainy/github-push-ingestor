@@ -57,8 +57,9 @@ jobs:
         with:
           bundler-cache: true
 
-      # Prepares both isolated test databases declared in config/database.yml. The
-      # queue database is schema-empty until PR 8; a version-0 schema loads cleanly.
+      # Prepares both isolated test databases declared in config/database.yml, including
+      # Solid Queue's tables in the queue database (db/queue_migrate, dumped to
+      # db/queue_schema.rb).
       - name: Prepare test databases
         run: bin/rails db:test:prepare
 
@@ -86,3 +87,24 @@ jobs:
         env:
           GITHUB_MODE: fixture
         run: bin/enrich --limit 6
+
+      # Solid Queue's own validator over config/queue.yml and config/recurring.yml: a
+      # schedule Fugit cannot parse, or a task naming a class that does not exist, fails
+      # here rather than in a worker container at 3am. Starts no process.
+      - name: Validate the queue configuration
+        run: bin/rails solid_queue:check
+
+      # The supervisor's own boot path, for the reason the two smokes above exist: the suite
+      # never runs bin/jobs, so nothing else would catch a queue database without its schema,
+      # a scheduler that cannot register its recurring tasks, or a TERM it does not honour.
+      # Deliberately not long enough to guarantee a tick — the 60-second schedule would make
+      # that a 70-second CI step — so what it proves is boot, registration and clean
+      # shutdown; the tick's own behaviour is spec/jobs' business.
+      #
+      # GITHUB_MODE=fixture is not optional: this boots a real scheduler that can run a real
+      # poll, in a separate process WebMock cannot see, and a live-mode worker would spend a
+      # runner's unauthenticated quota on every push.
+      - name: Smoke test the worker supervisor
+        env:
+          GITHUB_MODE: fixture
+        run: timeout --preserve-status --signal=TERM 20 bin/jobs

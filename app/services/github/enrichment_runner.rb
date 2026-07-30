@@ -15,9 +15,10 @@ module Github
   # budget is exhausted — precisely when boundedness matters. Behind the fairness decision
   # it would stop exactly then, and the backlog would grow without limit.
   #
-  # **At most one entity per call.** §5 names EnrichActorJob and EnrichRepositoryJob, so
-  # one entity is the unit PR 8 wraps; batching is the caller's loop.
-  # Github::Enrichment::OneShot is that loop today.
+  # **At most one entity per call.** §5 names EnrichActorJob and EnrichRepositoryJob, and one
+  # entity is what each of them performs; batching is the caller's loop, which
+  # Github::Enrichment::OneShot is for the operator and the 60-second reconciler tick is for
+  # the worker.
   #
   # **No source lock, ever.** §8 step 1: "Enrichment jobs skip this step — they take only
   # the request gate." This class is never handed an EventSource and never reaches for

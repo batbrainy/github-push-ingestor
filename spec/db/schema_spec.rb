@@ -128,11 +128,25 @@ RSpec.describe "Core data model schema" do
       expect(names).to include("event_sources_status_known")
     end
 
-    # PR 8 adds the "which sources are due" query and should add the index that serves it
-    # in the same change, where its plan is checkable. Asserting the absence keeps that a
-    # visible decision rather than an oversight.
-    it "carries no index yet, because the query that would use one does not exist" do
-      expect(connection.indexes("event_sources")).to be_empty
+    # PR 8's recurring tick is the query that needed one, and it arrived in the same change.
+    # The predicate here and EventSource.poll_due's WHERE are the same sentence written
+    # twice, so this example is what keeps them from drifting apart.
+    it "indexes the recurring tick's due-source query" do
+      index = connection.indexes("event_sources").find { |i| i.name == "index_event_sources_on_poll_due" }
+
+      expect(index).not_to be_nil, "expected index_event_sources_on_poll_due"
+      expect(index.columns).to eq(%w[source_type next_poll_at])
+      expect(index.where).to include("enabled").and include("idle")
+    end
+  end
+
+  # Solid Queue lives in its own database (§2A), and the outbox-style recovery argument
+  # depends on that being true rather than intended: if these tables were here, an enqueue
+  # could join the business transaction and "the committed entity state is the durable record
+  # of pending work" would stop being the reason the reconciler exists.
+  describe "the queue database boundary" do
+    it "keeps Solid Queue's tables out of the primary database" do
+      expect(connection.tables.grep(/solid_queue/)).to be_empty
     end
   end
 end

@@ -6,8 +6,9 @@ module Github
   # A `FOR UPDATE` row claim cannot own an HTTP operation, because a row lock ends at
   # transaction end and a transaction must not span network I/O. A session advisory
   # lock gives operation-wide ownership that PostgreSQL releases automatically when
-  # the session dies — which is what makes a hard container kill safe. Verifying that
-  # release-on-death behaviour is PR 8's half of B7; PR 4 delivers acquisition.
+  # the session dies — which is what makes a hard container kill safe. That
+  # release-on-death behaviour is verified rather than assumed, with a terminated backend
+  # rather than a cooperative close: spec/recovery/advisory_lock_session_death_spec.rb.
   #
   # PR 5's IngestionRunner is the first caller; the one-shot ingestion command is the
   # second.

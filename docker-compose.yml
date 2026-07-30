@@ -1,7 +1,8 @@
 # Compose topology per IMPLEMENTATION_PLAN.md §2A.
 #
-# `docker compose up --build` starts db + setup + web (worker arrives with
-# PR 8; continuous polling starts then). The `tools`-profiled services run
+# `docker compose up --build` starts db + setup + web + worker, and continuous
+# polling begins immediately: the worker's Solid Queue scheduler fires
+# config/recurring.yml's 60-second tick. The `tools`-profiled services run
 # only when explicitly targeted:
 #
 #   docker compose run --rm ingest   # one ingestion cycle, then the state
@@ -68,8 +69,8 @@ services:
       start_period: 10s
 
   # One-shot: prepares BOTH the primary and queue databases declared in
-  # config/database.yml, so web (and later worker) never race concurrent
-  # db:prepare runs.
+  # config/database.yml, so web and worker never race concurrent db:prepare
+  # runs.
   setup:
     build: .
     image: github-push-ingestor-app
@@ -101,6 +102,37 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+
+  # The always-on background worker (plan §2A's topology table): one Solid Queue
+  # supervisor running the 60-second poll tick, the enrichment jobs, and the
+  # entity-scoped reconciler. Same image and the same shared environment as web,
+  # because one ledger row serves every process and two policies against it
+  # would be worse than either.
+  #
+  # stop_grace_period pairs with SolidQueue.shutdown_timeout (20s, set in
+  # config/application.rb from §2A's pinned HTTP timeouts): 20s for an in-flight
+  # attempt that already holds the request gate, and 10s of margin for the
+  # supervisor to reap its children. A job still *waiting* for the gate has
+  # reserved nothing and is safe to kill — §8's at-least-once execution with
+  # idempotent writes is what makes that true, and both advisory locks die with
+  # the session.
+  #
+  # No healthcheck. Nothing depends on this service, `unless-stopped` already
+  # covers process death, and the only probe that could tell a hung worker from
+  # a busy one would have to boot Rails on every interval; Solid Queue's own
+  # heartbeats in solid_queue_processes are the durable evidence instead.
+  worker:
+    build: .
+    image: github-push-ingestor-app
+    restart: unless-stopped
+    command: ["bin/jobs"]
+    stop_grace_period: 30s
+    environment: *app_env
+    depends_on:
+      db:
+        condition: service_healthy
+      setup:
+        condition: service_completed_successfully
 
   # One-shot ingestion (plan §2A's topology table, §9's contract). Profiled so
   # a plain `up` never starts it, and `restart: "no"` because a one-shot that

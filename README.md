@@ -10,7 +10,7 @@ and worker crashes.
 
 ## Status
 
-Enrichment budget and fairness stage (PR 7). The Rails 8.1 API, PostgreSQL, Docker
+Background processing and recovery stage (PR 8). The Rails 8.1 API, PostgreSQL, Docker
 Compose topology, health endpoints, and structured JSON logging landed in PR 2; the
 seven core tables and their idempotent write paths in PR 3; the chain every GitHub
 request flows through — request gate, class-aware budget ledger, SSRF URL policy,
@@ -18,17 +18,18 @@ live and offline transports, fixture corpus, per-source advisory lock, event-sou
 adapter — in PR 4; the processor registry, the tolerant `PushEvent` parser, the
 quarantine taxonomy, the ingest transaction, and the one-shot command in PR 5;
 `Link`-header pagination, the page-one ETag, the five independent components behind
-`effective_poll_time`, and global-versus-class blocking in PR 6.
+`effective_poll_time`, and global-versus-class blocking in PR 6; the entity state
+machine, per-class fairness with eligibility-aware borrowing, the freshness cache and
+its refresh TTLs, `skipped_budget` with distinct-event reactivation, and
+`effective_enrichment_time` in PR 7.
 
-This stage fills the stubs in. Actors and repositories are now fetched from the
-URLs their own push events carried, under an hourly allowance split fairly between
-the two classes — because one observed live page referenced ~89 distinct actors
-against ~92 distinct repositories, and a queue ordered purely by recency would
-starve actor enrichment to zero. It adds the entity state machine and its write
-matrix, the per-class fairness guarantees with eligibility-aware borrowing,
-newest-first eligibility, the freshness cache and its refresh TTLs, `skipped_budget`
-with distinct-event reactivation, error classification that tells an entity failure
-from a source failure, and `effective_enrichment_time`.
+**This stage makes the system run by itself, and proves it recovers.** Solid Queue
+now runs in its own `queue` database inside the same PostgreSQL container, a `worker`
+container runs its supervisor, and two recurring tasks fire every 60 seconds:
+`PollEventSourceJob`, which polls each source that §9's schedule says is due, and
+`ReconcilePendingEnrichmentsJob`, which sweeps the committed entity rows for
+enrichment work and schedules a cycle per class. A completed poll that created events
+schedules enrichment immediately, after commit.
 
 **Enrichment is bounded best-effort sampling, and says so.** Against ~2,172 cold
 entity requests an hour of demand and 40 available, partial coverage is the design
@@ -36,10 +37,15 @@ rather than a shortfall — `skipped_budget` is a normal documented outcome, and
 `bin/enrich` prints the per-class usage so the sampling rate is visible instead of a
 mysteriously growing queue (plan §10).
 
-**Nothing fires either schedule yet.** `docker compose run --rm ingest` and
-`docker compose run --rm enrich` are still the only things that poll and enrich; the
-always-on `worker` container, its recurring task, and the entity-scoped reconciler
-are PR 8.
+**With the default `GITHUB_MODE=live`, `docker compose up` starts spending real
+unauthenticated quota** — twelve poll requests an hour at the default cadence, plus
+enrichment inside its allowance. That is the intended runtime behaviour (plan §2A);
+`GITHUB_MODE=fixture docker compose up --build` runs the same flow entirely offline.
+
+The processing guarantee is unchanged and stated exactly: at-least-once execution
+plus idempotent writes plus unique constraints gives **effectively-once persisted
+outcomes**. This system does not claim exactly-once execution — a job may run twice,
+and the second run changes nothing.
 
 Ingestion capabilities land PR by PR; each README section below is completed by
 the pull request that ships the capability it documents. The authoritative
@@ -66,6 +72,9 @@ This starts, in dependency order (plan §2A):
    queue databases
 3. `web` — the Rails API on http://localhost:3000, started only after `setup`
    completes successfully
+4. `worker` — the Solid Queue supervisor, started on the same condition.
+   **Continuous polling begins here**: its scheduler fires the 60-second tick, so
+   the first poll happens within a minute and every 300 seconds after that.
 
 Verify it is healthy:
 
@@ -83,12 +92,12 @@ development databases):
 docker compose run --rm test
 ```
 
-Rails and application logs (requests, and jobs from PR 8 onward) are one
-structured JSON stream; PostgreSQL and Puma startup output remain their own
-plain-text formats:
+Rails, Active Job and application logs are one structured JSON stream;
+PostgreSQL and Puma startup output remain their own plain-text formats:
 
 ```bash
 docker compose logs -f
+docker compose logs -f worker    # the poll tick, enrichment cycles, reconciliation
 ```
 
 Stop everything (add `-v` to also drop the database volume):
@@ -392,6 +401,23 @@ system — plus a line per persisted, duplicate and ignored event.
 Every line carries the run's `run_id`, except `ingestion.not_due`: a poll the
 schedule turned away opens no run, so it reports `event_source_id` instead.
 
+Background work adds the job vocabulary: `job.completed` for every job the worker
+runs — carrying `job_id`, `job_class`, `queue`, `attempt`, `duration_ms` and the
+identifiers that job produced — and `job.failed` with the error class and message
+when one raises. `ingestion.source_busy` reports a tick that found the source owned
+by another poller, `ingestion.cycle_failed` one source that failed without stopping
+the tick, and `enrichment.dispatched` is the reconciliation summary: what it
+scheduled, what blocked it, and the per-class state counts and share usage. A tick
+that scheduled nothing keeps that line at debug, so an exhausted window does not
+emit a line a minute for the rest of the hour.
+
+The trace is one hop: a `job_id` on `job.completed` gives the `run_id`s that job
+opened, and every `ingestion.*` line carries the `run_id`.
+
+```bash
+docker compose logs worker | grep -E 'job\.(completed|failed)|enrichment\.dispatched'
+```
+
 ## Environment variables
 
 Compose runs with working defaults — no `.env` file is required. The template
@@ -409,7 +435,7 @@ is [`.env.example`](.env.example).
 | `MAX_HTTP_RETRIES` | `2` | Retries after a 5xx or network timeout. Each retry is a fresh budget reservation (plan §10) |
 | `MAX_REDIRECTS` | `2` | Redirect hops followed per request, each re-validated and separately reserved |
 | `SOURCE_LOCK_WAIT_SECONDS` | `30` | How long the one-shot waits for a busy source lock; the poller attempts once (plan §9) |
-| `POLL_INTERVAL_SECONDS` | `300` | The poll cadence, and an allowance-formula input. A source polled at T is due again at T + this; an unforced run before then is deferred rather than made. Nothing fires the cadence automatically until PR 8 (plan §9, §10) |
+| `POLL_INTERVAL_SECONDS` | `300` | The poll cadence, and an allowance-formula input. A source polled at T is due again at T + this; an unforced run before then is deferred rather than made. The worker's 60-second tick checks the schedule; it does not replace it (plan §9, §10) |
 | `MAX_PAGES_PER_POLL` | `1` | How many `Link`-followed pages one poll may fetch, and an allowance-formula input. Raising it trades enrichment allowance for capture depth: at `3` the poll allowance becomes 36 attempts an hour and enrichment drops to 16 (plan §9, §10) |
 | `ENABLED_LIVE_SOURCE_COUNT` | `1` | Allowance-formula input: live sources sharing one per-IP budget |
 | `RATE_LIMIT_RESERVE` | `8` | Requests per hour left deliberately unspent (plan §10) |
@@ -558,15 +584,50 @@ EnrichmentRunner ────────────────┘      │ �
 Decisions behind this are recorded in
 [`docs/adr/`](docs/adr/): advisory locks and the gate (0002), the source and transport
 seams (0003), the class-aware ledger (0004), at-least-once processing with idempotent
-writes (0005), decomposed poll deferral state (0006), and enrichment fairness shares
-and borrowing (0007).
+writes (0005), decomposed poll deferral state (0006), enrichment fairness shares
+and borrowing (0007), and post-commit enqueue with entity-scoped reconciliation (0008).
+
+## Continuous ingestion
+
+The `worker` container runs one Solid Queue supervisor: a dispatcher, the worker
+threads from [`config/queue.yml`](config/queue.yml), and a scheduler running
+[`config/recurring.yml`](config/recurring.yml). Two tasks fire every 60 seconds.
+
+**A tick is not a poll.** `PollEventSourceJob` selects the sources whose cached
+`next_poll_at` has arrived, and `Github::IngestionRunner` then re-reads each one
+inside its advisory lock and applies §9's five components before spending anything.
+At the default 300-second cadence roughly four ticks in five cost one indexed
+`SELECT` and nothing else. The tick exists so a source that becomes due at T is
+polled within a minute of T — not so that polls happen every minute, which the
+allowance formula (twelve poll requests an hour, no headroom) could not pay for.
+A source another process is polling is reported at INFO and left alone; the tick
+never retries it, because the next tick is 60 seconds away.
+
+**Enrichment is scheduled twice over, deliberately.** A run that created events
+schedules one cycle per class as soon as its rows are committed and its advisory
+lock is released. That enqueue is a *hint*: the durable record of pending work is the
+entity rows themselves, so `ReconcilePendingEnrichmentsJob` sweeps them every 60
+seconds and schedules a cycle for any class that has claimable work and is not
+blocked by the ledger. Work committed before a crash but never enqueued is
+rediscovered on the next tick — no operator step, no cleanup job, and no queue
+inspection (plan §8, [ADR 0008](docs/adr/0008-post-commit-enqueue-and-entity-scoped-reconciliation.md)).
+
+Each cycle enriches at most one entity, chosen by §10's fairness policy under a
+lease, so a backlog of ninety pending actors is one queued job rather than ninety.
+Steady state at the defaults: twelve polls an hour, and at most forty enrichment
+requests an hour split between the two classes.
+
+**Crashes need no cleanup.** A killed worker's PostgreSQL session dies with it, and
+the source advisory lock goes with the session; its claim lease is a timestamp on
+`next_retry_at` that expires by arithmetic; and any job it was running may run again,
+because every write on the path is idempotent. That is at-least-once execution with
+effectively-once persisted outcomes — never exactly-once execution.
 
 ## Planned contents
 
 | Section | Lands with |
 |---|---|
 | Data model reference | PR 12 (design brief) |
-| Continuous ingestion behavior — what the always-on poller does on a schedule | PR 8 |
 | Full fixture scenario matrix (retries, rate limits, redirects) | PR 11 |
 | API and database inspection examples | PR 10, 12 |
 | Crash-recovery verification (container kills) | PR 11, 12 |
@@ -575,14 +636,41 @@ and borrowing (0007).
 ## Reviewer commands
 
 ```bash
-docker compose up --build                             # available now
+docker compose up --build                             # available now — starts continuous polling
 docker compose run --rm test                          # available now (real suite; runs in CI too)
+docker compose logs -f worker                         # available now — the tick, cycles, reconciliation
 docker compose logs -f                                # available now
 docker compose run --rm ingest                        # available now — one ingestion cycle
 docker compose run --rm enrich --limit 6              # available now — up to six enrichment cycles
+GITHUB_MODE=fixture docker compose up --build         # available now — the whole system, no network
 GITHUB_MODE=fixture docker compose run --rm ingest    # available now — deterministic, no network
 GITHUB_MODE=fixture docker compose run --rm enrich --limit 6
 ```
+
+The queue is a database, so it is inspectable with the same tool as everything else:
+
+```bash
+docker compose exec db psql -U postgres -d github_push_ingestor_queue_development \
+  -c "SELECT key, class_name, schedule FROM solid_queue_recurring_tasks;" \
+  -c "SELECT class_name, count(*) FROM solid_queue_jobs GROUP BY 1;" \
+  -c "SELECT kind, name, last_heartbeat_at FROM solid_queue_processes;"
+```
+
+Recovery is watchable in under a minute — stop the worker, put the entities back into
+`pending`, empty the queue (the crash), and start it again:
+
+```bash
+docker compose stop worker
+docker compose exec db psql -U postgres -d github_push_ingestor_development \
+  -c "UPDATE github_actors SET enrichment_status = 'pending', fetched_at = NULL, next_retry_at = NULL;"
+docker compose exec db psql -U postgres -d github_push_ingestor_queue_development \
+  -c "TRUNCATE solid_queue_jobs CASCADE;"
+docker compose start worker
+docker compose logs -f worker    # enrichment.dispatched, then enrichment.completed
+```
+
+Container-kill verification against the restart policies is `IMPLEMENTATION_PLAN.md`
+§15's reviewer step and lands with PR 11; nothing above claims it.
 
 ## Development
 

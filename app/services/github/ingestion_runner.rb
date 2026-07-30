@@ -36,10 +36,20 @@ module Github
   # refuses a reservation inside an open application transaction, because an outer
   # rollback would refund a request GitHub has already counted.
   #
-  # It still enqueues nothing. §8 step 10 is PR 8, and §8 already says why no list of
-  # created ids is needed: "the committed entity state is the durable record of pending
-  # work (outbox-style recovery)" — and the enrichment_candidates partial index for
-  # exactly that predicate already exists.
+  # §8 step 10 — "enqueue enrichment after commit" — is #call's last act, once the lock is
+  # released, and it needs no list of created ids because §8 says why: "the committed entity
+  # state is the durable record of pending work (outbox-style recovery)", and the
+  # enrichment_candidates partial index for exactly that predicate already exists.
+  # Github::Enrichment::Dispatch reads that state; this class only tells it that a run
+  # created something worth looking at.
+  #
+  # One dispatch per run rather than per created event, and after the run row is finalized
+  # rather than inside PageWriter's per-envelope transaction. Both follow from enrichment
+  # jobs being class-scoped: the runner chooses the entity by fairness, so N enqueues carry
+  # no more information than one, and §8's property that matters — the enqueue happens after
+  # the rows are durable — is stronger here, where every commit of the run is behind us.
+  # Losing the dispatch to a crash loses nothing: ReconcilePendingEnrichmentsJob sweeps the
+  # same committed state every 60 seconds.
   class IngestionRunner
     MONOTONIC = -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) }
 
@@ -70,10 +80,11 @@ module Github
     def initialize(executor: Github.executor, writer: Ingestion::PageWriter.new,
                    configuration: Github.configuration, clock: -> { Time.current },
                    monotonic: MONOTONIC, rate_limit_policy: RateLimitPolicy.new,
-                   page_loop: nil, poll_state: nil)
+                   page_loop: nil, poll_state: nil, dispatch: nil)
       @configuration = configuration
       @clock = clock
       @monotonic = monotonic
+      @dispatch = dispatch || Enrichment::Dispatch.new(configuration: configuration, clock: clock)
       @page_loop = page_loop || Ingestion::PageLoop.new(
         executor: executor, writer: writer, configuration: configuration,
         rate_limit_policy: rate_limit_policy, clock: clock
@@ -96,12 +107,32 @@ module Github
     def call(event_source:, wait_seconds: SourceLock::POLLER_WAIT_SECONDS, force: false)
       requested_at = @monotonic.call
 
-      SourceLock.acquire(event_source.id, wait_seconds: wait_seconds) do
+      result = SourceLock.acquire(event_source.id, wait_seconds: wait_seconds) do
         run(event_source.reload, force: force, lock_wait_ms: elapsed_ms(requested_at))
       end
+
+      dispatch_enrichment(result)
+      result
     end
 
     private
+
+    # §8 step 10, outside the source lock on purpose: every row of this run is committed, the
+    # run row is finalized, and there is no reason to hold a source's mutual exclusion across
+    # a write to a different database.
+    #
+    # Only when the run created events. A page of duplicates, a 304, a deferral and a not-due
+    # tick changed no entity's state, and everything that was pending before this run is
+    # already ReconcilePendingEnrichmentsJob's business.
+    #
+    # A crash before this line — or a queue database that refuses the insert — loses the
+    # dispatch and no work: that is what §2A's outbox-style recovery means, and the reconciler
+    # closes the gap within its 60-second cadence.
+    def dispatch_enrichment(result)
+      return unless result.tally.events_created.positive?
+
+      @dispatch.call(reason: "ingestion")
+    end
 
     def run(event_source, force:, lock_wait_ms:)
       return out_of_service(event_source) if event_source.failed?
