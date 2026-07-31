@@ -656,9 +656,14 @@ EnrichmentRunner ────────────────┘      │ �
   `global_blocked_until`, which only ever moves later.
 - **`Github::RateLimitPolicy`** decides *which* response warrants a global block and until
   when — primary exhaustion to the reset GitHub named, a reserve breach to the same, a
-  secondary limit to `Retry-After` clamped between one minute and one hour. Class
-  exhaustion deliberately writes nothing there: it is derived from the counters, so
-  polling running out never stops enrichment and vice versa.
+  secondary limit to `Retry-After` (either RFC 9110 form) clamped between one minute and one
+  hour. When a secondary limit carries no usable `Retry-After`, the block backs off
+  exponentially with jitter across *consecutive* limits — 60s, 120s, 240s, capped at one
+  hour — counted in `github_api_budget.consecutive_secondary_limits`, which survives a
+  window rollover because secondary limits are IP-scoped rather than window-scoped. One live
+  request that completes without a secondary limit resets the run. Class exhaustion
+  deliberately writes nothing there: it is derived from the counters, so polling running out
+  never stops enrichment and vice versa.
 - **`Github::UrlPolicy`** is the SSRF boundary. It rebuilds every URL from validated
   components, and a URL that arrived inside a GitHub payload or a `Link` header always
   clears the full live policy first.
@@ -685,9 +690,12 @@ EnrichmentRunner ────────────────┘      │ �
 - **`Github::Enrichment::Fairness`** applies §10's ladder: a never-enriched candidate in a
   class still inside its guarantee, then the same borrowing when the other class has no
   *currently eligible* candidate, then a TTL-stale refresh only when no pending candidate
-  is eligible anywhere. It decides; the ledger enforces, so a wrong answer produces a
-  refused reservation rather than an overspend
-  ([ADR 0007](docs/adr/0007-enrichment-fairness-shares-and-borrowing.md)).
+  is eligible anywhere. The refresh pool allocates by the same two steps — prefer a class
+  with room, borrow only from a class with nothing to refresh — so neither pool can starve a
+  class. It decides; the ledger enforces, so a wrong answer produces a refused reservation
+  rather than an overspend
+  ([ADR 0007](docs/adr/0007-enrichment-fairness-shares-and-borrowing.md),
+  [ADR 0010](docs/adr/0010-secondary-limit-escalation-and-refresh-pool-fairness.md)).
 - **`Github::Enrichment::Claim`** prevents two workers enriching one entity by leasing the
   row — a conditional `UPDATE` that pushes `next_retry_at` forward. One column, one
   meaning: the same predicate excludes leases, backoffs and secondary-limit deferrals from
@@ -708,8 +716,9 @@ Decisions behind this are recorded in
 [`docs/adr/`](docs/adr/): advisory locks and the gate (0002), the source and transport
 seams (0003), the class-aware ledger (0004), at-least-once processing with idempotent
 writes (0005), decomposed poll deferral state (0006), enrichment fairness shares
-and borrowing (0007), post-commit enqueue with entity-scoped reconciliation (0008), and
-runtime source allocation with shared-IP observability (0009).
+and borrowing (0007), post-commit enqueue with entity-scoped reconciliation (0008),
+runtime source allocation with shared-IP observability (0009), and secondary-limit
+escalation with refresh-pool fairness (0010).
 
 ## Continuous ingestion
 

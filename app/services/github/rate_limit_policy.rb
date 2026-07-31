@@ -66,7 +66,16 @@ module Github
     # @return [Decision]
     def apply!(fetched, now: Time.current)
       decision = decide(fetched, now: now)
-      return decision unless decision.blocking?
+
+      unless decision.blocking?
+        # A live request that completed without a secondary limit is the evidence that the
+        # IP is no longer being throttled, and §10's backoff is exponential in
+        # *consecutive* limits. Asked of successful? rather than of the decision alone: a
+        # 5xx or a timeout produced no verdict from GitHub about throttling, so it must
+        # neither escalate the streak nor end it.
+        @ledger.clear_secondary_limit_streak!(now: now) if fetched.successful?
+        return decision
+      end
 
       @ledger.block_globally!(until_at: decision.blocked_until, reason: decision.kind,
                               window_status: decision.window_status, now: now)
@@ -92,7 +101,11 @@ module Github
     # would spend its whole allowance re-asking a quota that is provably at zero.
     def primary_limit(fetched, now:)
       snapshot = fetched.rate_limit(observed_at: now)
-      blocked_until = snapshot&.reset_at || fallback_instant(snapshot, now: now)
+      # attempt: 1 — a primary exhaustion is not escalated on the secondary streak. The
+      # two conditions are unrelated: §10 attaches exponential backoff to secondary limits
+      # specifically, and a quota that is provably at zero is relieved by the window
+      # rolling, not by waiting longer each time.
+      blocked_until = snapshot&.reset_at || fallback_instant(snapshot, now: now, attempt: 1)
 
       Decision.new(kind: :primary_rate_limit, blocked_until: blocked_until,
                    source_retry_at: nil, window_status: blocked_window_status)
@@ -111,8 +124,15 @@ module Github
     # exactly when the window rolls, and rollover is the transition that restores the
     # label; a secondary limit expires on an unrelated Retry-After and has no writer to
     # put the label back, so it would strand a value with no way out.
+    # The streak read here is stale by construction, and acceptably so. #apply! runs after
+    # the gate is released, so two responses can read the same count and compute the same
+    # block. The consequence is an under-escalated block and never an over-escalated one,
+    # and BLOCK_SQL's GREATEST means the loser's shorter instant cannot shorten the
+    # winner's. Computing it inside the ledger under the row lock would remove the staleness
+    # and cost the split this class exists for: it decides, the ledger records.
     def secondary_limit(fetched, now:)
-      blocked_until = fallback_instant(fetched.rate_limit(observed_at: now), now: now)
+      attempt = consecutive_secondary_limits + 1
+      blocked_until = fallback_instant(fetched.rate_limit(observed_at: now), now: now, attempt: attempt)
 
       Decision.new(kind: :secondary_rate_limit, blocked_until: blocked_until,
                    source_retry_at: blocked_until, window_status: nil)
@@ -134,16 +154,27 @@ module Github
                    source_retry_at: nil, window_status: blocked_window_status)
     end
 
-    # Retry-After may be absent, zero, negative, or an HTTP-date — RateLimitSnapshot
-    # parses only the delta-seconds form and deliberately leaves the rest nil. All four
-    # mean the same thing here: no usable instruction, so back off on our own terms.
-    # `now + nil` raises and `now + nil.to_i` is no block at all, which is the response
-    # most likely to escalate GitHub's throttling.
-    def fallback_instant(snapshot, now:)
+    # Retry-After may be absent, zero, negative, or unparseable. All of those mean the same
+    # thing here: no usable instruction, so back off on our own terms. `now + nil` raises
+    # and `now + nil.to_i` is no block at all, which is the response most likely to
+    # escalate GitHub's throttling.
+    #
+    # A server-supplied instruction is obeyed as given (within honoured's clamp), so
+    # `attempt` reaches PollBackoff only on the header-absent path — which is exactly where
+    # §10 puts the exponential: "from Retry-After (or >= 1 minute with exponential backoff
+    # when the header is absent)".
+    def fallback_instant(snapshot, now:, attempt:)
       seconds = snapshot&.retry_after_seconds
       return now + honoured(seconds) if seconds.is_a?(Integer) && seconds.positive?
 
-      @backoff.retry_at(1, now: now)
+      @backoff.retry_at(attempt, now: now)
+    end
+
+    # Zero when no row exists yet: a secondary limit before the ledger is bootstrapped has
+    # no history to escalate from, and PollBackoff's floor still gives it the minute §10
+    # requires.
+    def consecutive_secondary_limits
+      GithubApiBudget.find_by(id: GithubApiBudget::SINGLETON_ID)&.consecutive_secondary_limits.to_i
     end
 
     def honoured(seconds)

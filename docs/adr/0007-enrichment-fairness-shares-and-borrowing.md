@@ -128,3 +128,24 @@ from inside the most contended row lock in the application would invert the lock
   type. The failure is precision rather than soundness — the sum invariant survives, because
   the repository guarantee is a subtraction — but it silently loses an attempt off the
   number on the page.
+
+## Amendment (2026-07-31): the refresh pool follows the same two steps
+
+This ADR decided how the pending pool allocates and left the refresh pool's *selection
+order* unstated, and the shipped `#refresh_choice` did not follow it: it took the first
+refreshable class in `EntityType.all` order — always actor — and set `borrow` from whether
+that class happened to be past its guarantee. Its borrow test also read the pending
+eligibility map, so the other class's stale rows were invisible to it. The result was the
+starvation this ADR exists to prevent, reproduced one pool down: actor could spend the whole
+enrichment allowance on refreshes while repository's untouched guarantee and eligible stale
+rows were never selected.
+
+`#refresh_choice` now performs the same two steps as `#pending_choice` — prefer a class with
+`room_within_guarantee?`, then borrow only from a class with nothing to refresh — over an
+eligibility map built from the refresh pool. `CandidateSelector#pending_available?` is
+unchanged and stays pending-only; decision 3's reasoning about the prioritization ladder is
+about the *pending* borrow test and still holds.
+
+See [ADR 0010](0010-secondary-limit-escalation-and-refresh-pool-fairness.md) for the full
+context, the rejected "refreshes never borrow" reading of §10:898, and the
+`borrowed_refresh` choice reason.

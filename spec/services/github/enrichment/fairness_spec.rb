@@ -174,13 +174,64 @@ RSpec.describe Github::Enrichment::Fairness do
       expect(choose(entity_class: :actor)).to have_attributes(chosen?: false, reason: "no_candidate")
     end
 
-    # With no pending candidate anywhere, "the other class has no currently eligible
-    # candidate" is true by definition, so a refresh past the guarantee is a legal borrow.
+    # The other class has no refresh of its own to do, so nothing is starved by lending
+    # its idle capacity — the same condition #pending_choice borrows under.
     it "borrows for a refresh once the class has spent its guarantee" do
       active_budget_window(now: now, actor_share_used: 20, enrichment_used: 20)
       stale_actor
 
-      expect(choose).to have_attributes(pool: :refresh, borrow: true)
+      expect(choose).to have_attributes(pool: :refresh, borrow: true, reason: "borrowed_refresh")
+    end
+
+    def stale_repository(github_id: 2)
+      create_repository(github_id: github_id, enrichment_status: "complete", fetched_at: now - 90_000,
+                        last_seen_at: now - 60)
+    end
+
+    # §10:898 scopes refreshes "within each class's share", and §10's whole reason for
+    # having shares is that "a naive repo-first policy would starve actor enrichment to
+    # zero indefinitely". Selecting the first refreshable class outright reproduced exactly
+    # that inside the refresh pool, with the order reversed: actor spent its own twenty and
+    # then borrowed the remaining twenty, while repository's untouched guarantee and
+    # eligible stale rows were never chosen.
+    describe "when both classes have stale rows" do
+      before do
+        active_budget_window(now: now, actor_share_used: 20, enrichment_used: 20)
+        stale_actor
+        stale_repository
+      end
+
+      it "chooses the class that still has room, not the first in class order" do
+        expect(choose).to have_attributes(entity_type: Github::Enrichment::EntityType.fetch(:repository),
+                                          pool: :refresh, borrow: false, reason: "refresh")
+      end
+
+      # The borrow condition is about the class this cycle did not pick, so a class with
+      # refresh work of its own is not idle capacity to lend.
+      it "refuses to borrow while the other class has a refresh of its own" do
+        expect(choose(entity_class: :actor)).to have_attributes(chosen?: false, reason: "no_candidate")
+      end
+
+      # Once the other class runs dry the capacity genuinely is idle, and §10's borrowing
+      # rule applies to the refresh pool exactly as it does to the pending one.
+      it "borrows again once the other class has nothing left to refresh" do
+        GithubRepository.update_all(fetched_at: now)
+
+        expect(choose).to have_attributes(entity_type: Github::Enrichment::EntityType.fetch(:actor),
+                                          pool: :refresh, borrow: true, reason: "borrowed_refresh")
+      end
+    end
+
+    # The pending pool's borrow test stays pending-only. CandidateSelector documents why:
+    # counting refreshes there would let a refresh outrank a never-enriched candidate and
+    # invert §10's ladder. Only the refresh pool's own test changed.
+    it "still borrows for a pending candidate while the other class has a stale refresh" do
+      active_budget_window(now: now, actor_share_used: 20, enrichment_used: 20)
+      pending_actor
+      stale_repository
+
+      expect(choose).to have_attributes(entity_type: Github::Enrichment::EntityType.fetch(:actor),
+                                        pool: :pending, borrow: true, reason: "borrowed_pending")
     end
   end
 end

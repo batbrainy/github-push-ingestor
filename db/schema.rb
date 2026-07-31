@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_07_31_100000) do
+ActiveRecord::Schema[8.1].define(version: 2026_07_31_120000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -63,6 +63,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_07_31_100000) do
 
   create_table "github_api_budget", id: :integer, default: 1, force: :cascade do |t|
     t.integer "actor_share_used", default: 0, null: false
+    t.integer "consecutive_secondary_limits", default: 0, null: false
     t.datetime "created_at", null: false
     t.integer "enrichment_allowance", default: 0, null: false
     t.integer "enrichment_used", default: 0, null: false
@@ -80,6 +81,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_07_31_100000) do
     t.datetime "updated_at", null: false
     t.datetime "window_initialized_at"
     t.text "window_status", default: "uninitialized", null: false
+    t.check_constraint "consecutive_secondary_limits >= 0", name: "github_api_budget_secondary_limits_nonnegative"
     t.check_constraint "id = 1", name: "github_api_budget_singleton"
     t.check_constraint "poll_allowance >= 0 AND poll_used >= 0 AND enrichment_allowance >= 0 AND enrichment_used >= 0 AND actor_share_used >= 0 AND repository_share_used >= 0 AND reserve >= 0 AND (\"limit\" IS NULL OR \"limit\" >= 0) AND (remaining IS NULL OR remaining >= 0)", name: "github_api_budget_counters_nonnegative"
     t.check_constraint "window_status = ANY (ARRAY['uninitialized'::text, 'active'::text, 'globally_blocked'::text])", name: "github_api_budget_window_status_check"

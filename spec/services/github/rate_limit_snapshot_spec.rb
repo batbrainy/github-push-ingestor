@@ -70,6 +70,37 @@ RSpec.describe Github::RateLimitSnapshot do
     end
   end
 
+  # RFC 9110 permits delta-seconds and an HTTP-date, and §10 lists Retry-After among the
+  # headers to process without qualifying which form. Both are normalized to a delta here
+  # so Github::RateLimitPolicy has one thing to reason about.
+  describe "Retry-After" do
+    def retry_after(value) = snapshot("retry-after" => value).retry_after_seconds
+
+    it "reads the delta-seconds form GitHub actually sends" do
+      expect(retry_after("120")).to eq(120)
+    end
+
+    # Resolved against the snapshot's own observed_at rather than the wall clock, so the
+    # same headers always produce the same delta.
+    it "converts the HTTP-date form to a delta against the observation instant" do
+      expect(retry_after((frozen_time + 2700).httpdate)).to eq(2700)
+    end
+
+    # Not normalized to nil: this class reads and never decides, and the policy already
+    # treats a non-positive delta exactly as it treats an absent header.
+    it "reports a date that has already passed as a non-positive delta" do
+      expect(retry_after((frozen_time - 300).httpdate)).to eq(-300)
+    end
+
+    it "reports a value that is neither form as absent" do
+      expect(retry_after("immediately")).to be_nil
+    end
+
+    it "reports an absent header as absent" do
+      expect(retry_after(nil)).to be_nil
+    end
+  end
+
   describe "#quantitative?" do
     # What the ledger needs before it can initialize or reconcile a window: without a
     # reset boundary there is no window to reconcile within.
