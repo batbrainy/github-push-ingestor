@@ -8,50 +8,65 @@ structured data in PostgreSQL, enriches actors and repositories within an
 explicit unauthenticated request budget, and recovers cleanly from application
 and worker crashes.
 
-## Status
+## Contents
 
-Background processing and recovery stage (PR 8). The Rails 8.1 API, PostgreSQL, Docker
-Compose topology, health endpoints, and structured JSON logging landed in PR 2; the
-seven core tables and their idempotent write paths in PR 3; the chain every GitHub
-request flows through — request gate, class-aware budget ledger, SSRF URL policy,
-live and offline transports, fixture corpus, per-source advisory lock, event-source
-adapter — in PR 4; the processor registry, the tolerant `PushEvent` parser, the
-quarantine taxonomy, the ingest transaction, and the one-shot command in PR 5;
-`Link`-header pagination, the page-one ETag, the five independent components behind
-`effective_poll_time`, and global-versus-class blocking in PR 6; the entity state
-machine, per-class fairness with eligibility-aware borrowing, the freshness cache and
-its refresh TTLs, `skipped_budget` with distinct-event reactivation, and
-`effective_enrichment_time` in PR 7.
+- [What this is](#what-this-is)
+- [Requirements](#requirements)
+- [Quick start](#quick-start)
+- [How to verify it's working](#how-to-verify-its-working)
+- [One-shot ingestion](#one-shot-ingestion)
+- [Deterministic fixture verification](#deterministic-fixture-verification)
+- [Inspecting the data](#inspecting-the-data)
+- [The data model](#the-data-model)
+- [Logs](#logs)
+- [Rate limits and the request budget](#rate-limits-and-the-request-budget)
+- [Configuration](#configuration)
+- [Architecture](#architecture)
+- [Continuous ingestion](#continuous-ingestion)
+- [Processing guarantees](#processing-guarantees)
+- [Crash recovery, verified](#crash-recovery-verified)
+- [Troubleshooting and reset](#troubleshooting-and-reset)
+- [Known limitations](#known-limitations)
+- [Development](#development)
+- [License](#license)
 
-**This stage makes the system run by itself, and proves it recovers.** Solid Queue
-now runs in its own `queue` database inside the same PostgreSQL container, a `worker`
-container runs its supervisor, and two recurring tasks fire every 60 seconds:
-`PollEventSourceJob`, which polls each source that §9's schedule says is due, and
-`ReconcilePendingEnrichmentsJob`, which sweeps the committed entity rows for
-enrichment work and schedules a cycle per class. A completed poll that created events
-schedules enrichment immediately, after commit.
+## What this is
 
-**Enrichment is bounded best-effort sampling, and says so.** Against ~2,172 cold
-entity requests an hour of demand and 40 available, partial coverage is the design
-rather than a shortfall — `skipped_budget` is a normal documented outcome, and
-`bin/enrich` prints the per-class usage so the sampling rate is visible instead of a
-mysteriously growing queue (plan §10).
+GitHub publishes a firehose of public activity at `/events`. This service ingests the
+`PushEvent` slice of it durably, enriches the actors and repositories those events
+reference, and survives restarts — **without a token**, inside an unauthenticated ceiling
+of 60 requests per hour keyed to the outbound IP.
+
+What it does, running:
+
+- **Polls** one event source on a cadence, following `Link`-header pagination, and
+  processes every fetched page in full.
+- **Persists** each `PushEvent` with typed columns and its raw `jsonb` payload, quarantining
+  malformed envelopes durably instead of dropping them or failing the batch.
+- **Enriches** actors and repositories through the same budget-governed request chain,
+  under per-class fairness guarantees.
+- **Recovers** on its own: advisory locks die with their session, entity leases expire by
+  arithmetic, and a 60-second reconciler rebuilds pending work from committed rows.
+
+**Enrichment is bounded best-effort sampling, and says so.** Against roughly 2,172 cold
+entity requests an hour of demand and 40 available, partial coverage is the design rather
+than a shortfall — `skipped_budget` is a normal documented outcome, and `/status` publishes
+the real sampling rate. See [Known limitations](#known-limitations).
 
 **With the default `GITHUB_MODE=live`, `docker compose up` starts spending real
 unauthenticated quota** — twelve poll requests an hour at the default cadence, plus
 enrichment inside its allowance. That is the intended runtime behaviour (plan §2A);
 `GITHUB_MODE=fixture docker compose up --build` runs the same flow entirely offline.
 
-The processing guarantee is unchanged and stated exactly: at-least-once execution
-plus idempotent writes plus unique constraints gives **effectively-once persisted
-outcomes**. This system does not claim exactly-once execution — a job may run twice,
-and the second run changes nothing.
+The processing guarantee is stated exactly: at-least-once execution plus idempotent writes
+plus unique constraints gives **effectively-once persisted outcomes**. This system does not
+claim exactly-once execution. See [Processing guarantees](#processing-guarantees).
 
-Ingestion capabilities land PR by PR; each README section below is completed by
-the pull request that ships the capability it documents. The authoritative
-execution plan is [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) — its
-pre-implementation revision history lives in Git and in its Appendices A–D.
-Delivery is tracked on the
+[`docs/DESIGN_BRIEF.md`](docs/DESIGN_BRIEF.md) is the two-page architecture summary and the
+best place to start. The authoritative execution plan is
+[`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) — its pre-implementation revision history
+lives in Git and in its Appendices A–D, and Appendix E records how the build diverged from
+it. Delivery is tracked on the
 [GitHub Push Ingestor Delivery project](https://github.com/users/batbrainy/projects/1).
 
 ## Requirements
@@ -59,7 +74,7 @@ Delivery is tracked on the
 - Docker with Compose v2 (`docker compose`). Nothing else is needed on the
   host — Ruby 3.4.10 and all dependencies live in the image.
 
-## Quick start (clean checkout)
+## Quick start
 
 ```bash
 docker compose up --build
@@ -76,6 +91,9 @@ This starts, in dependency order (plan §2A):
    **Continuous polling begins here**: its scheduler fires the 60-second tick, so
    the first poll happens within a minute and every 300 seconds after that.
 
+Those four are the whole stack. `ingest`, `enrich`, and `test` sit behind a compose
+profile, so a plain `up` never starts them.
+
 Verify it is healthy:
 
 ```bash
@@ -83,74 +101,13 @@ curl http://localhost:3000/health/live    # {"status":"ok"} — process is up
 curl http://localhost:3000/health/ready   # {"status":"ok"} — database reachable, schema current
 ```
 
-See what it has actually done, and inspect what it captured:
-
-```bash
-curl -s http://localhost:3000/status | jq
-curl -s 'http://localhost:3000/api/push_events?limit=5' | jq
-curl -s http://localhost:3000/api/push_events/<github_event_id> | jq .data.raw_payload
-```
-
 **No endpoint on this surface ever calls GitHub or consumes request budget** (plan
 §11). That is structural rather than a promise: none of these controllers holds an
 executor or a transport, and `Github::BudgetLedger` is absent from all of them —
 every one of its public methods writes, and `#bootstrap!` would create from a read
-path the very ledger row a reservation owns. Four specs pin it, including one that
-subscribes to every SQL statement a request issues and fails on any `INSERT`,
+path the very ledger row a reservation owns. Specs pin it, including ones that
+subscribe to every SQL statement a request issues and fail on any `INSERT`,
 `UPDATE` or `DELETE`.
-
-#### `GET /status`
-
-Reports persisted state only: the poll schedule per event source (all five of §9's
-components, plus which one is binding), the per-class ledger state, §11's three
-enrichment coverage percentages, and the per-status entity counts.
-
-Three conventions in the response body are worth knowing before reading one:
-
-- **`null` is never a zero.** A counted zero prints `0`; a number that does not
-  exist prints `null`. Where `null` would be ambiguous the disambiguating fact gets
-  its own field — `ledger.present` separates "no ledger row yet" from "remaining is
-  genuinely 0", `due_now` separates "no constraint applies" from "unknown", and
-  `claimable_now` separates "work is claimable this second" from "nothing is
-  waiting". An empty coverage window reports `null` percentages, not `0.0`: the
-  ratio is undefined, not zero, and every denominator is published beside its ratio
-  so you can check it.
-- **The coverage window is measured on `created_at`** — when *this application*
-  persisted the event, not GitHub's `occurred_at`. Coverage grades this
-  application's enrichment pipeline, and that pipeline's own eligibility and
-  freshness rules already run on this clock. The basis is published as
-  `coverage.basis` so the choice is visible rather than assumed. Widen
-  `ENRICHMENT_COVERAGE_WINDOW_SECONDS` when reviewing a fixture corpus that has aged.
-- **`actor_requests.available` is a floor, not a ceiling.** §10 lets one class
-  borrow the other's unspent capacity when the other has no eligible candidate, so a
-  class does not stop at zero available. The real ceiling is the `enrichment` pair
-  beside it.
-
-`pending` in the entity counts means `enrichment_status = 'pending'` exactly. The
-`candidates` figure beside it is pending **plus** `retryable_failure` — the "how much
-work is left" number `bin/ingest` prints. Two questions, two names, deliberately.
-
-#### `GET /api/push_events` and `GET /api/push_events/:id`
-
-`:id` is the **GitHub event id**, not the surrogate primary key — the identifier §11
-puts on every log line, so a log line is a URL you can type. The surrogate key
-appears in no response.
-
-Paging is keyset on `(occurred_at, id)` with an opaque cursor, not `offset`: the
-poller writes continuously and this list is newest-first, so an offset page 2 would
-re-serve rows from page 1 and skip others whenever a poll landed in between. Follow
-`pagination.next_cursor`, or the RFC-8288 `Link: …; rel="next"` header. `limit`
-defaults to 25 and is capped at 100 — a value outside that range is a `400`, never a
-silent clamp, because a client that asked for 500 and received 100 cannot tell
-whether it received everything. `actor_id` and `repository_id` filter; an unknown
-parameter is a `400` rather than a silently unfiltered answer.
-
-The list omits `raw_payload` — it is a multi-kilobyte TOASTed `jsonb` column nobody
-scans a list for. `GET /api/push_events/:id` returns it, which is how §16's "raw
-payload is retained" gate is checkable without a psql session. Every row nests its
-actor and repository with their `enrichment_status`, so §16's enrichment gate is
-visible in a browser as statuses flip from `pending` to `complete` while the worker
-runs.
 
 Run the test suite (isolated `*_test` databases; never touches the
 development databases):
@@ -177,6 +134,151 @@ Stop everything (add `-v` to also drop the database volume):
 ```bash
 docker compose down
 ```
+
+## How to verify it's working
+
+The four commands the assignment asks for:
+
+```bash
+docker compose up --build
+docker compose run --rm ingest
+docker compose run --rm test
+docker compose logs -f
+```
+
+`IMPLEMENTATION_PLAN.md` §15 asks a reviewer to walk eleven steps. Each one below is the
+command plus the result to look for; the linked section carries the explanation.
+
+**1. Start all services.**
+
+```bash
+docker compose up --build          # live mode — spends real quota
+GITHUB_MODE=fixture docker compose up --build    # the same flow, zero network
+```
+
+Exactly four containers come up: `db`, `setup`, `web`, `worker`. See
+[Quick start](#quick-start).
+
+**2. Wait for health checks.**
+
+```bash
+until curl -fsS http://localhost:3000/health/ready; do sleep 2; done
+```
+
+`{"status":"ok"}`. `/health/live` reports the process; `/health/ready` reports the database
+and schema. Neither consumes budget.
+
+**3. Run one-shot ingestion.**
+
+```bash
+docker compose run --rm ingest
+```
+
+Either a completed-run summary or a deferral — `Ingestion deferred until … — cadence_due_at`
+or `source busy — poller cycle in progress`. **A deferred or busy result is a valid result**:
+the state summary prints on every path and the exit code is 0, so the command always proves
+system state rather than just its own outcome. See [One-shot ingestion](#one-shot-ingestion).
+
+**4. Follow application and worker logs.**
+
+```bash
+docker compose logs -f
+docker compose logs -f worker
+```
+
+One structured JSON stream. See [Logs](#logs).
+
+**5. Query persisted push events.**
+
+```bash
+curl -s 'http://localhost:3000/api/push_events?limit=5' | jq
+curl -s http://localhost:3000/api/push_events/<github_event_id> | jq .data.raw_payload
+```
+
+The list nests each event's actor and repository with their `enrichment_status`; the
+detail endpoint returns the retained raw payload. See
+[Inspecting the data](#inspecting-the-data).
+
+**6. Inspect PostgreSQL record counts.**
+
+```bash
+docker compose exec db psql -U postgres -d github_push_ingestor_development -c "
+  SELECT (SELECT COUNT(*) FROM push_events)                     AS push_events,
+         (SELECT COUNT(*) FROM github_actors)                   AS actors,
+         (SELECT COUNT(*) FROM github_repositories)             AS repositories,
+         (SELECT COUNT(*) FROM quarantined_events)              AS quarantined,
+         (SELECT SUM(occurrence_count) FROM quarantined_events) AS occurrences;"
+```
+
+More queries in [Database inspection](#database-inspection); what each table means is in
+[The data model](#the-data-model).
+
+**7. Run the fixture replay and confirm duplicates are absorbed.**
+
+```bash
+GITHUB_MODE=fixture docker compose run --rm ingest
+sleep 60    # GitHub's X-Poll-Interval floor, which --force deliberately does not bypass
+GITHUB_MODE=fixture docker compose run --rm ingest --force
+```
+
+Two things to confirm, not one. `Duplicates skipped: 4` in the second summary — and that
+**no skipped entity was reactivated**. The second is falsifiable: `enrichment.reactivated`
+is emitted only on a real reactivation, so it should be absent, and the `skipped_budget`
+count should be unchanged.
+
+```bash
+docker compose logs ingest | grep enrichment.reactivated     # expect no output
+docker compose exec db psql -U postgres -d github_push_ingestor_development -c "
+  SELECT COUNT(*) FROM github_actors WHERE enrichment_status = 'skipped_budget';"
+```
+
+See [Deterministic fixture verification](#deterministic-fixture-verification).
+
+**8. Verify crash recovery with actual container kills.**
+
+```bash
+GITHUB_MODE=fixture docker compose up --build -d
+script/verify_recovery.sh --confirm
+```
+
+Read §15's literal `docker kill` command knowing what it does: it is an API stop, and
+`restart: unless-stopped` is *defined* to skip exactly that case, so the documented command
+leaves the container down. The script performs both that and a real process crash, and
+reports both. See [Crash recovery, verified](#crash-recovery-verified).
+
+**9. Restart normally and confirm records remain.**
+
+```bash
+docker compose exec db psql -U postgres -d github_push_ingestor_development \
+  -c "SELECT COUNT(*) FROM push_events;"
+docker compose restart
+docker compose exec db psql -U postgres -d github_push_ingestor_development \
+  -c "SELECT COUNT(*) FROM push_events;"
+```
+
+Identical counts. The volume is named; only `down -v` removes it.
+
+**10. Run the full deterministic fixture scenario.**
+
+```bash
+GITHUB_MODE=fixture docker compose run --rm ingest
+GITHUB_MODE=fixture docker compose run --rm enrich --limit 6
+```
+
+From an empty database: **4 push events created, 3 quarantined, 1 ignored, 3 actors, 3
+repositories** — then `complete 2 / permanent_failure 1` in each entity class. Eleven more
+scenarios are in the [fixture scenario matrix](#fixture-scenario-matrix).
+
+**11. Run tests.**
+
+```bash
+docker compose run --rm test
+```
+
+Two `rspec` invocations against isolated `*_test` databases, the same two CI runs.
+
+If something looks wrong, [Troubleshooting and reset](#troubleshooting-and-reset) has a
+symptom table and a three-level reset ladder.
 
 ## One-shot ingestion
 
@@ -246,7 +348,7 @@ window prints `Ingestion deferred until … — cadence_due_at` and makes no req
 all. With `--force`, it polls — and spends one of the twelve hourly poll attempts
 to do it.
 
-### Deterministic verification
+## Deterministic fixture verification
 
 Fixture mode resolves every request inside [`fixtures/github/`](fixtures/github/)
 with no network at all, so the numbers are exact:
@@ -371,78 +473,375 @@ At `MAX_PAGES_PER_POLL=2` the counts are identical except `Pages fetched: 2` —
 3 is empty — and the stop reason on the `ingestion.pagination_stopped` debug line
 changes from `empty_page` to `page_cap`.
 
-### Why a `304` costs a request here
+### Fixture scenario matrix
 
-GitHub's events documentation states generally that `304` responses do not count
-against the rate limit; its REST best-practices documentation scopes that exemption
-to requests "correctly authorized with an `Authorization` header". This service
-sends no token, so the two statements disagree about exactly the population of
-requests it makes. A dated unauthenticated probe run under
-`X-GitHub-Api-Version: 2022-11-28` settles it for this configuration:
-`x-ratelimit-used` increments across a `304`. The transcript, with complete
-before-and-after headers and its own stated limits, is
-[`docs/evidence/2026-07-30-unauthenticated-304-quota-probe.md`](docs/evidence/2026-07-30-unauthenticated-304-quota-probe.md).
+Every scenario resolves inside [`fixtures/github/`](fixtures/github/) with no network at all.
+Each poll obeys GitHub's `X-Poll-Interval` floor of 60s, which `--force` deliberately does not
+bypass, so allow a minute between successive ingestion scenarios.
 
-So the ledger debits every outbound attempt, `304`s included, and the stored ETag
-is a bandwidth and correctness measure rather than a quota saver. The asymmetry
-justifies the choice: budgeting a `304` that turns out to be free wastes one
-attempt, while not budgeting one that is in fact charged overruns a sixty-request
-hour. The transcript claims nothing about authenticated requests — this project has
-no token and cannot test that case.
+| Scenario | Command | What it shows | Cleanup |
+|---|---|---|---|
+| `default` | `GITHUB_MODE=fixture docker compose run --rm ingest` | 4 push events, 3 actors, 3 repositories, 3 quarantined | none |
+| `default` (replay) | `… run --rm ingest --force` after 60s | `duplicates_skipped > 0`, occurrence counts climb, no skipped entity reactivated | none |
+| `default` (enrich) | `… run --rm enrich --limit 6` | both classes enrich within their fairness shares | none |
+| `paginated` | `GITHUB_FIXTURE_SCENARIO=paginated MAX_PAGES_PER_POLL=3 … ingest` | `Link`-driven walk over 3 pages | none |
+| `paginated_final_page` | `GITHUB_FIXTURE_SCENARIO=paginated_final_page … ingest` | the walk stops when no `next` link exists | none |
+| `transient_failure` | `GITHUB_FIXTURE_SCENARIO=transient_failure … ingest` | one `500`, then success on retry | none |
+| `transient_failure_exhausted` | `GITHUB_FIXTURE_SCENARIO=transient_failure_exhausted … ingest` | retries exhausted; the source backs off | source backoff |
+| `redirecting_repository` | `GITHUB_FIXTURE_SCENARIO=redirecting_repository … enrich --class repository` | a renamed repository followed across one validated hop, debited twice | none |
+| `hostile_redirect` | `GITHUB_FIXTURE_SCENARIO=hostile_redirect … enrich --class repository` | an off-host `Location` refused by the URL policy; the second hop is never sent and the event source stays in service | none |
+| `secondary_rate_limited` | `GITHUB_FIXTURE_SCENARIO=secondary_rate_limited … ingest` | a secondary limit blocks globally | global block |
+| `rate_limited` | `GITHUB_FIXTURE_SCENARIO=rate_limited … ingest` | primary exhaustion → `global_blocked_until` | **a real one-hour global block** |
 
-### Expected time before records appear
+The last two leave durable state behind on purpose — that is the behaviour being demonstrated.
+`script/verify_recovery.sh --phase=cleanup` runs the SQL under
+[Recovering from a fixture rate-limit run](#recovering-from-a-fixture-rate-limit-run), and
+`--phase=rate-limit` plays the rate-limit scenario and cleans up immediately after.
 
-A push reaches the public feed with a documented latency of 30 seconds to 6 hours,
-and the default cadence polls every 5 minutes, so a given push may take hours to
-appear — or never, if it left the feed's 300-event window before a poll reached it.
-The feed retains 30 days. At `MAX_PAGES_PER_POLL=1` each poll sees at most the
-newest ~100 events, and the feed moves considerably faster than that. **This service
-samples the public feed rather than mirroring it**, and pagination deepens a single
-poll within the budget rather than backfilling: events that rolled out of the window
-while the service was down are not recoverable.
+## Inspecting the data
 
-### When a source goes out of service
+Three endpoints answer "what has it actually done" without a psql session, and none of
+them consumes request budget:
 
-A permanent `4xx` from `/events` — not a rate limit, not a `5xx`, both of which are
-retried — takes the source out of service: `event_sources.status` becomes `failed`,
-`last_error` records why, and **no further poll is attempted**, including under
-`--force`. That is deliberate: the request cannot succeed, so retrying it on a cadence
-would spend the hourly budget on a certainty.
+```bash
+curl -s http://localhost:3000/status | jq
+curl -s 'http://localhost:3000/api/push_events?limit=5' | jq
+curl -s http://localhost:3000/api/push_events/<github_event_id> | jq .data.raw_payload
+```
+
+### `GET /status`
+
+Reports persisted state only: the poll schedule per event source (all five of §9's
+components, plus which one is binding), the per-class ledger state, §11's three
+enrichment coverage percentages, and the per-status entity counts.
+
+Three conventions in the response body are worth knowing before reading one:
+
+- **`null` is never a zero.** A counted zero prints `0`; a number that does not
+  exist prints `null`. Where `null` would be ambiguous the disambiguating fact gets
+  its own field — `ledger.present` separates "no ledger row yet" from "remaining is
+  genuinely 0", `due_now` separates "no constraint applies" from "unknown", and
+  `claimable_now` separates "work is claimable this second" from "nothing is
+  waiting". An empty coverage window reports `null` percentages, not `0.0`: the
+  ratio is undefined, not zero, and every denominator is published beside its ratio
+  so you can check it.
+- **The coverage window is measured on `created_at`** — when *this application*
+  persisted the event, not GitHub's `occurred_at`. Coverage grades this
+  application's enrichment pipeline, and that pipeline's own eligibility and
+  freshness rules already run on this clock. The basis is published as
+  `coverage.basis` so the choice is visible rather than assumed. Widen
+  `ENRICHMENT_COVERAGE_WINDOW_SECONDS` when reviewing a fixture corpus that has aged.
+- **`actor_requests.available` is a floor, not a ceiling.** §10 lets one class
+  borrow the other's unspent capacity when the other has no eligible candidate, so a
+  class does not stop at zero available. The real ceiling is the `enrichment` pair
+  beside it.
+
+`pending` in the entity counts means `enrichment_status = 'pending'` exactly. The
+`candidates` figure beside it is pending **plus** `retryable_failure` — the "how much
+work is left" number `bin/ingest` prints. Two questions, two names, deliberately.
+
+### `GET /api/push_events` and `GET /api/push_events/:id`
+
+`:id` is the **GitHub event id**, not the surrogate primary key — the identifier §11
+puts on every log line, so a log line is a URL you can type. The surrogate key
+appears in no response.
+
+Paging is keyset on `(occurred_at, id)` with an opaque cursor, not `offset`: the
+poller writes continuously and this list is newest-first, so an offset page 2 would
+re-serve rows from page 1 and skip others whenever a poll landed in between. Follow
+`pagination.next_cursor`, or the RFC-8288 `Link: …; rel="next"` header. `limit`
+defaults to 25 and is capped at 100 — a value outside that range is a `400`, never a
+silent clamp, because a client that asked for 500 and received 100 cannot tell
+whether it received everything. `actor_id` and `repository_id` filter; an unknown
+parameter is a `400` rather than a silently unfiltered answer.
+
+The list omits `raw_payload` — it is a multi-kilobyte TOASTed `jsonb` column nobody
+scans a list for. `GET /api/push_events/:id` returns it, which is how §16's "raw
+payload is retained" gate is checkable without a psql session. Every row nests its
+actor and repository with their `enrichment_status`, so §16's enrichment gate is
+visible in a browser as statuses flip from `pending` to `complete` while the worker
+runs.
+
+### Database inspection
+
+The queue is a database too, so one tool inspects everything. Each query below assumes
+this prefix:
+
+```bash
+docker compose exec db psql -U postgres -d github_push_ingestor_development -c "…"
+```
+
+**How much was captured**
+
+```sql
+SELECT (SELECT COUNT(*) FROM push_events)                     AS push_events,
+       (SELECT COUNT(*) FROM github_actors)                   AS actors,
+       (SELECT COUNT(*) FROM github_repositories)             AS repositories,
+       (SELECT COUNT(*) FROM quarantined_events)              AS quarantined,
+       (SELECT SUM(occurrence_count) FROM quarantined_events) AS occurrences,
+       (SELECT COUNT(*) FROM ingestion_runs)                  AS runs;
+```
+
+**Where enrichment stands, per class**
+
+```sql
+SELECT 'actor' AS class, enrichment_status, COUNT(*) FROM github_actors GROUP BY 2
+UNION ALL
+SELECT 'repository', enrichment_status, COUNT(*) FROM github_repositories GROUP BY 2
+ORDER BY 1, 2;
+```
+
+**The budget ledger, whole**
+
+```sql
+SELECT window_status, "limit", remaining, reserve,
+       poll_used, poll_allowance, enrichment_used, enrichment_allowance,
+       actor_share_used, repository_share_used,
+       global_blocked_until, reset_at, consecutive_secondary_limits
+  FROM github_api_budget;
+```
+
+**The last five runs and what they did**
+
+```sql
+SELECT run_id, status, started_at, pages_fetched, events_created,
+       duplicates_skipped, events_quarantined, events_failed
+  FROM ingestion_runs ORDER BY started_at DESC LIMIT 5;
+```
+
+**What was quarantined, and how often it recurred**
+
+```sql
+SELECT github_event_id, event_type, error_code, occurrence_count,
+       first_received_at, last_received_at
+  FROM quarantined_events ORDER BY occurrence_count DESC;
+```
+
+**Why a source is or is not due** — all five scheduling components side by side
+
+```sql
+SELECT source_type, status, enabled, consecutive_failures,
+       cadence_due_at, poll_floor_until, retry_not_before_at, next_poll_at
+  FROM event_sources;
+```
+
+**The queue** — a different database, same tool
+
+```bash
+docker compose exec db psql -U postgres -d github_push_ingestor_queue_development \
+  -c "SELECT key, class_name, schedule FROM solid_queue_recurring_tasks;" \
+  -c "SELECT class_name, count(*) FROM solid_queue_jobs GROUP BY 1;" \
+  -c "SELECT kind, name, last_heartbeat_at FROM solid_queue_processes;"
+```
+
+## The data model
+
+Seven business tables in three groups:
+
+- **Source and run state** — `event_sources` (what to poll and when), `ingestion_runs`
+  (what each attempt did).
+- **Business records** — `push_events`, `github_actors`, `github_repositories`,
+  `quarantined_events`.
+- **The global ledger** — `github_api_budget`, one row.
+
+A second database, `github_push_ingestor_queue_development`, holds Solid Queue's tables.
+That is job state, not business state: deleting all of it loses nothing, because pending
+work is rebuilt from committed entity rows
+([ADR 0008](docs/adr/0008-post-commit-enqueue-and-entity-scoped-reconciliation.md)).
+
+| Table | What a row is | Identity | Written by |
+|---|---|---|---|
+| `event_sources` | one pollable feed and its schedule | `source_type` | `Ingestion::PollState`, `SourceProvisioner` |
+| `ingestion_runs` | one poll attempt that reached GitHub | `run_id` (uuid, unique) | `Ingestion::RunRecorder` |
+| `push_events` | one accepted GitHub `PushEvent` | `github_event_id` (unique) | `Ingestion::PageWriter` |
+| `github_actors` | one GitHub user seen pushing | `github_id` (unique) | `PageWriter` (stub), `Enrichment::EntityState` |
+| `github_repositories` | one GitHub repository seen receiving a push | `github_id` (unique) | `PageWriter` (stub), `Enrichment::EntityState` |
+| `quarantined_events` | one distinct malformed payload | `payload_fingerprint` (unique) | `Ingestion::PageWriter` |
+| `github_api_budget` | the hourly request budget | `id = 1` (check constraint) | `Github::BudgetLedger` |
+
+### Columns that carry a rule
+
+**`push_events`** — the durability boundary.
+
+| Column | Type | The rule it encodes |
+|---|---|---|
+| `github_event_id` | `text` **unique** | GitHub's own event id. The unique index *is* the deduplication mechanism |
+| `github_push_id` | `bigint` | `payload.push_id`; indexed but not unique — GitHub does not guarantee it is |
+| `github_actor_id` | `bigint` FK → `github_actors.github_id` | The FK targets GitHub's identifier, **not** the surrogate primary key |
+| `github_repository_id` | `bigint` FK → `github_repositories.github_id` | Same |
+| `ref` | `text` `NOT NULL` | `payload.ref` |
+| `head_sha`, `before_sha` | `varchar(64)` `NOT NULL` | `payload.head` and `payload.before`. 64, not 40, so **both SHA-1 and SHA-256 object names are accepted** |
+| `occurred_at` | `timestamp` `NOT NULL`, indexed | GitHub's `created_at`. Distinct from this row's `created_at`, which is when *this* application persisted it |
+| `raw_payload` | `jsonb` `NOT NULL` | Retention is **semantic, not byte-exact** ([ADR 0001](docs/adr/0001-jsonb-semantic-retention.md)) |
+
+**`github_actors` / `github_repositories`** — identical enrichment state machines.
+
+| Column | Type | The rule it encodes |
+|---|---|---|
+| `github_id` | `bigint` **unique** | Identity. The stub upsert conflicts on this |
+| `enrichment_status` | `text`, check-constrained | Five legal values; see below |
+| `first_seen_at`, `last_seen_at`, `latest_event_at` | `timestamp` | Activity. Updated **only** when a `push_events` insert actually returned a row |
+| `next_retry_at` | `timestamp` | Double duty: the backoff instant *and* the enrichment lease. One column, one predicate, so the candidate query, the age-out sweep and the claim cannot drift apart |
+| `fetched_at` | `timestamp` | When enrichment last succeeded — the input to the refresh TTL |
+| `skipped_at` | `timestamp` | When the eligibility window expired and the row became `skipped_budget` |
+| `raw_payload` | `jsonb` nullable | The enrichment response. Null until a fetch succeeds |
+
+**`event_sources`** — five independent scheduling columns, never one collapsed timestamp:
+`cadence_due_at`, `poll_floor_until`, `retry_not_before_at`, plus the ledger's
+`global_blocked_until` and a derived class block. `next_poll_at` is a **cache of the
+answer, never an input** ([ADR 0006](docs/adr/0006-decomposed-poll-deferral-state.md)).
+`status` is `idle` or `failed` by check constraint; `enabled` is the separate operator
+switch.
+
+**`quarantined_events`** — `payload_fingerprint` is the sole identity: SHA-256 of compact
+UTF-8 JSON with recursively sorted object keys. `github_event_id` is nullable and indexed
+but **not unique**, because a malformed event may be malformed precisely because it has no
+event id. `occurrence_count` is check-constrained `>= 1` and climbs on replay.
+
+**`github_api_budget`** — a `CHECK (id = 1)` singleton, because the unauthenticated quota
+is keyed to the outbound IP rather than to a source. `window_status` is
+`uninitialized` / `active` / `globally_blocked`; every counter is check-constrained
+non-negative; `consecutive_secondary_limits` survives window rollover because secondary
+limits are IP-scoped rather than window-scoped
+([ADR 0010](docs/adr/0010-secondary-limit-escalation-and-refresh-pool-fairness.md)).
+
+### The enrichment state machine
+
+| Status | Entered when | Left when | Spends budget |
+|---|---|---|---|
+| `pending` | A stub row is created by ingestion | Enrichment succeeds, fails, or ages out | Yes — it is the candidate pool |
+| `complete` | An enrichment fetch succeeded | The refresh TTL expires, making it a refresh candidate | Only on refresh |
+| `retryable_failure` | A `5xx`, timeout, or transport error | The backoff expires and a retry runs | Yes — it stays a candidate |
+| `permanent_failure` | A `404` or other permanent `4xx` on the entity URL | Never, automatically | No |
+| `skipped_budget` | The eligibility window expired before budget was available | **Only** a genuinely new push event reactivates it | No |
+
+`skipped_budget` is what bounds the backlog. A duplicate replay refreshes identity fields
+but never reactivates a skipped entity — that is the half of §7's merge rules a re-polled
+window would otherwise break.
+
+### The idempotency contract
+
+| Table | Write | Effect on replay |
+|---|---|---|
+| `push_events` | `INSERT … ON CONFLICT (github_event_id) DO NOTHING RETURNING id` | No-op; the accepted raw event is never mutated |
+| `github_actors`, `github_repositories` | `INSERT … ON CONFLICT (github_id) DO UPDATE` on identity fields only | Identity refreshed; enrichment payload untouched |
+| `quarantined_events` | `INSERT … ON CONFLICT (payload_fingerprint) DO UPDATE` | `occurrence_count` increments; the first classification is permanent |
+| Entity activity fields | Gated on the `push_events` insert returning a row | No activity registered, no reactivation |
+
+Transactions are **one per event**, not one per page, so a single malformed envelope can
+never discard the events persisted beside it. Quarantine writes stand outside any
+transaction.
+
+### Indexes worth knowing
+
+Three are partial — the predicate lives in the index rather than only in the query, so the
+planner scans only rows that could possibly qualify:
+
+- `index_event_sources_on_poll_due` on `(source_type, next_poll_at)`
+  `WHERE enabled AND status = 'idle'` — the tick's due-source scan.
+- `index_github_{actors,repositories}_on_enrichment_candidates` on
+  `(next_retry_at, last_seen_at)` `WHERE enrichment_status IN ('pending','retryable_failure')`
+  — the candidate pool.
+- `index_github_{actors,repositories}_on_enrichment_refresh` on `(fetched_at, next_retry_at)`
+  `WHERE enrichment_status = 'complete'` — the TTL refresh pool.
+
+[`db/schema.rb`](db/schema.rb) is authoritative (version `2026_07_31_120000`). For live
+truth:
+
+```bash
+docker compose exec db psql -U postgres -d github_push_ingestor_development -c "\d+ push_events"
+```
+
+The entity-relationship diagram is Figure 2 of
+[`docs/DESIGN_BRIEF.md`](docs/DESIGN_BRIEF.md).
+
+## Logs
+
+### Anatomy of a log line
+
+One JSON object per line on stdout. Four fields are owned by
+[`lib/json_log_formatter.rb`](lib/json_log_formatter.rb) and cannot be overridden by an
+application payload — a structured event can never spoof its own severity, service,
+environment or timestamp:
+
+```json
+{
+  "timestamp": "2026-07-31T15:50:49.973Z",
+  "level": "info",
+  "service": "github-push-ingestor",
+  "environment": "development",
+  "event": "ingestion.run_completed",
+  "run_id": "099d562d-1261-488d-9003-cb0c443cdb55",
+  "event_source_id": 1,
+  "duration_ms": 100.7,
+  "run_status": "completed",
+  "pages_fetched": 1,
+  "events_received": 8,
+  "push_events_seen": 6,
+  "events_created": 4,
+  "duplicates_skipped": 0,
+  "events_quarantined": 3,
+  "events_ignored": 1,
+  "events_failed": 0
+}
+```
+
+### Sample stream
+
+Captured verbatim from a fixture-mode run against an empty database, so you can reproduce
+the same shapes offline:
+
+```bash
+GITHUB_MODE=fixture docker compose up --build -d
+GITHUB_MODE=fixture docker compose run --rm ingest 2>&1 | grep '^{'
+docker compose logs --no-log-prefix worker | grep '^{'
+GITHUB_MODE=fixture GITHUB_FIXTURE_SCENARIO=transient_failure \
+  docker compose run --rm ingest --force 2>&1 | grep '^{'
+```
+
+The `grep '^{'` is load-bearing: `bin/ingest` shares stdout between the operator summary
+and the JSON stream, so a leading brace is exactly what separates them.
+
+Boot, then a poll that created four events and quarantined three:
 
 ```text
-Ingestion deferred — source_failed
+{"timestamp":"2026-07-31T15:50:49.677Z","level":"info","service":"github-push-ingestor","environment":"development","event":"config.budget_resolved","mode":"fixture","poll_interval_seconds":300,"max_pages_per_poll":1,"enabled_live_source_count":1,"worst_case_reservations_per_poll":9,"limit":60,"reserve":8,"poll_allowance":12,"enrichment_allowance":40,"actor_guarantee":20,"repository_guarantee":20}
+{"timestamp":"2026-07-31T15:50:49.896Z","level":"info","service":"github-push-ingestor","environment":"development","event":"ingestion.run_started","run_id":"099d562d-1261-488d-9003-cb0c443cdb55","event_source_id":1,"source_type":"github_fixture_events","github_mode":"fixture","forced":false,"lock_wait_ms":2.2}
+{"timestamp":"2026-07-31T15:50:49.924Z","level":"info","service":"github-push-ingestor","environment":"development","event":"budget.window_initialized","limit":60,"reserve":8,"poll_allowance":12,"enrichment_allowance":40,"actor_guarantee":20,"repository_guarantee":20,"rate_limit_resource":"core","rate_limit_limit":60,"rate_limit_remaining":59,"rate_limit_used":1,"rate_limit_reset_at":"2026-07-31T16:50:49Z","poll_used":1}
+{"timestamp":"2026-07-31T15:50:49.965Z","level":"info","service":"github-push-ingestor","environment":"development","event":"ingestion.event_quarantined","run_id":"099d562d-1261-488d-9003-cb0c443cdb55","github_event_id":"58000000006","event_type":"PushEvent","error_code":"invalid_field_format","error_message":"payload.head is \"not-a-valid-object-name\", not 40 or 64 hexadecimal characters","payload_fingerprint":"a8ad67ca97a4c48049f5fa447d5d88ae10c58c514e0129546e18b5ff22368020"}
+{"timestamp":"2026-07-31T15:50:49.973Z","level":"info","service":"github-push-ingestor","environment":"development","event":"ingestion.run_completed","run_id":"099d562d-1261-488d-9003-cb0c443cdb55","event_source_id":1,"duration_ms":100.7,"next_poll_at":"2026-07-31T15:55:49Z","consecutive_failures":0,"run_status":"completed","classification":"ok","stop_reason":"no_next_link","pages_fetched":1,"events_received":8,"push_events_seen":6,"events_created":4,"duplicates_skipped":0,"events_quarantined":3,"events_ignored":1,"events_failed":0}
+{"timestamp":"2026-07-31T15:50:50.024Z","level":"info","service":"github-push-ingestor","environment":"development","event":"enrichment.dispatched","actor_enqueued":1,"repository_enqueued":1,"reason":"ingestion","actor_counts":{"pending":3},"repository_counts":{"pending":3},"actor_share_used":0,"repository_share_used":0,"actor_guarantee":20,"repository_guarantee":20,"enrichment_used":0,"enrichment_allowance":40,"window_status":"active","claimable_now":true}
 ```
 
-Nothing returns it to service automatically — a later success cannot, because no later
-poll happens. Clear it once the cause is fixed:
+A second run inside the cadence window makes no request at all, and names the component
+holding it:
 
-```bash
-docker compose exec db psql -U postgres -d github_push_ingestor_development -c "
-  UPDATE event_sources SET status = 'idle', last_error = NULL WHERE status = 'failed';"
+```text
+{"timestamp":"2026-07-31T15:51:00.142Z","level":"info","service":"github-push-ingestor","environment":"development","event":"ingestion.not_due","event_source_id":1,"forced":false,"deferral_reason":"cadence_due_at","next_poll_at":"2026-07-31T15:55:49Z","cadence_due_at":"2026-07-31T15:55:49Z","poll_floor_until":"2026-07-31T15:51:49Z"}
 ```
 
-`enabled` is a separate switch and stays untouched: it means *an operator turned this
-off*, while `status` means *the system took this out of service*.
+From the worker — a job, its enrichment outcome, and the deliberate `404` the corpus plants
+so a dead target fails the *entity* rather than the source:
 
-### Recovering from a fixture rate-limit run
-
-The budget ledger is persisted and the corpus's rate-limit scenarios carry a real
-one-hour reset, so a single exploratory run leaves a genuine global block behind:
-
-```bash
-GITHUB_MODE=fixture GITHUB_FIXTURE_SCENARIO=rate_limited docker compose run --rm ingest
+```text
+{"timestamp":"2026-07-31T15:50:50.780Z","level":"info","service":"github-push-ingestor","environment":"development","event":"job.completed","job_id":"58a1e78d-f473-4440-aee0-fe0bbb22027f","job_class":"EnrichActorJob","queue":"default","attempt":1,"duration_ms":74.6,"entity_type":"actor","github_actor_id":7700421,"enrichment_outcome":"failed"}
+{"timestamp":"2026-07-31T15:50:50.780Z","level":"info","service":"github-push-ingestor","environment":"development","enrichment_outcome":"failed","entity_type":"actor","github_id":7700421,"pool":"pending","classification":"not_found","entity_status":"permanent_failure","enrichment_attempt":1,"error_message":"GitHub returned 404 (not_found)","duration_ms":56.6,"event":"enrichment.failed"}
+{"timestamp":"2026-07-31T15:51:00.949Z","level":"info","service":"github-push-ingestor","environment":"development","enrichment_outcome":"enriched","entity_type":"actor","github_id":1024025,"pool":"pending","classification":"ok","entity_status":"complete","enrichment_attempt":1,"duration_ms":27.3,"event":"enrichment.completed"}
 ```
 
-Every later request — in any scenario — is then deferred with `globally_blocked`
-until that hour elapses, and the `budget.global_block_set` log line names the
-instant. To clear it in development:
+A retry ladder, from the `transient_failure` scenario — the failed request at `warn`, the
+scheduled backoff at `info` reporting the delay actually slept:
 
-```bash
-docker compose exec db psql -U postgres -d github_push_ingestor_development -c "
-  UPDATE github_api_budget
-     SET global_blocked_until = NULL, reset_at = NULL, remaining = NULL,
-         window_status = 'uninitialized'
-   WHERE id = 1;"
+```text
+{"timestamp":"2026-07-31T15:52:11.046Z","level":"warn","service":"github-push-ingestor","environment":"development","event":"github.request","request_class":"poll","http_method":"get","url":"fixture://api.github.com/events?per_page=100","origin":"application","run_id":"2de73c38-2d98-4f90-b09b-53044ac54395","source_type":"github_fixture_events","http_status":500,"classification":"server_error","attempt":0,"duration_ms":0.0}
+{"timestamp":"2026-07-31T15:52:11.046Z","level":"info","service":"github-push-ingestor","environment":"development","event":"github.retry_scheduled","request_class":"poll","http_method":"get","url":"fixture://api.github.com/events?per_page=100","origin":"application","run_id":"2de73c38-2d98-4f90-b09b-53044ac54395","source_type":"github_fixture_events","http_status":500,"classification":"server_error","attempt":0,"duration_ms":0.0,"next_attempt":1,"max_attempts":2,"backoff_seconds":1.2}
+```
+
+That run also demonstrates the replay contract in one line — the same page, zero created,
+four absorbed:
+
+```text
+{"timestamp":"2026-07-31T15:52:14.560Z","level":"info","service":"github-push-ingestor","environment":"development","event":"ingestion.run_completed","run_id":"2de73c38-2d98-4f90-b09b-53044ac54395","event_source_id":1,"duration_ms":3539.3,"next_poll_at":"2026-07-31T15:57:14Z","consecutive_failures":0,"run_status":"completed","classification":"ok","stop_reason":"no_next_link","pages_fetched":1,"events_received":8,"push_events_seen":6,"events_created":0,"duplicates_skipped":4,"events_quarantined":3,"events_ignored":1,"events_failed":0}
 ```
 
 ### What a run logs
@@ -498,13 +897,132 @@ until an operator clears it (plan §10). It shares its token with the
 `deferral_reason` of every poll subsequently refused, so one grep returns the
 transition and its consequences together.
 
+Background work adds the job vocabulary: `job.completed` for every job the worker
+runs — carrying `job_id`, `job_class`, `queue`, `attempt`, `duration_ms` and the
+identifiers that job produced — and `job.failed` with the error class and message
+when one raises. `ingestion.source_busy` reports a tick that found the source owned
+by another poller, `ingestion.cycle_failed` one source that failed without stopping
+the tick, and `enrichment.dispatched` is the reconciliation summary: what it
+scheduled, what blocked it, and the per-class state counts and share usage. A tick
+that scheduled nothing keeps that line at debug, so an exhausted window does not
+emit a line a minute for the rest of the hour.
+
 `LOG_LEVEL=debug` adds the `github.request` line for requests that **succeeded** (the
 failing ones are already at warning), `ingestion.page_fetched` and
 `ingestion.page_processed` per page, `ingestion.pagination_stopped` with its reason,
 `ingestion.not_modified` — which carries the `x-ratelimit-used` and
 `x-ratelimit-remaining` that make the `304` accounting visible in the running
-system — `budget.co_tenant_usage` (below), plus a line per persisted, duplicate and ignored
+system — `budget.co_tenant_usage`, plus a line per persisted, duplicate and ignored
 event.
+
+### Reading the stream
+
+Every line carries the run's `run_id`, except `ingestion.not_due`: a poll the
+schedule turned away opens no run, so it reports `event_source_id` instead. **The trace is
+one hop** — a `job_id` on `job.completed` gives the `run_id`s that job opened, and every
+`ingestion.*` line carries the `run_id`.
+
+```bash
+# one run, end to end
+docker compose logs | grep '"run_id":"099d562d-1261-488d-9003-cb0c443cdb55"'
+
+# one job, and the runs it opened
+docker compose logs worker | grep -E 'job\.(completed|failed)|enrichment\.dispatched'
+
+# everything that went wrong
+docker compose logs | grep -E '"level":"(warn|error)"'
+
+# every budget state transition
+docker compose logs | grep '"event":"budget\.'
+```
+
+## Rate limits and the request budget
+
+### The allowance formula
+
+`POLL_INTERVAL_SECONDS`, `MAX_PAGES_PER_POLL`, `ENABLED_LIVE_SOURCE_COUNT` and
+`RATE_LIMIT_RESERVE` feed the one authoritative allowance formula (plan §10):
+
+```text
+poll_attempt_allowance = ceil(3600 / POLL_INTERVAL_SECONDS)
+                         x MAX_PAGES_PER_POLL x ENABLED_LIVE_SOURCE_COUNT
+enrichment_allowance   = rate_limit - RATE_LIMIT_RESERVE - poll_attempt_allowance
+```
+
+With the defaults: 12 poll attempts and 40 enrichment attempts an hour, against
+GitHub's unauthenticated limit of 60. **The process refuses to boot** if the
+polling requirement leaves no capacity for enrichment.
+
+The enrichment allowance is then split by `ACTOR_ENRICHMENT_SHARE` (plan §10):
+
+```text
+actor_guarantee      = floor(enrichment_allowance x ACTOR_ENRICHMENT_SHARE)
+repository_guarantee = enrichment_allowance - actor_guarantee
+```
+
+With the defaults: 20 actor and 20 repository attempts an hour. The remainder
+always goes to repositories, because the formula floors one side and subtracts for
+the other — so the two always add up to the whole allowance.
+
+### The budget table
+
+At limit 60, reserve 8, cadence 300s, one source — the only variable is page depth:
+
+| `MAX_PAGES_PER_POLL` | Poll allowance | Enrichment allowance | Actor guarantee | Repository guarantee |
+|---|---|---|---|---|
+| 1 (default) | 12 | 40 | 20 | 20 |
+| 2 | 24 | 28 | 14 | 14 |
+| 3 | 36 | 16 | 8 | 8 |
+| 4 | 48 | 4 | 2 | 2 |
+| 5 | 60 | — | — | **refuses to boot** |
+
+Capture depth is bought with enrichment coverage, at a fixed exchange rate, and the
+formula tells you the price before you pay it.
+
+### Global blocks versus class exhaustion
+
+Two different things that both stop requests, deliberately kept apart:
+
+- **A global block** is the only thing written to `github_api_budget.global_blocked_until`,
+  and it only ever moves later. Primary exhaustion, a reserve breach, and a secondary rate
+  limit set it; it stops **everything**. `budget.global_block_set` and
+  `budget.global_block_cleared` mark the edges.
+- **Class exhaustion** is *derived* from the counters and writes nothing. When polling has
+  spent its twelve, enrichment carries on; when enrichment has spent its forty, polling
+  carries on. `budget.class_exhausted` fires once per class per window, and
+  `budget.share_exhausted` once per fairness share.
+
+So "the poller ran out" never means "the system stopped", and a reviewer can tell which
+happened from one log line.
+
+### Per-window bootstrap
+
+The ledger is never seeded by a discovery request. The **first canonical page-one poll of
+each rate-limit window** initialises it from that response's authoritative headers — it is
+a normal, counted, event-processing poll that happens to also establish the window. Until
+the window is `active`, enrichment is ineligible. `budget.window_initialized` marks it,
+`budget.window_rolled` marks the hour turning over, and `budget.window_reset_in_past` warns
+that this container's clock runs ahead of GitHub's
+([ADR 0004](docs/adr/0004-class-aware-budget-ledger.md)).
+
+### Why a `304` costs a request here
+
+GitHub's events documentation states generally that `304` responses do not count
+against the rate limit; its REST best-practices documentation scopes that exemption
+to requests "correctly authorized with an `Authorization` header". This service
+sends no token, so the two statements disagree about exactly the population of
+requests it makes. A dated unauthenticated probe run under
+`X-GitHub-Api-Version: 2022-11-28` settles it for this configuration:
+`x-ratelimit-used` increments across a `304`. The transcript, with complete
+before-and-after headers and its own stated limits, is
+[`docs/evidence/2026-07-30-unauthenticated-304-quota-probe.md`](docs/evidence/2026-07-30-unauthenticated-304-quota-probe.md).
+
+So the ledger debits every outbound attempt, `304`s included, and the stored ETag
+is a bandwidth and correctness measure rather than a quota saver. The asymmetry
+justifies the choice: budgeting a `304` that turns out to be free wastes one
+attempt, while not budgeting one that is in fact charged overruns a sixty-request
+hour. The transcript claims nothing about authenticated requests — this project has
+no token and cannot test that case.
 
 ### Sharing the outbound IP
 
@@ -520,27 +1038,7 @@ is raised to `budget.co_tenant_pressure` at info, because every class is about t
 cause attached to it. Nothing is inferred back into the class counters: GitHub's `used`
 carries no request class, and a guess would break the fairness accounting.
 
-Every line carries the run's `run_id`, except `ingestion.not_due`: a poll the
-schedule turned away opens no run, so it reports `event_source_id` instead.
-
-Background work adds the job vocabulary: `job.completed` for every job the worker
-runs — carrying `job_id`, `job_class`, `queue`, `attempt`, `duration_ms` and the
-identifiers that job produced — and `job.failed` with the error class and message
-when one raises. `ingestion.source_busy` reports a tick that found the source owned
-by another poller, `ingestion.cycle_failed` one source that failed without stopping
-the tick, and `enrichment.dispatched` is the reconciliation summary: what it
-scheduled, what blocked it, and the per-class state counts and share usage. A tick
-that scheduled nothing keeps that line at debug, so an exhausted window does not
-emit a line a minute for the rest of the hour.
-
-The trace is one hop: a `job_id` on `job.completed` gives the `run_id`s that job
-opened, and every `ingestion.*` line carries the `run_id`.
-
-```bash
-docker compose logs worker | grep -E 'job\.(completed|failed)|enrichment\.dispatched'
-```
-
-## Environment variables
+## Configuration
 
 Compose runs with working defaults — no `.env` file is required. The template
 is [`.env.example`](.env.example).
@@ -558,7 +1056,7 @@ is [`.env.example`](.env.example).
 | `MAX_REDIRECTS` | `2` | Redirect hops followed per request, each re-validated and separately reserved |
 | `SOURCE_LOCK_WAIT_SECONDS` | `30` | How long the one-shot waits for a busy source lock; the poller attempts once (plan §9) |
 | `POLL_INTERVAL_SECONDS` | `300` | The poll cadence, and an allowance-formula input. A source polled at T is due again at T + this; an unforced run before then is deferred rather than made. The worker's 60-second tick checks the schedule; it does not replace it (plan §9, §10) |
-| `MAX_PAGES_PER_POLL` | `1` | How many `Link`-followed pages one poll may fetch, and an allowance-formula input. Raising it trades enrichment allowance for capture depth: at `3` the poll allowance becomes 36 attempts an hour and enrichment drops to 16 (plan §9, §10) |
+| `MAX_PAGES_PER_POLL` | `1` | How many `Link`-followed pages one poll may fetch, and an allowance-formula input. Raising it trades enrichment allowance for capture depth — see [the budget table](#the-budget-table) (plan §9, §10) |
 | `ENABLED_LIVE_SOURCE_COUNT` | `1` | Allowance-formula input: live sources sharing one per-IP budget. **A fallback rather than the authority** — at window initialization and rollover the formula counts the enabled, in-service `event_sources` rows of the running mode and uses that instead, falling back to this value only when there are none yet. A disagreement is logged as `budget.source_allocation_drift` (plan §10, [ADR 0009](docs/adr/0009-runtime-source-allocation-and-shared-ip-observability.md)) |
 | `RATE_LIMIT_RESERVE` | `8` | Requests per hour left deliberately unspent (plan §10) |
 | `ACTOR_ENRICHMENT_SHARE` | `0.50` | How the enrichment allowance splits between actors and repositories: `floor(allowance x this)` guarantees actors, the remainder goes to repositories. A guarantee, not a cap — either class may borrow the other's unused capacity when the other has no *currently eligible* candidate. Both ends of `[0, 1]` are legal (plan §10) |
@@ -567,41 +1065,18 @@ is [`.env.example`](.env.example).
 | `REPOSITORY_REFRESH_TTL_SECONDS` | `86400` | The same, for repositories |
 | `ENRICHMENT_COVERAGE_WINDOW_SECONDS` | `86400` | How far back `GET /status` looks when computing §11's three coverage percentages, measured on `push_events.created_at`. The only knob here that changes what the system *reports* rather than what it *does* |
 
-`POLL_INTERVAL_SECONDS`, `MAX_PAGES_PER_POLL`, `ENABLED_LIVE_SOURCE_COUNT` and
-`RATE_LIMIT_RESERVE` feed the one authoritative allowance formula (plan §10):
-
-```text
-poll_attempt_allowance = ceil(3600 / POLL_INTERVAL_SECONDS)
-                         x MAX_PAGES_PER_POLL x ENABLED_LIVE_SOURCE_COUNT
-enrichment_allowance   = rate_limit - RATE_LIMIT_RESERVE - poll_attempt_allowance
-```
-
-With the defaults: 12 poll attempts and 40 enrichment attempts an hour, against
-GitHub's unauthenticated limit of 60. **The process refuses to boot** if the
-polling requirement leaves no capacity for enrichment.
-
-There is deliberately no variable for the API host or the API version. The
-allowed host is a constant in `Github::UrlPolicy`, because an environment
-variable there would make the SSRF boundary a deployment setting; the API version
-is pinned to `2022-11-28`, the version every live probe behind this plan was run
-under.
-
-The enrichment allowance is then split by `ACTOR_ENRICHMENT_SHARE` (plan §10):
-
-```text
-actor_guarantee      = floor(enrichment_allowance x ACTOR_ENRICHMENT_SHARE)
-repository_guarantee = enrichment_allowance - actor_guarantee
-```
-
-With the defaults: 20 actor and 20 repository attempts an hour. The remainder
-always goes to repositories, because the formula floors one side and subtracts for
-the other — so the two always add up to the whole allowance.
-
 Database connection settings (`POSTGRES_HOST`, `POSTGRES_PORT`,
 `POSTGRES_USER`, `POSTGRES_PASSWORD`) are managed by the compose topology
 itself and matter only when running the app outside compose.
 
-## The request path
+There is deliberately no variable for the API host or the API version — see
+[The SSRF boundary](#the-ssrf-boundary) and
+[ADR 0011](docs/adr/0011-pinned-api-version-2022-11-28.md).
+
+## Architecture
+
+[`docs/DESIGN_BRIEF.md`](docs/DESIGN_BRIEF.md) is the two-page architecture summary, with
+rendered request-path and data-model figures. This section is the annotated call chain.
 
 Every live GitHub request — polling and enrichment, from the poller, the worker, or the
 one-shot — takes one chain, and nothing outside it calls GitHub
@@ -664,14 +1139,11 @@ EnrichmentRunner ────────────────┘      │ �
   request that completes without a secondary limit resets the run. Class exhaustion
   deliberately writes nothing there: it is derived from the counters, so polling running out
   never stops enrichment and vice versa.
-- **`Github::UrlPolicy`** is the SSRF boundary. It rebuilds every URL from validated
-  components, and a URL that arrived inside a GitHub payload or a `Link` header always
-  clears the full live policy first.
+- **`Github::UrlPolicy`** is the SSRF boundary — see below.
 - **Transports** are `Faraday` (live) and `Fixture` (offline). The Faraday connection
   carries the adapter and no middleware at all — retries and redirects belong to the
   executor, because each attempt re-reserves budget and each redirect target is
   re-validated.
-
 - **`Github::Ingestion::PageWriter`** turns one fetched page into rows, in **one
   transaction per event** — so a single malformed event can never discard the events
   persisted beside it. Quarantine writes stand outside any transaction, and entity activity
@@ -712,13 +1184,50 @@ EnrichmentRunner ────────────────┘      │ �
   against a poll cadence, and enrichment has none — and no per-class share, because a share
   exhaustion is a denial rather than a deferral.
 
+### The SSRF boundary
+
+Enrichment follows URLs that arrive **inside GitHub payloads**, `Link` headers and
+`Location` headers — data this application did not construct and an attacker could
+influence. So `Github::UrlPolicy` is a trust boundary, not a formatter. Every URL is
+rebuilt from validated components, and a `:payload`-origin URL always clears the full
+*live* policy first, whatever mode the process is in:
+
+- HTTPS only
+- Host exactly `api.github.com`
+- No userinfo (`https://evil@api.github.com/…` is refused)
+- No non-default port
+- No IP literals
+- Redirects bounded by `MAX_REDIRECTS`, each hop re-validated and separately debited
+
+The allowed host is a **constant, not an environment variable** — a deployment setting
+there would make the trust boundary configurable. The API version is pinned to
+`2022-11-28` for the same class of reason
+([ADR 0011](docs/adr/0011-pinned-api-version-2022-11-28.md)). Fixture mode fails closed:
+an unknown URL is an error, never a live fallback
+([ADR 0003](docs/adr/0003-event-source-and-transport-seams.md)).
+
+It is demonstrable offline. The `hostile_redirect` scenario serves a `301` whose `Location`
+points off-host:
+
+```bash
+GITHUB_MODE=fixture GITHUB_FIXTURE_SCENARIO=hostile_redirect \
+  docker compose run --rm enrich --class repository
+docker compose logs | grep '"event":"github.request"' | grep '"level":"warn"'
+```
+
+The second hop is never sent, the entity records the failure, and **the event source stays
+in service** — a refused redirect is a fact about one entity, not about the feed. Compare
+`redirecting_repository`, where a legitimate rename is followed across one validated hop
+and debited twice.
+
 Decisions behind this are recorded in
-[`docs/adr/`](docs/adr/): advisory locks and the gate (0002), the source and transport
-seams (0003), the class-aware ledger (0004), at-least-once processing with idempotent
-writes (0005), decomposed poll deferral state (0006), enrichment fairness shares
-and borrowing (0007), post-commit enqueue with entity-scoped reconciliation (0008),
-runtime source allocation with shared-IP observability (0009), and secondary-limit
-escalation with refresh-pool fairness (0010).
+[`docs/adr/`](docs/adr/): `jsonb` semantic retention (0001), advisory locks and the gate
+(0002), the source and transport seams (0003), the class-aware ledger (0004),
+at-least-once processing with idempotent writes (0005), decomposed poll deferral state
+(0006), enrichment fairness shares and borrowing (0007), post-commit enqueue with
+entity-scoped reconciliation (0008), runtime source allocation with shared-IP
+observability (0009), secondary-limit escalation with refresh-pool fairness (0010), the
+pinned API version (0011), and Solid Queue over Kafka (0012).
 
 ## Continuous ingestion
 
@@ -750,56 +1259,56 @@ lease, so a backlog of ninety pending actors is one queued job rather than ninet
 Steady state at the defaults: twelve polls an hour, and at most forty enrichment
 requests an hour split between the two classes.
 
-**Crashes need no cleanup.** A killed worker's PostgreSQL session dies with it, and
-the source advisory lock goes with the session; its claim lease is a timestamp on
-`next_retry_at` that expires by arithmetic; and any job it was running may run again,
-because every write on the path is idempotent. That is at-least-once execution with
-effectively-once persisted outcomes — never exactly-once execution.
+## Processing guarantees
 
-## Planned contents
+**An event is accepted when its `push_events` row commits** — not when GitHub returns it,
+not when a job is enqueued, not when a log line says so. That commit is the durability
+boundary; everything upstream of it is retryable and everything downstream is derived.
 
-| Section | Lands with |
-|---|---|
-| Data model reference | PR 12 (design brief) |
-| API and database inspection examples | PR 10, 12 |
-| Known limitations (sampling-based enrichment, no complete-capture guarantee, shared-IP budget) | PR 12 |
-
-## Reviewer commands
-
-```bash
-docker compose up --build                             # available now — starts continuous polling
-docker compose run --rm test                          # available now (real suite; runs in CI too)
-docker compose logs -f worker                         # available now — the tick, cycles, reconciliation
-docker compose logs -f                                # available now
-docker compose run --rm ingest                        # available now — one ingestion cycle
-docker compose run --rm enrich --limit 6              # available now — up to six enrichment cycles
-GITHUB_MODE=fixture docker compose up --build         # available now — the whole system, no network
-GITHUB_MODE=fixture docker compose run --rm ingest    # available now — deterministic, no network
-GITHUB_MODE=fixture docker compose run --rm enrich --limit 6
-script/verify_recovery.sh --confirm                   # §15 step 8's container kills; nothing in CI runs it
+```text
+At-least-once execution
++ Idempotent writes
++ Unique constraints
+= Effectively-once persisted outcomes
 ```
 
-The queue is a database, so it is inspectable with the same tool as everything else:
+### What is not claimed, and why
 
-```bash
-docker compose exec db psql -U postgres -d github_push_ingestor_queue_development \
-  -c "SELECT key, class_name, schedule FROM solid_queue_recurring_tasks;" \
-  -c "SELECT class_name, count(*) FROM solid_queue_jobs GROUP BY 1;" \
-  -c "SELECT kind, name, last_heartbeat_at FROM solid_queue_processes;"
-```
+- **Not exactly-once execution.** A job may run twice; the second run changes nothing
+  durable. Side effects that are not idempotent writes — a log line, a duration metric —
+  can and will repeat.
+- **Not complete upstream capture.** The feed is a sliding window with hours of latency;
+  see [Known limitations](#known-limitations).
+- **Not complete enrichment coverage.** Demand exceeds the hourly budget by roughly fifty
+  to one; see [Known limitations](#known-limitations).
 
-Recovery is watchable in under a minute — stop the worker, put the entities back into
-`pending`, empty the queue (the crash), and start it again:
+### The four crash cases
 
-```bash
-docker compose stop worker
-docker compose exec db psql -U postgres -d github_push_ingestor_development \
-  -c "UPDATE github_actors SET enrichment_status = 'pending', fetched_at = NULL, next_retry_at = NULL;"
-docker compose exec db psql -U postgres -d github_push_ingestor_queue_development \
-  -c "TRUNCATE solid_queue_jobs CASCADE;"
-docker compose start worker
-docker compose logs -f worker    # enrichment.dispatched, then enrichment.completed
-```
+| Crash point | What survives | What recovers it |
+|---|---|---|
+| Before the event commits | Nothing from this page | The next overlapping poll re-fetches it — there is no stop-on-known-event |
+| After the event commits, before enrichment is enqueued | The `push_events` row and its stub entities | `ReconcilePendingEnrichmentsJob`, from committed entity rows, within 60s |
+| Worker dies before the enrichment commit | The entity row, still `pending`, its lease expiring by arithmetic | The next reconcile tick after `next_retry_at` passes |
+| Worker dies after the enrichment commit, before acknowledgement | The enriched entity row | Solid Queue re-runs the job; the re-run is a no-op |
+
+### The mechanisms
+
+- `INSERT … ON CONFLICT (github_event_id) DO NOTHING RETURNING id` — the deduplication gate.
+- Activity updates gated on that `RETURNING` — so a replay refreshes identity but never
+  reactivates a `skipped_budget` entity.
+- `payload_fingerprint` uniqueness on quarantine — one row per distinct malformed payload,
+  occurrence-counted.
+- The entity lease is a `next_retry_at` timestamp that **expires by arithmetic**, so a
+  crashed worker leaves nothing to release.
+- Session advisory locks die with their PostgreSQL session, so a killed poller releases its
+  source the moment its connection drops.
+- `enqueue_after_transaction_commit` plus an entity-scoped reconciler — the enqueue is a
+  hint, the committed rows are the record.
+- `restart: unless-stopped` on `db`, `web`, and `worker`.
+
+[ADR 0005](docs/adr/0005-at-least-once-with-idempotent-writes.md) argues the choice;
+[ADR 0008](docs/adr/0008-post-commit-enqueue-and-entity-scoped-reconciliation.md) covers
+recovery; [Crash recovery, verified](#crash-recovery-verified) demonstrates it.
 
 ## Crash recovery, verified
 
@@ -835,38 +1344,182 @@ One reading tip for §15 step 8's `docker compose ps` output: `web`'s container 
 curls `/health/live`, which never touches the database, so `web` stays green throughout a `db`
 kill. `/health/ready` is the observable that flips.
 
-### Fixture scenario matrix
+Recovery is also watchable by hand in under a minute — stop the worker, put the entities back
+into `pending`, empty the queue (the crash), and start it again:
 
-Every scenario resolves inside [`fixtures/github/`](fixtures/github/) with no network at all.
-Each poll obeys GitHub's `X-Poll-Interval` floor of 60s, which `--force` deliberately does not
-bypass, so allow a minute between successive ingestion scenarios.
+```bash
+docker compose stop worker
+docker compose exec db psql -U postgres -d github_push_ingestor_development \
+  -c "UPDATE github_actors SET enrichment_status = 'pending', fetched_at = NULL, next_retry_at = NULL;"
+docker compose exec db psql -U postgres -d github_push_ingestor_queue_development \
+  -c "TRUNCATE solid_queue_jobs CASCADE;"
+docker compose start worker
+docker compose logs -f worker    # enrichment.dispatched, then enrichment.completed
+```
 
-| Scenario | Command | What it shows | Cleanup |
-|---|---|---|---|
-| `default` | `GITHUB_MODE=fixture docker compose run --rm ingest` | 4 push events, 3 actors, 3 repositories, 3 quarantined | none |
-| `default` (replay) | `… run --rm ingest --force` after 60s | `duplicates_skipped > 0`, occurrence counts climb, no skipped entity reactivated | none |
-| `default` (enrich) | `… run --rm enrich --limit 6` | both classes enrich within their fairness shares | none |
-| `paginated` | `GITHUB_FIXTURE_SCENARIO=paginated MAX_PAGES_PER_POLL=3 … ingest` | `Link`-driven walk over 3 pages | none |
-| `paginated_final_page` | `GITHUB_FIXTURE_SCENARIO=paginated_final_page … ingest` | the walk stops when no `next` link exists | none |
-| `transient_failure` | `GITHUB_FIXTURE_SCENARIO=transient_failure … ingest` | one `500`, then success on retry | none |
-| `transient_failure_exhausted` | `GITHUB_FIXTURE_SCENARIO=transient_failure_exhausted … ingest` | retries exhausted; the source backs off | source backoff |
-| `redirecting_repository` | `GITHUB_FIXTURE_SCENARIO=redirecting_repository … enrich --class repository` | a renamed repository followed across one validated hop, debited twice | none |
-| `hostile_redirect` | `GITHUB_FIXTURE_SCENARIO=hostile_redirect … enrich --class repository` | an off-host `Location` refused by the URL policy; the second hop is never sent and the event source stays in service | none |
-| `secondary_rate_limited` | `GITHUB_FIXTURE_SCENARIO=secondary_rate_limited … ingest` | a secondary limit blocks globally | global block |
-| `rate_limited` | `GITHUB_FIXTURE_SCENARIO=rate_limited … ingest` | primary exhaustion → `global_blocked_until` | **a real one-hour global block** |
+Emptying the queue loses nothing, which is the point: the work is rebuilt from committed
+entity rows.
 
-The last two leave durable state behind on purpose — that is the behaviour being demonstrated.
-`script/verify_recovery.sh --phase=cleanup` runs the SQL under
-[Recovering from a fixture rate-limit run](#recovering-from-a-fixture-rate-limit-run), and
-`--phase=rate-limit` plays the rate-limit scenario and cleans up immediately after.
+## Troubleshooting and reset
+
+### Common symptoms
+
+| Symptom | Likely cause | What to run |
+|---|---|---|
+| No `push_events` after 10 minutes in live mode | Documented 30s–6h feed latency plus the 5-minute cadence — not a fault | `curl -s localhost:3000/status \| jq .sources` |
+| Every run reports `globally_blocked` | A `rate_limited` fixture scenario left a real one-hour block | [Recovering from a fixture rate-limit run](#recovering-from-a-fixture-rate-limit-run) |
+| Every run reports `source_failed` | A permanent `4xx` took the source out of service | [When a source goes out of service](#when-a-source-goes-out-of-service) |
+| `ingest` exits `2` | Unknown option, a refused configuration, or a fixture-corpus gap | `docker compose run --rm ingest --help` |
+| Worker logs nothing | `setup` did not complete, so `worker` never started | `docker compose logs setup` |
+| `/health/ready` fails while `/health/live` is fine | Database unreachable or schema not loaded. `web`'s healthcheck curls `/health/live`, so `web` stays green through a `db` outage | `docker compose ps`, `docker compose logs db` |
+| Enrichment stuck at `pending` | The allowance is spent for this window, or the window is not `active` yet | `curl -s localhost:3000/status \| jq .ledger` |
+
+### When a source goes out of service
+
+A permanent `4xx` from `/events` — not a rate limit, not a `5xx`, both of which are
+retried — takes the source out of service: `event_sources.status` becomes `failed`,
+`last_error` records why, and **no further poll is attempted**, including under
+`--force`. That is deliberate: the request cannot succeed, so retrying it on a cadence
+would spend the hourly budget on a certainty.
+
+```text
+Ingestion deferred — source_failed
+```
+
+Nothing returns it to service automatically — a later success cannot, because no later
+poll happens. Clear it once the cause is fixed:
+
+```bash
+docker compose exec db psql -U postgres -d github_push_ingestor_development -c "
+  UPDATE event_sources SET status = 'idle', last_error = NULL WHERE status = 'failed';"
+```
+
+`enabled` is a separate switch and stays untouched: it means *an operator turned this
+off*, while `status` means *the system took this out of service*.
+
+### Recovering from a fixture rate-limit run
+
+The budget ledger is persisted and the corpus's rate-limit scenarios carry a real
+one-hour reset, so a single exploratory run leaves a genuine global block behind:
+
+```bash
+GITHUB_MODE=fixture GITHUB_FIXTURE_SCENARIO=rate_limited docker compose run --rm ingest
+```
+
+Every later request — in any scenario — is then deferred with `globally_blocked`
+until that hour elapses, and the `budget.global_block_set` log line names the
+instant. To clear it in development:
+
+```bash
+docker compose exec db psql -U postgres -d github_push_ingestor_development -c "
+  UPDATE github_api_budget
+     SET global_blocked_until = NULL, reset_at = NULL, remaining = NULL,
+         window_status = 'uninitialized'
+   WHERE id = 1;"
+```
+
+### Resetting
+
+Three levels, least destructive first.
+
+**Level 1 — clear derived state, keep the data.** The two SQL blocks above, or both at
+once:
+
+```bash
+script/verify_recovery.sh --phase=cleanup
+```
+
+**Level 2 — drop the business data, keep the volume.**
+
+```bash
+docker compose exec db psql -U postgres -d github_push_ingestor_development -c "
+  TRUNCATE push_events, quarantined_events, github_actors, github_repositories,
+           ingestion_runs, event_sources, github_api_budget RESTART IDENTITY CASCADE;"
+```
+
+Safe because **nothing is seeded**: `Github::Ingestion::SourceProvisioner.ensure!`
+recreates the `event_sources` row lazily at the point of use, and
+`Github::BudgetLedger#bootstrap!` recreates the ledger row from the next window's response
+headers. The next `ingest` behaves exactly like a first run — that is expected, not a
+broken system.
+
+**Level 3 — destroy everything, including the volume.**
+
+```bash
+docker compose down -v
+docker compose up --build
+```
+
+`-v` deletes the named `pgdata` volume and **every stored event**. Plain
+`docker compose down` does not: it stops and removes the containers and leaves the volume
+intact, which is why step 9 of the verification walk finds identical counts afterwards.
+
+## Known limitations
+
+### Expected time before records appear
+
+A push reaches the public feed with a documented latency of 30 seconds to 6 hours,
+and the default cadence polls every 5 minutes, so a given push may take hours to
+appear — or never, if it left the feed's 300-event window before a poll reached it.
+The feed retains 30 days. At `MAX_PAGES_PER_POLL=1` each poll sees at most the
+newest ~100 events, and the feed moves considerably faster than that. **This service
+samples the public feed rather than mirroring it.**
+
+The eight limitations that follow are consequences of that, and of the 60-request hourly
+ceiling. None is a gap to be closed later; each is a stated boundary.
+
+**1. Enrichment coverage is a sample, not coverage.** One observed live page held ~92–95
+`PushEvent` records with ~89 distinct actors and ~92 distinct repositories — 181 cold
+entity requests per page, ~2,172 an hour at twelve polls, against 40 available. That is
+roughly 1.8% theoretical cold coverage. `skipped_budget` is a normal documented outcome,
+and `/status` publishes the three coverage percentages with every denominator so the real
+sampling rate is visible rather than inferred.
+
+**2. There is no guarantee of complete upstream capture.** Pagination deepens a single
+poll within the budget; it does not backfill. Events that rolled out of the feed's window
+while the service was down are **not recoverable**, and no amount of configuration changes
+that.
+
+**3. The budget is shared with anything else behind the same outbound IP.** The
+unauthenticated limit is IP-keyed, so a co-tenant spends the same sixty requests an hour.
+The ledger observes it — `budget.co_tenant_usage`, and `budget.co_tenant_pressure` when
+the remaining quota reaches the reserve — and cannot prevent it. See
+[Sharing the outbound IP](#sharing-the-outbound-ip).
+
+**4. One event source, in practice.** The event-source seam has two shipped
+implementations (live and fixture), and the allowance formula already divides by source
+count, but a second *live* source is a documented seam rather than shipped behaviour.
+
+**5. Raw payload retention is semantic, not byte-exact.** Stored as `jsonb`, so whitespace,
+key order, and duplicate keys are lost; array order is preserved because it is meaningful
+([ADR 0001](docs/adr/0001-jsonb-semantic-retention.md)).
+
+**6. No authentication.** A token would raise the ceiling from 60 to 5,000 requests an
+hour and change the enrichment story entirely — which is the point of the constraint, not
+an oversight. See the scaling path in
+[`docs/DESIGN_BRIEF.md`](docs/DESIGN_BRIEF.md).
+
+**7. An enriched entity can be up to 24 hours stale.** `ACTOR_REFRESH_TTL_SECONDS` and
+`REPOSITORY_REFRESH_TTL_SECONDS` default to 86400, and a refresh only spends budget when
+no never-enriched candidate is eligible anywhere.
+
+**8. Extension C (object storage) was deliberately not attempted.** A decision with a
+stated reason, not an omission — the remaining budget went to rate-limit correctness,
+durability, and reviewer experience.
 
 ## Development
 
 AI-assisted development guidance for this repository lives in
 [`CLAUDE.md`](CLAUDE.md).
 
-Architecture decision records live under [`docs/adr/`](docs/adr/). The design
-brief lands with PR 12.
+- [`docs/DESIGN_BRIEF.md`](docs/DESIGN_BRIEF.md) — the two-page architecture summary; start
+  here.
+- [`docs/adr/`](docs/adr/) — twelve architecture decision records.
+- [`docs/evidence/`](docs/evidence/) — dated first-party verifications of contested claims.
+- [`docs/SUBMISSION_CHECKLIST.md`](docs/SUBMISSION_CHECKLIST.md) — the §16 quality gates as
+  a pre-flight checklist.
+- [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) — the execution plan; Appendix E
+  records how the build diverged from it.
 
 ## License
 
