@@ -19,6 +19,17 @@ CI.run do
   # enrich — across two real processes, offline and deterministically.
   step "Tests: One-shot enrichment smoke", "env RAILS_ENV=test GITHUB_MODE=fixture bin/enrich"
 
+  # Solid Queue's own validator over config/queue.yml and config/recurring.yml. Starts no
+  # process; catches an unparseable schedule or a task naming a class that does not exist.
+  step "Tests: Queue configuration", "env RAILS_ENV=test bin/rails solid_queue:check"
+
+  # The supervisor's own boot path, for the same reason the two smokes above exist — nothing
+  # else runs bin/jobs. It proves boot, recurring-task registration and a clean TERM, not that
+  # a tick fired: the schedule is 60 seconds and waiting for one would treble the step. Fixture
+  # mode is mandatory — this boots a real scheduler in a process WebMock cannot see.
+  step "Tests: Worker supervisor smoke",
+       "env RAILS_ENV=test GITHUB_MODE=fixture timeout --preserve-status --signal=TERM 20 bin/jobs"
+
   step "Style: Ruby", "bin/rubocop"
 
   step "Security: Gem audit", "bin/bundler-audit"

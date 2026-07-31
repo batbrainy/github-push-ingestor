@@ -12,9 +12,8 @@ RSpec.describe "docker-compose.yml" do
     services.reject { |_name, service| service.key?("profiles") }.keys
   end
 
-  # worker arrives with PR 8, when continuous polling starts.
-  it "starts exactly db, setup and web on a plain up" do
-    expect(unprofiled).to match_array(%w[db setup web])
+  it "starts exactly db, setup, web and worker on a plain up" do
+    expect(unprofiled).to match_array(%w[db setup web worker])
   end
 
   it "keeps the one-shots behind the tools profile" do
@@ -95,6 +94,50 @@ RSpec.describe "docker-compose.yml" do
       Github::Configuration::DEFAULTS.slice(*environment.keys).each do |variable, default|
         expect(environment.fetch(variable)).to eq("${#{variable}:-#{default}}")
       end
+    end
+  end
+
+  # §2A's topology table, and the service that makes this system run by itself: one Solid
+  # Queue supervisor per container, running the poll tick, the enrichment jobs and the
+  # reconciler.
+  describe "the worker service" do
+    let(:worker) { services.fetch("worker") }
+
+    it "runs the Solid Queue supervisor" do
+      expect(worker.fetch("command")).to eq([ "bin/jobs" ])
+      expect(worker).not_to have_key("entrypoint")
+    end
+
+    # Docker's default policy is `no`, so §2A's crash recovery has to be declared. This is
+    # the service whose death would silently stop all ingestion.
+    it "restarts after a crash, like the other long-running services" do
+      expect(worker.fetch("restart")).to eq("unless-stopped")
+    end
+
+    # 30s pairs with SolidQueue.shutdown_timeout (20s in config/application.rb, itself
+    # HTTP_OPEN_TIMEOUT_SECONDS + HTTP_READ_TIMEOUT_SECONDS), leaving margin for the
+    # supervisor to reap its children.
+    it "gives in-flight GitHub work time to finish on the way down" do
+      expect(worker.fetch("stop_grace_period")).to eq("30s")
+    end
+
+    it "waits for the schema both databases need" do
+      expect(worker.dig("depends_on", "setup", "condition")).to eq("service_completed_successfully")
+      expect(worker.dig("depends_on", "db", "condition")).to eq("service_healthy")
+    end
+
+    # One ledger row serves every process, so the worker has to read the same §10 policy the
+    # one-shots do. A worker on a different ACTOR_ENRICHMENT_SHARE would enforce a second
+    # policy against the same row.
+    it "inherits the same shared environment the one-shots do" do
+      expect(worker.fetch("environment")).to eq(services.fetch("ingest").fetch("environment"))
+    end
+
+    # Nothing depends on this service, `unless-stopped` already covers process death, and the
+    # only probe that could tell a hung worker from a busy one would have to boot Rails on
+    # every interval; solid_queue_processes heartbeats are the durable evidence instead.
+    it "declares no healthcheck, unlike web" do
+      expect(worker).not_to have_key("healthcheck")
     end
   end
 

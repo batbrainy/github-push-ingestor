@@ -7,6 +7,14 @@ gem "pg", "~> 1.1"
 # Use the Puma web server [https://github.com/puma/puma]
 gem "puma", ">= 5.0"
 
+# The Active Job backend pinned by IMPLEMENTATION_PLAN.md §2A: PostgreSQL-backed, no
+# Redis, recurring tasks drive polling, and it runs in its own `queue` database inside the
+# same Postgres container (config/database.yml declares it; db/queue_migrate carries its
+# schema). That separation is what makes §8 step 10's post-commit enqueue necessary — an
+# enqueue cannot join the business transaction, so the committed entity rows are the
+# durable record of pending work and Github::Enrichment::Dispatch is only a hint.
+gem "solid_queue", "~> 1.5"
+
 # HTTP client for every live GitHub request, pinned by IMPLEMENTATION_PLAN.md §2A.
 # Reached only through Github::Transports::Faraday, and configured with no middleware:
 # retries and redirects belong to Github::RequestExecutor because every attempt

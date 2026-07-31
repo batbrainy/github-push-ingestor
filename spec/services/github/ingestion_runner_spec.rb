@@ -429,8 +429,60 @@ RSpec.describe Github::IngestionRunner do
     expect(observed).to all(be(false))
   end
 
-  # §9's poll cadence. Nothing fires it on a schedule until PR 8 — this is the gate every
-  # caller passes through, whoever calls it.
+  # §8 step 10. The enqueue is a hint and the committed entity rows are the durable record,
+  # so what these examples pin is *when* the hint is emitted — after every row is durable,
+  # outside the source lock, and only when the run created something.
+  describe "enqueueing enrichment after commit" do
+    it "enqueues one cycle per class when the run created events" do
+      expect { ingest }.to have_enqueued_job(EnrichActorJob).exactly(:once)
+        .and have_enqueued_job(EnrichRepositoryJob).exactly(:once)
+    end
+
+    # §7 merge rule 4's boundary, at the queue: a replay refreshes identity and reactivates
+    # nothing, so there is no new work to schedule. Anything still pending from the first run
+    # is ReconcilePendingEnrichmentsJob's business, not this run's.
+    it "enqueues nothing for a replay that created no events" do
+      ingest
+
+      replay = fixture_runner(transport: fixture_transport, now: frozen_time + 301)
+
+      expect { ingest(replay) }.not_to have_enqueued_job
+    end
+
+    it "enqueues nothing for a tick that was not due" do
+      ingest
+
+      expect { ingest(fixture_runner(now: frozen_time + 60)) }.not_to have_enqueued_job
+    end
+
+    # The three properties in one place, because each of them alone would let a plausible
+    # refactor through: enqueue inside PageWriter's transaction (rows not yet durable),
+    # enqueue in #finish before the run row closes (a "pending work" hint that outlives an
+    # unfinished run), or enqueue inside SourceLock (a source's mutual exclusion held across
+    # a write to another database).
+    it "enqueues only once the rows are durable, the run row is closed, and the lock is released" do
+      observed = []
+      allow(EnrichActorJob).to receive(:perform_later) do
+        transaction = ActiveRecord::Base.lease_connection.current_transaction
+
+        observed << {
+          open_transaction: transaction.open? && transaction.joinable?,
+          run_status: IngestionRun.sole.status,
+          persisted: PushEvent.count,
+          source_lock_free: lock_available_to_other_session?(
+            Github::AdvisoryLock::SOURCE_LOCK_NAMESPACE, Github::AdvisoryLock.key_for(event_source.id)
+          )
+        }
+      end
+
+      ingest
+
+      expect(observed).to eq([ { open_transaction: false, run_status: "completed", persisted: 4,
+                                 source_lock_free: true } ])
+    end
+  end
+
+  # §9's poll cadence — the gate every caller passes through, whoever calls it.
   describe "the poll cadence" do
     let(:transport) { fixture_transport }
 

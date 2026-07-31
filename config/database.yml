@@ -1,8 +1,8 @@
 # Two databases in the same PostgreSQL 16 instance (IMPLEMENTATION_PLAN.md §2A):
 #   primary — the business tables, the system of record
-#   queue   — Solid Queue's database (jobs run there from PR 8 onward; declared
-#             here already so the compose `setup` service prepares both and
-#             `web`/`worker` never race concurrent db:prepare runs)
+#   queue   — Solid Queue's database (db/queue_migrate carries its schema; the compose
+#             `setup` service prepares both, so `web` and `worker` never race
+#             concurrent db:prepare runs)
 #
 # Test databases are fully isolated from development (plan §2A, §12):
 #   github_push_ingestor_test / github_push_ingestor_queue_test

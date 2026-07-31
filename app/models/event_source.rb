@@ -28,6 +28,34 @@ class EventSource < ApplicationRecord
 
   enum :status, STATUSES.index_by(&:itself), validate: true
 
+  # PR 8's recurring tick asks this before it asks anything else, and it is a **pre-filter,
+  # never the decision**. Github::PollSchedule reading the four components under the source
+  # lock stays the authority — Github::IngestionRunner reloads the row inside the lock
+  # precisely so a decision is made against committed state.
+  #
+  # Filtering on next_poll_at is safe because that column can only be conservative. It is a
+  # projection written at the end of each run from values that had already been committed,
+  # and §9's components only ever move later or are cleared by the run that clears them —
+  # so a row this scope skips was genuinely not due, and no source can be stranded by it.
+  # The cost of being wrong in the other direction is nil: the runner re-checks and returns
+  # `deferred` without opening a run row.
+  #
+  # source_type is not a nicety. A development database routinely holds two rows — the
+  # README's reviewer path creates a github_fixture_events source with
+  # `GITHUB_MODE=fixture docker compose run --rm ingest` — and a live worker polling the
+  # fixture row (or the reverse) would either be refused by Github::UrlPolicy or raise
+  # Errors::FixtureMiss, once a minute, forever.
+  #
+  # enabled/status are excluded here rather than left to the runner because
+  # IngestionRunner#out_of_service warns on every attempt: a failed source is
+  # operator-recoverable only, so the tick would emit a warning a minute until someone
+  # looked, burying the lines §11 asks reviewers to read.
+  scope :poll_due, ->(source_type:, now:) {
+    where(source_type: source_type, enabled: true, status: "idle")
+      .where("next_poll_at IS NULL OR next_poll_at <= :now", now: now)
+      .order(:id)
+  }
+
   validates :source_type, :status, presence: true
   validates :consecutive_failures, numericality: { greater_than_or_equal_to: 0 }
 end

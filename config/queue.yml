@@ -1,0 +1,31 @@
+# Solid Queue's process topology (IMPLEMENTATION_PLAN.md §2A). One supervisor per `worker`
+# container: a dispatcher, a scheduler for config/recurring.yml, and one worker process.
+#
+# Two threads, not the generator's three, and no JOB_CONCURRENCY knob. §5's global request
+# gate makes outbound concurrency exactly one application-wide, so a third thread could only
+# queue behind the gate — and while it waited it would hold a primary-database connection
+# for up to Github::RequestGate::WAIT_SECONDS (45) out of the RAILS_MAX_THREADS (5) that
+# config/database.yml grants per database. Two keeps a reconciler tick from sitting behind a
+# poll that is mid-fetch, which is the only concurrency this system actually needs.
+#
+# polling_interval stays at 1s. Nothing here is latency-sensitive: the poll cadence is
+# POLL_INTERVAL_SECONDS (300), enrichment is capped by the hourly allowance (40 at the
+# defaults), and both recurring tasks fire on a 60-second schedule.
+default: &default
+  dispatchers:
+    - polling_interval: 1
+      batch_size: 500
+  workers:
+    - queues: "*"
+      threads: 2
+      processes: 1
+      polling_interval: 1
+
+development:
+  <<: *default
+
+test:
+  <<: *default
+
+production:
+  <<: *default

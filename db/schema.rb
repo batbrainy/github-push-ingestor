@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_07_31_090000) do
+ActiveRecord::Schema[8.1].define(version: 2026_07_31_100000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -30,6 +30,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_07_31_090000) do
     t.text "source_type", null: false
     t.text "status", null: false
     t.datetime "updated_at", null: false
+    t.index ["source_type", "next_poll_at"], name: "index_event_sources_on_poll_due", where: "(enabled AND (status = 'idle'::text))"
     t.check_constraint "consecutive_failures >= 0", name: "event_sources_consecutive_failures_nonnegative"
     t.check_constraint "status = ANY (ARRAY['idle'::text, 'failed'::text])", name: "event_sources_status_known"
   end

@@ -134,6 +134,71 @@ RSpec.describe EventSource do
     end
   end
 
+  # PR 8's recurring tick asks this once a minute. It is a pre-filter over the cached
+  # projection, never the decision — Github::IngestionRunner reloads the row inside the
+  # source lock and Github::PollSchedule decides there, from §9's four components.
+  describe ".poll_due" do
+    def due(now: frozen_time, source_type: "github_public_events")
+      described_class.poll_due(source_type: source_type, now: now)
+    end
+
+    # A freshly provisioned source has never been polled, so its projection is NULL. If that
+    # did not count as due, a clean checkout would never poll at all.
+    it "includes a source that has never been polled" do
+      source = create_event_source(next_poll_at: nil)
+
+      expect(due).to contain_exactly(source)
+    end
+
+    it "includes a source whose projection has arrived, and excludes one whose has not" do
+      overdue = create_event_source(next_poll_at: frozen_time - 1)
+      create_event_source(next_poll_at: frozen_time + 1)
+
+      expect(due).to contain_exactly(overdue)
+    end
+
+    # <= rather than <, matching PollSchedule#due? and for its reason: PostgreSQL truncates a
+    # timestamp to microseconds on the way in and Time.current does not.
+    it "includes a source due at exactly this instant" do
+      source = create_event_source(next_poll_at: frozen_time)
+
+      expect(due).to contain_exactly(source)
+    end
+
+    # A live worker polling a fixture source raises Errors::FixtureMiss once a minute
+    # forever, and the reverse is refused by Github::UrlPolicy — and a development database
+    # routinely holds both rows, because the README's reviewer path creates one.
+    it "excludes a source belonging to another mode" do
+      create_event_source(source_type: "github_fixture_events", next_poll_at: nil)
+
+      expect(due).to be_empty
+    end
+
+    # An operator turned it off; the tick has nothing to say about that.
+    it "excludes a disabled source" do
+      create_event_source(enabled: false, next_poll_at: nil)
+
+      expect(due).to be_empty
+    end
+
+    # §10's "/events returns permanent 4xx → source failed": operator-recoverable only. The
+    # runner would refuse it anyway, with a warning — once a minute, until someone looked.
+    it "excludes a source that is out of service" do
+      create_event_source(status: "failed", next_poll_at: nil)
+
+      expect(due).to be_empty
+    end
+
+    # Ordered, so a tick with several due sources spends the budget in the same order every
+    # time rather than in whatever order PostgreSQL finds convenient.
+    it "returns due sources in a stable order" do
+      first = create_event_source(next_poll_at: nil)
+      second = create_event_source(next_poll_at: frozen_time - 60)
+
+      expect(due.map(&:id)).to eq([ first.id, second.id ].sort)
+    end
+  end
+
   describe "associations" do
     it "will not be destroyed while runs reference it" do
       source = create_event_source

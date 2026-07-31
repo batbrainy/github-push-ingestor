@@ -41,8 +41,10 @@ Rails.application.configure do
   # Append comments with runtime information tags to SQL queries in logs.
   config.active_record.query_log_tags_enabled = true
 
-  # Highlight code that enqueued background job in logs.
-  config.active_job.verbose_enqueue_logs = true
+  # Off, now that jobs run continuously: the enqueue backtrace line is an unstructured
+  # string in a JSON stream, and every enqueue this application makes comes from one place
+  # (Github::Enrichment::Dispatch) that logs it structurally with the job's own identifiers.
+  config.active_job.verbose_enqueue_logs = false
 
   # Highlight code that triggered redirect in logs.
   config.action_dispatch.verbose_redirect_logs = true
