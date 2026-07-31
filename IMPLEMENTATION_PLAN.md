@@ -1039,16 +1039,14 @@ Rich `/status` (window status, per-class ledger state, defined coverage formulas
 Crash-window tests; multi-poller concurrency tests; class-isolation and fairness stress tests; fixture-mode Docker e2e; container-kill recovery verification
 
 ### PR 12 — Reviewer documentation and final hardening
-Complete README; complete design brief; architecture diagram; “How to verify it’s working”; sample logs; database inspection commands; clean-checkout verification; final quality review; **submission checklist with the email template** (recipient `recruiter@strongmind.com`, subject “Full Stack Developer Candidate - Umang Brahmakshatriya”, body containing the public repository link)
-
-**The submission email itself is a post-merge step** — sent only after PR 12 is merged and the default branch passes final clean-checkout verification.
+Complete README; complete design brief; architecture diagram; “How to verify it’s working”; sample logs; database inspection commands; clean-checkout verification; final quality review; and a reusable submission checklist.
 
 ### Descope ladder
 
 1. Cut PR 11’s advanced scenarios first, retaining the required tests that live in PRs 3–8.
 2. Cut PR 10’s enhancements, retaining health, logs, and basic status.
 3. Cut PR 9 entirely if needed — the *core* gate, ledger, scheduling, and fairness behavior already shipped in PRs 4–7 and is never cut.
-4. Never cut PR 12’s documentation, clean-checkout verification, or the submission step.
+4. Never cut PR 12’s documentation or clean-checkout verification.
 
 ## 14. Documentation Deliverables
 
@@ -1197,7 +1195,7 @@ evidence for the other.
 - GitHub Project and issues show organized execution
 - Pull requests are focused and linked to issues
 
-### Final repository review and submission
+### Final repository review
 
 - No secrets
 - No personal access token
@@ -1207,7 +1205,6 @@ evidence for the other.
 - No claim of exactly-once execution
 - No claim that enrichment coverage is complete
 - No failing or flaky tests
-- **Post-merge, after final clean-checkout verification passes: send the submission email** — recruiter@strongmind.com, subject “Full Stack Developer Candidate - Umang Brahmakshatriya”, public repository link in the body
 
 ## 17. Delivery Principle
 
@@ -1266,7 +1263,7 @@ A second, independent validation pass approved the direction and required these 
 | 9 | PR ladder rebalanced (superseded by Appendix C’s dependency-ordered version) | Section 13 |
 | 10 | Protocol headers pinned; SSRF boundary; `Link` pagination explicit | Sections 2A, 9, 10 |
 | 11 | “Transactional outbox” → outbox-style recovery terminology | Sections 2A, 8, 14 |
-| 12 | `run_id` restored; V2 authoritative in README; submission email; tolerant parsing; precise 304 wording | Sections 7, 11, 13, 14, 16 |
+| 12 | `run_id` restored; V2 authoritative in README; submission checklist; tolerant parsing; precise 304 wording | Sections 7, 11, 13, 14, 16 |
 
 Version facts verified 2026-07-29: GitHub REST API versions `2022-11-28` (default; supported until 2028-03-10) and `2026-03-10` (latest); plan pins `2022-11-28` (probe evidence gathered under it). Rails current release: 8.1.3 (2026-03-24).
 
@@ -1284,7 +1281,7 @@ A third review round conditionally approved V2 and required eight substantive co
 | 6 | **Stop-on-known-event removed for the live source; ETag scoped to page 1**; overlap claim softened to probe-dated observation | Sections 9, 12, 15 |
 | 7 | **One authoritative allowance formula** with startup validation; “request-attempt” naming; fresh-install bootstrap concept | Sections 7, 10 |
 | 8 | **Schema completed**: actor `display_login`/`name` + envelope mappings; repo `full_name` mapping; typed columns; canonical fingerprint + occurrence counting | Section 7 |
-| 9 | Smaller: exact Ruby pin; source-vs-entity error classification; tightened SSRF; `/health` live/ready split; `/status` read-only; one-shot state summary; file locations; post-merge submission email; precise impossibility wording | Sections 2A, 9, 10, 11, 13, 14, 16 |
+| 9 | Smaller: exact Ruby pin; source-vs-entity error classification; tightened SSRF; `/health` live/ready split; `/status` read-only; one-shot state summary; file locations; post-merge verification gate; precise impossibility wording | Sections 2A, 9, 10, 11, 13, 14, 16 |
 
 ## Appendix D — Corrections from the freeze-readiness pass (2026-07-29)
 
