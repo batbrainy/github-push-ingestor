@@ -329,7 +329,7 @@ particular, read the erratum atop
 
 ```bash
 claim_pattern='exactly[ -]?once|effectively[ -]?once|once-only[[:space:]]+(execution|processing|delivery)|(complete|full|exhaustive)[[:space:]]+(upstream[[:space:]]+)?(event[[:space:]]+)?capture|captur(e|es|ed|ing)[[:space:]]+(all|every)[[:space:]]+(upstream[[:space:]]+|public[[:space:]]+|GitHub[[:space:]]+)?events?|(complete|full|exhaustive)[[:space:]]+enrichment([[:space:]]+coverage)?|enrich(es|ed|ing)?[[:space:]]+(all|every)[[:space:]]+(actors?|repositories|entities)|sampling[[:space:]]+becomes[[:space:]]+coverage|100%[[:space:]]+(capture|enrichment|coverage)'
-git grep -nEI "$claim_pattern" -- .
+git grep -nI -i -E "$claim_pattern" -- .
 ```
 
 **The rule: every prose hit must explicitly reject the guarantee.** The regex assignment

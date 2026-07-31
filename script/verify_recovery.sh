@@ -44,8 +44,9 @@
 #   to, and a container-killing tool there invites someone to wire it into compose or CI.
 #
 # COST: kills and restarts the running db, web and worker containers, and writes to the
-# *development* databases. It never touches the test databases, never removes a volume, and
-# never runs db:drop or db:reset. Do not run it against a stack someone else is using.
+# *development* databases. Its test-isolation phase prepares and exercises only the isolated
+# test databases; the verifier's own SQL never targets them. It never removes a volume or runs
+# db:drop or db:reset. Do not run it against a stack someone else is using.
 #
 # Nothing in the repository executes this file. spec/docker_compose_spec.rb asserts that, so
 # "CI never runs the verification" is a red test rather than a promise.
