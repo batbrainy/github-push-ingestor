@@ -27,7 +27,10 @@ working tree.** A working tree can pass gates a clone would fail: an untracked `
 - [ ] `docker compose down` then `up`, and `SELECT COUNT(*) FROM push_events` is unchanged
 - [ ] No local Ruby, PostgreSQL, or `psql` was used at any point
 
-Transcript: `docs/evidence/<date>-clean-checkout-verification.md`
+Pre-merge run against `6eab84c`:
+[`docs/evidence/2026-07-31-clean-checkout-verification.md`](evidence/2026-07-31-clean-checkout-verification.md).
+It found and fixed a defect that made `docker compose up --build` fail from a cold image —
+which is why this section is checked again, from a fresh clone, after the merge.
 
 ---
 

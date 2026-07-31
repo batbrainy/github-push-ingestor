@@ -284,6 +284,10 @@ Two `rspec` invocations against isolated `*_test` databases, the same two CI run
 unmodified checkout that is the whole story; **if you have edited anything, add `--build`**
 — the code is baked into the image, not mounted.
 
+A transcript of this whole walk, run from a fresh clone on a machine with no image, is at
+[`docs/evidence/2026-07-31-clean-checkout-verification.md`](docs/evidence/2026-07-31-clean-checkout-verification.md)
+— including the live half, which is what shows the public API works with no token.
+
 If something looks wrong, [Troubleshooting and reset](#troubleshooting-and-reset) has a
 symptom table and a three-level reset ladder.
 
@@ -1350,6 +1354,17 @@ and reports both.
 One reading tip for §15 step 8's `docker compose ps` output: `web`'s container healthcheck
 curls `/health/live`, which never touches the database, so `web` stays green throughout a `db`
 kill. `/health/ready` is the observable that flips.
+
+**The stack comes back in live mode, so put it back offline when you are done.** Bringing a
+killed container back means `docker compose up -d <service>`, which recreates it from the
+*current* shell environment — and `GITHUB_MODE` defaults to `live` there. A reviewer who
+started the stack with `GITHUB_MODE=fixture` and then ran the script ends up with a worker
+polling real GitHub and spending real quota. Check it and reset it:
+
+```bash
+docker compose exec worker printenv GITHUB_MODE     # `live` after a recovery run
+GITHUB_MODE=fixture docker compose up -d --force-recreate worker
+```
 
 Recovery is also watchable by hand in under a minute — stop the worker, put the entities back
 into `pending`, empty the queue (the crash), and start it again:
