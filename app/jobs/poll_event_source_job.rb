@@ -18,7 +18,9 @@
 # fixed duration, so a container killed mid-poll would suppress that source until it expired,
 # where the session advisory lock is released by PostgreSQL the moment the backend dies. PR 8
 # is the PR about surviving container kills; a weaker duplicate of a lock we already hold
-# would be a regression. Revisit in PR 11, where multi-poller tests could justify one.
+# would be a regression. PR 11 measured the question rather than leaving it open — a contended
+# tick writes nothing at all, and the lock frees a killed session in milliseconds where a
+# semaphore's fixed duration cannot. See spec/recovery/multi_poller_spec.rb and ADR 0008.
 class PollEventSourceJob < ApplicationJob
   # Facts about the process rather than about one source: continuing to the next source
   # would only repeat them, and a tick that "completed" after boot-level breakage would be a

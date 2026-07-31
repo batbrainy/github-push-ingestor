@@ -98,6 +98,32 @@ existing lock — in the PR whose subject is surviving container kills — would
 regression. The source lock, the global request gate and the unique event constraint are
 the protections in force; revisit when PR 11's multi-poller tests can measure a gap.
 
+**PR 11 measured it. Verdict: no gap, and the rejection stands.**
+`spec/recovery/multi_poller_spec.rb`'s "the gap ADR 0008 asked PR 11 to measure" takes four
+observations, on the definition that a gap exists iff sustained contention leaves some
+observable cost or incorrectness a source-keyed semaphore would have prevented.
+
+1. Five contended ticks against a held source lock produce no run row, no request, no debit,
+   no schedule movement and no event — the four things the semaphore would exist to prevent
+   are already zero across a window, not merely across one tick.
+2. A contended tick issues **no INSERT, UPDATE or DELETE at all**. A semaphore costs an insert
+   and a delete in `solid_queue_semaphores` per acquire, so it would spend writes to prevent
+   writes that never happen.
+3. The lock frees a killed session in milliseconds, measured against `CLOCK_MONOTONIC`,
+   where a fixed-`duration` semaphore must by construction outlast the longest legitimate
+   poll. This is the crash-safety argument above, measured rather than asserted.
+4. Agreement on the key comes from `Github::Ingestion::SourceProvisioner`, not from any
+   concurrency primitive — two first-time processes that each created a row would hold
+   semaphores on two different keys and both poll.
+
+The verdict is executable rather than prose: an example asserts that no job under `app/jobs/`
+declares `limits_concurrency`, so reversing this decision fails a test and sends the author
+back to this section.
+
+Bounded honestly: that measurement covers correctness and local cost. Whether a
+`solid_queue_semaphores` round trip is material under N real worker containers is a load
+question, and nothing here answers it.
+
 **A dedicated outbox table.** A row per pending enrichment would be a second representation
 of a fact the entity row already carries, with its own drift and its own cleanup. §2A calls
 this design outbox-*style* precisely because there is no such record.

@@ -99,7 +99,13 @@ readable in one place.
 
 Scenarios beyond `default` exist because §12 names them as corpus contents. The pagination
 and rate-limit ones are consumed by `Github::Ingestion::PageLoop` and
-`Github::RateLimitPolicy`; the redirect ones wait for PR 11.
+`Github::RateLimitPolicy`. The redirect ones are consumed by
+`spec/services/github/enrichment/redirect_boundary_spec.rb`, which drives them through the
+enrichment claim path rather than through the executor alone — so what is asserted is the
+consequence for an *entity*: a rename reaches `complete` and is debited for both hops, while a
+hostile `Location` reaches `permanent_failure` with the second hop never sent and the event
+source still in service. Both also appear in the README's fixture scenario matrix as reviewer
+commands.
 
 ## What is in `bodies/events/page-1.json`
 
