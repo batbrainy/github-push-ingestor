@@ -83,7 +83,74 @@ curl http://localhost:3000/health/live    # {"status":"ok"} — process is up
 curl http://localhost:3000/health/ready   # {"status":"ok"} — database reachable, schema current
 ```
 
-Neither health endpoint ever calls GitHub or consumes request budget.
+See what it has actually done, and inspect what it captured:
+
+```bash
+curl -s http://localhost:3000/status | jq
+curl -s 'http://localhost:3000/api/push_events?limit=5' | jq
+curl -s http://localhost:3000/api/push_events/<github_event_id> | jq .data.raw_payload
+```
+
+**No endpoint on this surface ever calls GitHub or consumes request budget** (plan
+§11). That is structural rather than a promise: none of these controllers holds an
+executor or a transport, and `Github::BudgetLedger` is absent from all of them —
+every one of its public methods writes, and `#bootstrap!` would create from a read
+path the very ledger row a reservation owns. Four specs pin it, including one that
+subscribes to every SQL statement a request issues and fails on any `INSERT`,
+`UPDATE` or `DELETE`.
+
+#### `GET /status`
+
+Reports persisted state only: the poll schedule per event source (all five of §9's
+components, plus which one is binding), the per-class ledger state, §11's three
+enrichment coverage percentages, and the per-status entity counts.
+
+Three conventions in the response body are worth knowing before reading one:
+
+- **`null` is never a zero.** A counted zero prints `0`; a number that does not
+  exist prints `null`. Where `null` would be ambiguous the disambiguating fact gets
+  its own field — `ledger.present` separates "no ledger row yet" from "remaining is
+  genuinely 0", `due_now` separates "no constraint applies" from "unknown", and
+  `claimable_now` separates "work is claimable this second" from "nothing is
+  waiting". An empty coverage window reports `null` percentages, not `0.0`: the
+  ratio is undefined, not zero, and every denominator is published beside its ratio
+  so you can check it.
+- **The coverage window is measured on `created_at`** — when *this application*
+  persisted the event, not GitHub's `occurred_at`. Coverage grades this
+  application's enrichment pipeline, and that pipeline's own eligibility and
+  freshness rules already run on this clock. The basis is published as
+  `coverage.basis` so the choice is visible rather than assumed. Widen
+  `ENRICHMENT_COVERAGE_WINDOW_SECONDS` when reviewing a fixture corpus that has aged.
+- **`actor_requests.available` is a floor, not a ceiling.** §10 lets one class
+  borrow the other's unspent capacity when the other has no eligible candidate, so a
+  class does not stop at zero available. The real ceiling is the `enrichment` pair
+  beside it.
+
+`pending` in the entity counts means `enrichment_status = 'pending'` exactly. The
+`candidates` figure beside it is pending **plus** `retryable_failure` — the "how much
+work is left" number `bin/ingest` prints. Two questions, two names, deliberately.
+
+#### `GET /api/push_events` and `GET /api/push_events/:id`
+
+`:id` is the **GitHub event id**, not the surrogate primary key — the identifier §11
+puts on every log line, so a log line is a URL you can type. The surrogate key
+appears in no response.
+
+Paging is keyset on `(occurred_at, id)` with an opaque cursor, not `offset`: the
+poller writes continuously and this list is newest-first, so an offset page 2 would
+re-serve rows from page 1 and skip others whenever a poll landed in between. Follow
+`pagination.next_cursor`, or the RFC-8288 `Link: …; rel="next"` header. `limit`
+defaults to 25 and is capped at 100 — a value outside that range is a `400`, never a
+silent clamp, because a client that asked for 500 and received 100 cannot tell
+whether it received everything. `actor_id` and `repository_id` filter; an unknown
+parameter is a `400` rather than a silently unfiltered answer.
+
+The list omits `raw_payload` — it is a multi-kilobyte TOASTed `jsonb` column nobody
+scans a list for. `GET /api/push_events/:id` returns it, which is how §16's "raw
+payload is retained" gate is checkable without a psql session. Every row nests its
+actor and repository with their `enrichment_status`, so §16's enrichment gate is
+visible in a browser as statuses flip from `pending` to `complete` while the worker
+runs.
 
 Run the test suite (isolated `*_test` databases; never touches the
 development databases):
@@ -386,13 +453,35 @@ the request that reached its fairness guarantee — `budget.global_block_set` an
 `budget.global_block_cleared`.
 
 Enrichment adds `enrichment.completed` and `enrichment.failed`, each carrying the
-entity type, its GitHub id, the response classification and the resulting entity
-status; `enrichment.aged_out`, one summary line per class per sweep rather than one
-per row; `enrichment.reactivated` when a genuinely new push event brings a
-`skipped_budget` entity back; and `enrichment.lease_lost` at warning level when an
-outcome arrived after another worker had claimed the row.
+entity type, its GitHub id, the response classification, the resulting entity status
+and the attempt number; `enrichment.aged_out`, one summary line per class per sweep
+rather than one per row; `enrichment.reactivated` when a genuinely new push event
+brings a `skipped_budget` entity back; `enrichment.lease_lost` at warning level when
+an outcome arrived after another worker had claimed the row; and
+`enrichment.cycle_failed` at error level when an exception escapes a cycle entirely,
+carrying the lease it released and the error class.
 
-`LOG_LEVEL=debug` adds `github.request`, `ingestion.page_fetched` and
+**Every failure and every retry reaches the default level.** `github.request` is
+raised to warning when the request failed — a 5xx, a network timeout, a 404 on an
+entity URL, a permanent 4xx, or a URL the SSRF boundary refused — carrying the
+classification, status, URL and attempt number. `github.retry_scheduled` is emitted
+at info for each of the `MAX_HTTP_RETRIES` backoffs, reporting the delay actually
+slept rather than a freshly jittered one. `github.retry_exhausted` is emitted at
+warning when the attempts ran out, which is what distinguishes "retried and gave up"
+from "failed once, permanently". Each carries the `run_id` of the poll or the entity
+id of the enrichment that issued it, so a whole retry ladder greps as one trace.
+
+On the source side, `ingestion.source_backoff` names a failed poll's own retry
+instant and the delay behind it — `next_poll_at` is the maximum of §9's five
+independent components and so cannot say which one is binding — and
+`ingestion.source_failed` at error level reports the one transition nothing in this
+application reverses: a permanent 4xx on `/events` takes the source out of service
+until an operator clears it (plan §10). It shares its token with the
+`deferral_reason` of every poll subsequently refused, so one grep returns the
+transition and its consequences together.
+
+`LOG_LEVEL=debug` adds the `github.request` line for requests that **succeeded** (the
+failing ones are already at warning), `ingestion.page_fetched` and
 `ingestion.page_processed` per page, `ingestion.pagination_stopped` with its reason,
 `ingestion.not_modified` — which carries the `x-ratelimit-used` and
 `x-ratelimit-remaining` that make the `304` accounting visible in the running
@@ -425,7 +514,7 @@ is [`.env.example`](.env.example).
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `LOG_LEVEL` | `info` | JSON log verbosity: `debug` adds per-request/per-page lines (plan §11) |
+| `LOG_LEVEL` | `info` | JSON log verbosity. `info` carries the run summaries, the budget transitions and **every failure, retry and backoff**; `debug` adds the per-request and per-page lines for requests that succeeded (plan §11) |
 | `RAILS_ENV` | `development` | Environment for the compose app services |
 | `RAILS_MAX_THREADS` | `5` | Connection pool / Puma thread size |
 | `GITHUB_MODE` | `live` | `live` reaches api.github.com; `fixture` resolves everything inside [`fixtures/github/`](fixtures/github/) with no network and fails closed on an unknown URL (plan §6, §12) |
@@ -443,6 +532,7 @@ is [`.env.example`](.env.example).
 | `ENRICHMENT_ELIGIBILITY_WINDOW_SECONDS` | `3600` | How long a candidate stays worth enriching. Past it, the entity transitions to `skipped_budget` — which is what bounds the backlog — until a genuinely new push event reactivates it (plan §10, B8) |
 | `ACTOR_REFRESH_TTL_SECONDS` | `86400` | How long an enriched actor is reused before it is re-fetched. Never-enriched candidates always take priority over refreshes (plan §10) |
 | `REPOSITORY_REFRESH_TTL_SECONDS` | `86400` | The same, for repositories |
+| `ENRICHMENT_COVERAGE_WINDOW_SECONDS` | `86400` | How far back `GET /status` looks when computing §11's three coverage percentages, measured on `push_events.created_at`. The only knob here that changes what the system *reports* rather than what it *does* |
 
 `POLL_INTERVAL_SECONDS`, `MAX_PAGES_PER_POLL`, `ENABLED_LIVE_SOURCE_COUNT` and
 `RATE_LIMIT_RESERVE` feed the one authoritative allowance formula (plan §10):

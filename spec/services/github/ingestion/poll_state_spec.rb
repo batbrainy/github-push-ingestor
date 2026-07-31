@@ -26,8 +26,8 @@ RSpec.describe Github::Ingestion::PollState do
     )
   end
 
-  def record(outcome)
-    writer.record!(event_source: event_source, outcome: outcome, now: now)
+  def record(outcome, run_id: nil)
+    writer.record!(event_source: event_source, outcome: outcome, now: now, run_id: run_id)
     event_source.reload
   end
 
@@ -113,6 +113,26 @@ RSpec.describe Github::Ingestion::PollState do
 
       expect(event_source).to have_attributes(consecutive_failures: 2, retry_not_before_at: now + 120)
     end
+
+    # ingestion.run_completed already reports consecutive_failures and next_poll_at, but
+    # next_poll_at is the *maximum* of §9's five independent components, so it cannot say
+    # whether the source is deferred by its own backoff, by the server's poll floor, or by
+    # a global block. Naming the component and the delay is what makes the retry
+    # actionable — the same reason ingestion.not_due reports binding_component.
+    it "names the backoff it wrote, which next_poll_at alone cannot attribute" do
+      allow(Rails.logger).to receive(:warn)
+
+      record(outcome(status: "failed", classification: :server_error, last_error: "boom"),
+             run_id: "run-1")
+
+      expect(Rails.logger).to have_received(:warn).with(
+        hash_including(event: "ingestion.source_backoff", run_id: "run-1",
+                       event_source_id: event_source.id, classification: :server_error,
+                       consecutive_failures: 2, backoff_seconds: 120.0,
+                       retry_not_before_at: (now + 120).utc.iso8601,
+                       error_message: "boom")
+      )
+    end
   end
 
   # §10: "/events returns permanent 4xx → source failed/disabled". Terminal on first
@@ -127,6 +147,35 @@ RSpec.describe Github::Ingestion::PollState do
       expect(event_source).to have_attributes(status: "failed", enabled: true,
                                               consecutive_failures: 0, retry_not_before_at: nil,
                                               last_error: "gone")
+    end
+
+    # The transition is terminal and operator-recoverable only — nothing in this
+    # application writes `failed` back to `idle` — so it is the single poll outcome that
+    # will not resolve itself, and until now the only evidence of it was a status column
+    # nobody was told to read. Its entity-side twin, permanent_failure, already reaches the
+    # INFO stream through enrichment.failed's entity_status.
+    it "announces the terminal transition at error level" do
+      allow(Rails.logger).to receive(:error)
+
+      record(outcome(status: "failed", classification: :not_found, last_error: "gone",
+                     source_failing: true), run_id: "run-1")
+
+      expect(Rails.logger).to have_received(:error).with(
+        hash_including(event: "ingestion.source_failed", run_id: "run-1",
+                       event_source_id: event_source.id, source_status: "failed",
+                       classification: :not_found, error_message: "gone")
+      )
+    end
+
+    # There is nothing to back off from: the source is out of service, not retrying.
+    # Emitting both would tell an operator to wait for a retry that will never come.
+    it "reports no backoff, because a terminal source is not retrying" do
+      allow(Rails.logger).to receive(:warn)
+
+      record(outcome(status: "failed", classification: :not_found, source_failing: true))
+
+      expect(Rails.logger).not_to have_received(:warn)
+        .with(hash_including(event: "ingestion.source_backoff"))
     end
   end
 
@@ -154,6 +203,18 @@ RSpec.describe Github::Ingestion::PollState do
       record(outcome(status: "deferred", classification: :budget_denied, snapshot: nil))
 
       expect(event_source.next_poll_at).to eq(now + 120)
+    end
+
+    # Nothing was written, so there is nothing to announce. A line here would report a
+    # backoff a healthy source never took.
+    it "announces nothing, because no source state moved" do
+      allow(Rails.logger).to receive(:warn)
+      allow(Rails.logger).to receive(:error)
+
+      record(outcome(status: "deferred", classification: :budget_denied, snapshot: nil))
+
+      expect(Rails.logger).not_to have_received(:warn)
+      expect(Rails.logger).not_to have_received(:error)
     end
   end
 

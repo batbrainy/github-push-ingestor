@@ -352,6 +352,27 @@ RSpec.describe Github::IngestionRunner do
       expect(result.last_error).to eq("GitHub returned 500 (server_error)")
       expect(IngestionRun.sole.last_error).to eq("GitHub returned 500 (server_error)")
     end
+
+    # The whole retry ladder, end to end and joined to the run that produced it. Everything
+    # below reaches the stream at the default log level of info, which is the point: before
+    # PR 10 an operator running a 500 storm saw only the completion line.
+    it "shows the whole retry ladder against the run it belongs to" do
+      allow(Rails.logger).to receive(:info).and_call_original
+      allow(Rails.logger).to receive(:warn).and_call_original
+
+      result = ingest(fixture_runner(transport: fixture_transport(scenario: "transient_failure_exhausted")))
+
+      expect(Rails.logger).to have_received(:info)
+        .with(hash_including(event: "github.retry_scheduled", run_id: result.run_id)).twice
+      expect(Rails.logger).to have_received(:warn)
+        .with(hash_including(event: "github.retry_exhausted", run_id: result.run_id))
+      expect(Rails.logger).to have_received(:warn)
+        .with(hash_including(event: "github.request", classification: :server_error,
+                             run_id: result.run_id)).exactly(3).times
+      expect(Rails.logger).to have_received(:warn)
+        .with(hash_including(event: "ingestion.source_backoff", run_id: result.run_id,
+                             consecutive_failures: 1))
+    end
   end
 
   # §10 makes every retry its own reservation "through the same gate and ledger", so the

@@ -267,5 +267,51 @@ RSpec.describe Github::EnrichmentRunner do
       expect(Rails.logger).to have_received(:debug).with(hash_including(event: "enrichment.deferred"))
       expect(Rails.logger).not_to have_received(:info).with(hash_including(event: "enrichment.deferred"))
     end
+
+    # §11's common-field list includes the attempt number, and this is the line §11 actually
+    # asks reviewers to read. lease.to_log already carried it onto the DEBUG request line,
+    # so it was present exactly where nobody was looking and absent where they were.
+    it "carries §11's attempt number onto the outcome line, not only onto the request line" do
+      ghostuser(enrichment_attempts: 1)
+      allow(Rails.logger).to receive(:info)
+
+      runner.call
+
+      expect(Rails.logger).to have_received(:info).with(
+        hash_including(event: "enrichment.failed", enrichment_attempt: 2,
+                       entity_status: "permanent_failure")
+      )
+    end
+
+    it "counts the attempt from zero on an entity that has never been fetched" do
+      octocat
+      allow(Rails.logger).to receive(:info)
+
+      runner.call
+
+      expect(Rails.logger).to have_received(:info)
+        .with(hash_including(event: "enrichment.completed", enrichment_attempt: 1))
+    end
+
+    # Result::EVENTS owns "enrichment.failed" for the ordinary outcome §11 lists — INFO,
+    # with an entity status and a scheduled retry. An escaped exception has a released
+    # lease, an error pair and no entity outcome at all, so sharing the name would make one
+    # alert match two structurally different records.
+    it "reports an escaped exception under its own name, not the outcome's" do
+      octocat
+      allow(Rails.logger).to receive(:error)
+      exploding = instance_double(Github::Enrichment::EntityState)
+      allow(exploding).to receive(:record!).and_raise(RuntimeError, "boom")
+
+      expect { fixture_enrichment_runner(transport: transport, entity_state: exploding).call }
+        .to raise_error(RuntimeError, "boom")
+
+      expect(Rails.logger).to have_received(:error).with(
+        hash_including(event: "enrichment.cycle_failed", entity_type: :actor,
+                       error_class: "RuntimeError", error_message: "boom")
+      )
+      expect(Rails.logger).not_to have_received(:error)
+        .with(hash_including(event: "enrichment.failed"))
+    end
   end
 end

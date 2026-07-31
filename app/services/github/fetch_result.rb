@@ -34,6 +34,21 @@ module Github
     # reschedules rather than recording a failure (§9, §10).
     DEFERRED_CLASSIFICATIONS = %i[ budget_denied gate_unavailable ].freeze
 
+    # A conclusion was reached and it was a failure — the set §16's "failures contain
+    # actionable context" is about, and the one Github::RequestExecutor raises to warning
+    # level so it survives the default log_level of info.
+    #
+    # Neither deferral is one: nothing was attempted and nothing was spent, and the caller
+    # logs its own deferral line. Neither rate limit is one either — GitHub answered and
+    # declined, which §10 treats as something to reschedule rather than something that went
+    # wrong, and whose INFO line is budget.global_block_set, emitted once per block rather
+    # than once per request. :redirect is absent because it never escapes
+    # Github::RequestExecutor#follow_redirects: it is either followed or converted into
+    # RedirectLimitExceeded, which arrives here as :permanent_error.
+    FAILED_CLASSIFICATIONS = %i[
+      not_found client_error server_error transport_error permanent_error
+    ].freeze
+
     class << self
       def from_response(request:, status:, headers:, body:, duration_ms:, attempt: 0)
         new(
@@ -64,6 +79,7 @@ module Github
     def not_modified? = classification == :not_modified
     def successful? = ResponseClassifier.successful?(classification)
     def deferred? = DEFERRED_CLASSIFICATIONS.include?(classification)
+    def failed? = FAILED_CLASSIFICATIONS.include?(classification)
 
     def header(name)
       headers[name.to_s.downcase]
