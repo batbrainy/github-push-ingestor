@@ -7,8 +7,9 @@ plan wins.
 ## Before making any change
 
 1. Read `IMPLEMENTATION_PLAN.md` (repository root). It is the frozen execution
-   plan; its revision history lives in Git and in its Appendices A–D.
-2. Read `docs/DESIGN_BRIEF.md` and the ADRs under `docs/adr/` once they exist.
+   plan; its pre-implementation revision history lives in Git and in its
+   Appendices A–D, and Appendix E records how the build diverged from it.
+2. Read `docs/DESIGN_BRIEF.md` and the ADRs under `docs/adr/`.
 3. Do not change architectural direction, add infrastructure, or add dependencies
    without first updating the plan and stating the tradeoff.
 

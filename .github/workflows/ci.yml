@@ -19,6 +19,12 @@ jobs:
           test -f CLAUDE.md
           test -f .github/PULL_REQUEST_TEMPLATE.md
           test -f .github/workflows/ci.yml
+          # §14 names the design brief as the reviewer's primary architecture
+          # document, and CLAUDE.md tells every contributor to read it. Guarded
+          # here for the same reason as the plan and the README: a required
+          # document that can go missing without a red build will eventually go
+          # missing.
+          test -f docs/DESIGN_BRIEF.md
 
   # The real suite runs from PR 3 onward (IMPLEMENTATION_PLAN.md §13). Ruby is pinned
   # from .ruby-version — the same pin the Dockerfile uses — so CI and the image can

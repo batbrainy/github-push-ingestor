@@ -362,10 +362,43 @@ RSpec.describe "docker-compose.yml" do
   describe "the shared application image" do
     let(:app_services) { %w[setup web worker ingest enrich test] }
 
-    it "builds one image and runs every application service from it" do
+    it "runs every application service from one image" do
       app_services.each do |name|
-        expect(services.fetch(name).fetch("build")).to eq(".")
         expect(services.fetch(name).fetch("image")).to eq("github-push-ingestor-app")
+      end
+    end
+
+    # The invariant that keeps a reviewer's first command working. Compose Bake — on by
+    # default in Docker Desktop — makes every service with a `build:` its own bake target,
+    # and two targets exporting the same `image:` tag race: a cold `docker compose up
+    # --build` failed with `image "github-push-ingestor-app:latest": already exists` and
+    # started nothing. It reproduces only when the image is absent, so it is invisible on
+    # every machine except the one that matters.
+    #
+    # `up` starts setup, web and worker; exactly one of them may declare a build.
+    it "declares exactly one build among the services a plain `up` starts" do
+      builders = %w[setup web worker].select { |name| services.fetch(name).key?("build") }
+
+      expect(builders).to eq(%w[setup])
+    end
+
+    # web and worker are safe without a build only because they wait for the service that
+    # has one. Without this, a cold `up` would try to pull a tag that was never published.
+    it "makes the buildless services wait for the one that builds" do
+      %w[web worker].each do |name|
+        expect(services.fetch(name).fetch("depends_on").fetch("setup"))
+          .to include("condition" => "service_completed_successfully")
+      end
+    end
+
+    # Each `tools` one-shot is invoked alone by `docker compose run`, so it is a single
+    # bake target and cannot collide — it keeps its own build and must, because nothing
+    # else builds the image on that path. pull_policy stops Compose from attempting a
+    # registry pull of a tag that is local-only by construction.
+    it "lets each one-shot build for itself without reaching for a registry" do
+      %w[ingest enrich test].each do |name|
+        expect(services.fetch(name).fetch("build")).to eq(".")
+        expect(services.fetch(name).fetch("pull_policy")).to eq("build")
       end
     end
   end
