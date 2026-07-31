@@ -129,8 +129,25 @@ module Github
       observed_limit || UNAUTHENTICATED_CORE_LIMIT
     end
 
-    def allowances(limit: UNAUTHENTICATED_CORE_LIMIT)
-      Allowances.derive(configuration: self, limit: limit)
+    # @param live_source_count [Integer] §10's ENABLED_LIVE_SOURCE_COUNT. Defaults to the
+    #   configured value, which is what keeps #validate! a pure function of the environment
+    #   (ADR 0004); Github::BudgetLedger passes the count Github::SourceAllocation observes
+    #   in event_sources.
+    def allowances(limit: UNAUTHENTICATED_CORE_LIMIT, live_source_count: enabled_live_source_count)
+      Allowances.derive(configuration: self, limit: limit, live_source_count: live_source_count)
+    end
+
+    # How many reservations one *logical* poll can consume in the worst case, which is not
+    # the one the allowance formula counts. §10 makes each retry and each redirect hop its
+    # own reservation "through the same gate and ledger", and Github::RequestExecutor
+    # restarts the redirect chain from the original request on a retryable failure — so a
+    # single page can cost (retries + 1) x (redirects + 1) attempts, and a poll costs that
+    # once per page it is allowed to fetch.
+    #
+    # At the pinned defaults: 3 x 3 x 1 = 9 of a 12-attempt poll allowance. It is reported
+    # at boot rather than rejected — see the initializer for why.
+    def worst_case_reservations_per_poll
+      (max_http_retries + 1) * (max_redirects + 1) * max_pages_per_poll
     end
 
     # §10's per-class refresh TTLs, keyed by request class so a caller holding an

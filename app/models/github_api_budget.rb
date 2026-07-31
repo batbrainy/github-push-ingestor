@@ -80,4 +80,22 @@ class GithubApiBudget < ApplicationRecord
 
     reset_at || now + cadence_seconds
   end
+
+  # One canonical rendering of the row for §11's structured stream, in the shape every
+  # other value here already uses (Github::Allowances, Github::RateLimitSnapshot,
+  # Github::PollSchedule, Github::RateLimitPolicy::Decision all answer #to_log).
+  #
+  # It exists so the budget lines PR 9 adds cannot describe the same row with different
+  # field names than the lines that already exist. Timestamps are ISO-8601 UTC because a
+  # log stream is read across timezones; nils are kept rather than compacted, since
+  # "remaining is unknown" and "remaining was not reported" are different facts to an
+  # operator reading one line.
+  def to_log
+    { window_status: window_status, resource: resource, limit: limit, remaining: remaining,
+      reserve: reserve, reset_at: reset_at&.utc&.iso8601,
+      global_blocked_until: global_blocked_until&.utc&.iso8601,
+      poll_used: poll_used, poll_allowance: poll_allowance,
+      enrichment_used: enrichment_used, enrichment_allowance: enrichment_allowance,
+      actor_share_used: actor_share_used, repository_share_used: repository_share_used }
+  end
 end

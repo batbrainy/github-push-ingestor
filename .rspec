@@ -1,2 +1,6 @@
 --require spec_helper
 --format documentation
+# spec/stress holds the threaded budget-ledger stress specs (PR 9). They are excluded from
+# the default run and executed as their own process — see spec/stress/README.md for why —
+# so `bundle exec rspec` stays deterministic and `bundle exec rspec spec/stress` runs them.
+--exclude-pattern "stress/**/*_spec.rb"

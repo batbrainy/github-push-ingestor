@@ -29,10 +29,16 @@ module Github
       # The formula exactly as written. enrichment_allowance may come out zero or
       # negative; that is precisely the configuration #feasible? rejects, so it is
       # reported rather than hidden here.
-      def derive(configuration:, limit:)
+      #
+      # @param live_source_count [Integer] §10's ENABLED_LIVE_SOURCE_COUNT. Defaulted from
+      #   the configuration so boot-time validation stays a pure function of the
+      #   environment (ADR 0004: validation must be safe before migrations), and passed
+      #   explicitly by Github::BudgetLedger, which asks Github::SourceAllocation for the
+      #   number event_sources actually holds.
+      def derive(configuration:, limit:, live_source_count: configuration.enabled_live_source_count)
         poll = (3600.0 / configuration.poll_interval_seconds).ceil *
                configuration.max_pages_per_poll *
-               configuration.enabled_live_source_count
+               live_source_count
 
         new(
           limit: limit,
@@ -85,11 +91,21 @@ module Github
     # Polling wins the clamp: §10 ranks polling first, and enrichment reaching zero is
     # an already-modelled, documented outcome (skipped_budget), whereas polling
     # stopping is a Story 1 failure. Runtime degrades; only boot refuses.
+    #
+    # **The floor of one is what makes "degrades" true rather than "stops".** An observed
+    # limit at or below the reserve leaves nothing spendable, and the plain minimum gave
+    # poll_allowance = 0 — which denies every poll :class_allowance_exhausted, forever.
+    # Nothing recovers from that state: only a poll can observe a new x-ratelimit-limit,
+    # rollover re-derives from the stored one, and the stored one never changes again. One
+    # guaranteed attempt is exactly the bootstrap poll §7 already relies on, and it is not
+    # an overspend: once remaining is known, `remaining <= reserve` denies it on the
+    # ledger's own terms, and while remaining is NULL the window is uninitialized, which is
+    # the one state §7 grants a poll in regardless.
     def clamped
       spendable = [ limit - reserve, 0 ].max
-      poll = [ poll_allowance, spendable ].min
+      poll = [ [ poll_allowance, spendable ].min, 1 ].max
 
-      with(poll_allowance: poll, enrichment_allowance: spendable - poll)
+      with(poll_allowance: poll, enrichment_allowance: [ spendable - poll, 0 ].max)
     end
 
     # The guarantees rather than the share: they are the numbers that actually bind, and

@@ -198,12 +198,18 @@ services:
   # Depends only on db (never on the development `setup` service) and
   # prepares its own isolated test databases: github_push_ingestor_test and
   # github_push_ingestor_queue_test (plan §2A, §12).
+  #
+  # Two rspec invocations, not one. spec/stress holds the threaded budget-ledger stress
+  # specs, which open several real PostgreSQL sessions and would otherwise break the
+  # single-pinned-session assumption the rest of the suite is built on — spec/stress/README.md
+  # has the full reasoning. `.rspec` excludes them from the default run, so this second
+  # command is what actually executes them, and `&&` means a failure there fails the service.
   test:
     build: .
     image: github-push-ingestor-app
     profiles: ["tools"]
     restart: "no"
-    command: ["bash", "-c", "bin/rails db:test:prepare && bundle exec rspec"]
+    command: ["bash", "-c", "bin/rails db:test:prepare && bundle exec rspec && bundle exec rspec spec/stress"]
     environment:
       <<: *app_env
       RAILS_ENV: test

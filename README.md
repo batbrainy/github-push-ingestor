@@ -159,6 +159,11 @@ development databases):
 docker compose run --rm test
 ```
 
+That runs `rspec` twice: the suite, and then [`spec/stress`](spec/stress/) — the threaded
+budget-ledger stress specs, which open several real PostgreSQL sessions and therefore need
+their own process ([`spec/stress/README.md`](spec/stress/README.md) explains why). CI runs
+the same two steps.
+
 Rails, Active Job and application logs are one structured JSON stream;
 PostgreSQL and Puma startup output remain their own plain-text formats:
 
@@ -452,6 +457,19 @@ transitions `budget.window_initialized`, `budget.window_rolled`,
 the request that reached its fairness guarantee — `budget.global_block_set` and
 `budget.global_block_cleared`.
 
+Every process also logs `config.budget_resolved` at boot, carrying the formula's inputs and
+the allowances and guarantees they produce, so the numbers every later budget line is read
+against are in the stream before the first request.
+
+Four warnings name a budget condition that would otherwise be invisible:
+`budget.source_allocation_drift` when `ENABLED_LIVE_SOURCE_COUNT` and the `event_sources`
+table disagree; `budget.allowances_clamped` when a limit GitHub reported cannot fund the
+configured formula and the allowances in force are no longer the configured ones;
+`budget.window_reset_in_past` when a response's reset instant has already passed, which
+means this container's clock runs ahead of GitHub's and enrichment will stay ineligible
+until it does not; and `config.amplification` at boot when retries and redirects multiply to
+more request attempts per poll than the whole poll allowance.
+
 Enrichment adds `enrichment.completed` and `enrichment.failed`, each carrying the
 entity type, its GitHub id, the response classification, the resulting entity status
 and the attempt number; `enrichment.aged_out`, one summary line per class per sweep
@@ -485,7 +503,22 @@ failing ones are already at warning), `ingestion.page_fetched` and
 `ingestion.page_processed` per page, `ingestion.pagination_stopped` with its reason,
 `ingestion.not_modified` — which carries the `x-ratelimit-used` and
 `x-ratelimit-remaining` that make the `304` accounting visible in the running
-system — plus a line per persisted, duplicate and ignored event.
+system — `budget.co_tenant_usage` (below), plus a line per persisted, duplicate and ignored
+event.
+
+### Sharing the outbound IP
+
+The unauthenticated limit is keyed to the outbound IP, so anything else behind that address
+spends the same sixty requests an hour. The ledger cannot prevent that — it coordinates this
+application only, and converges to GitHub's headers rather than overriding them (plan §7) —
+but it does report it. On every reconciliation it compares GitHub's `x-ratelimit-used`
+against its own `poll_used + enrichment_used`; a positive difference is capacity this
+application did not spend, and it is logged as `budget.co_tenant_usage` at debug level.
+When that difference has taken `x-ratelimit-remaining` down to `RATE_LIMIT_RESERVE` the line
+is raised to `budget.co_tenant_pressure` at info, because every class is about to be denied
+`reserve_reached` for the rest of the window and the silence that follows otherwise has no
+cause attached to it. Nothing is inferred back into the class counters: GitHub's `used`
+carries no request class, and a guess would break the fairness accounting.
 
 Every line carries the run's `run_id`, except `ingestion.not_due`: a poll the
 schedule turned away opens no run, so it reports `event_source_id` instead.
@@ -526,7 +559,7 @@ is [`.env.example`](.env.example).
 | `SOURCE_LOCK_WAIT_SECONDS` | `30` | How long the one-shot waits for a busy source lock; the poller attempts once (plan §9) |
 | `POLL_INTERVAL_SECONDS` | `300` | The poll cadence, and an allowance-formula input. A source polled at T is due again at T + this; an unforced run before then is deferred rather than made. The worker's 60-second tick checks the schedule; it does not replace it (plan §9, §10) |
 | `MAX_PAGES_PER_POLL` | `1` | How many `Link`-followed pages one poll may fetch, and an allowance-formula input. Raising it trades enrichment allowance for capture depth: at `3` the poll allowance becomes 36 attempts an hour and enrichment drops to 16 (plan §9, §10) |
-| `ENABLED_LIVE_SOURCE_COUNT` | `1` | Allowance-formula input: live sources sharing one per-IP budget |
+| `ENABLED_LIVE_SOURCE_COUNT` | `1` | Allowance-formula input: live sources sharing one per-IP budget. **A fallback rather than the authority** — at window initialization and rollover the formula counts the enabled, in-service `event_sources` rows of the running mode and uses that instead, falling back to this value only when there are none yet. A disagreement is logged as `budget.source_allocation_drift` (plan §10, [ADR 0009](docs/adr/0009-runtime-source-allocation-and-shared-ip-observability.md)) |
 | `RATE_LIMIT_RESERVE` | `8` | Requests per hour left deliberately unspent (plan §10) |
 | `ACTOR_ENRICHMENT_SHARE` | `0.50` | How the enrichment allowance splits between actors and repositories: `floor(allowance x this)` guarantees actors, the remainder goes to repositories. A guarantee, not a cap — either class may borrow the other's unused capacity when the other has no *currently eligible* candidate. Both ends of `[0, 1]` are legal (plan §10) |
 | `ENRICHMENT_ELIGIBILITY_WINDOW_SECONDS` | `3600` | How long a candidate stays worth enriching. Past it, the entity transitions to `skipped_budget` — which is what bounds the backlog — until a genuinely new push event reactivates it (plan §10, B8) |
@@ -675,7 +708,8 @@ Decisions behind this are recorded in
 [`docs/adr/`](docs/adr/): advisory locks and the gate (0002), the source and transport
 seams (0003), the class-aware ledger (0004), at-least-once processing with idempotent
 writes (0005), decomposed poll deferral state (0006), enrichment fairness shares
-and borrowing (0007), and post-commit enqueue with entity-scoped reconciliation (0008).
+and borrowing (0007), post-commit enqueue with entity-scoped reconciliation (0008), and
+runtime source allocation with shared-IP observability (0009).
 
 ## Continuous ingestion
 

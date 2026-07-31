@@ -83,8 +83,25 @@ RSpec.describe Github::Allowances do
     it "never derives a negative allowance, which the schema's CHECK would reject" do
       clamped = described_class.derive(configuration: configuration, limit: 4).clamped
 
-      expect(clamped.poll_allowance).to eq(0)
+      expect(clamped.poll_allowance).to be >= 0
       expect(clamped.enrichment_allowance).to eq(0)
+    end
+
+    # The clamp's floor, and the reason it is not cosmetic. A limit at or below the reserve
+    # leaves nothing spendable, and a poll allowance of zero is unrecoverable: every poll is
+    # denied :class_allowance_exhausted, only a poll can observe a new x-ratelimit-limit,
+    # and rollover re-derives from the stored one — which nothing can now change.
+    it "keeps one poll attempt when the limit is at or below the reserve, or nothing recovers" do
+      clamped = described_class.derive(configuration: configuration, limit: 4).clamped
+
+      expect(clamped.poll_allowance).to eq(1)
+      expect(clamped.enrichment_allowance).to eq(0)
+    end
+
+    it "keeps that one attempt even when the reserve alone exceeds the whole limit" do
+      clamped = described_class.derive(configuration: configuration(RATE_LIMIT_RESERVE: "80"), limit: 60).clamped
+
+      expect(clamped).to have_attributes(poll_allowance: 1, enrichment_allowance: 0)
     end
 
     # The single strongest argument for deriving the guarantees rather than storing them:

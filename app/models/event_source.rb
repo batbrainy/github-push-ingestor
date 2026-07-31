@@ -28,6 +28,19 @@ class EventSource < ApplicationRecord
 
   enum :status, STATUSES.index_by(&:itself), validate: true
 
+  # Which rows of a type will actually be polled, and therefore which ones consume poll
+  # allowance. PR 9's Github::SourceAllocation counts these to derive §10's
+  # ENABLED_LIVE_SOURCE_COUNT from the database rather than from the environment, and
+  # #poll_due composes from it so the allowance input and the poll filter are one
+  # predicate rather than two that can drift.
+  #
+  # status is part of it deliberately. A failed source is operator-recoverable only and is
+  # never polled again on its own, so provisioning poll allowance for it would take
+  # requests away from enrichment for a source that provably cannot spend them.
+  scope :pollable, ->(source_type:) {
+    where(source_type: source_type, enabled: true, status: "idle")
+  }
+
   # PR 8's recurring tick asks this before it asks anything else, and it is a **pre-filter,
   # never the decision**. Github::PollSchedule reading the four components under the source
   # lock stays the authority — Github::IngestionRunner reloads the row inside the lock
@@ -51,7 +64,7 @@ class EventSource < ApplicationRecord
   # operator-recoverable only, so the tick would emit a warning a minute until someone
   # looked, burying the lines §11 asks reviewers to read.
   scope :poll_due, ->(source_type:, now:) {
-    where(source_type: source_type, enabled: true, status: "idle")
+    pollable(source_type: source_type)
       .where("next_poll_at IS NULL OR next_poll_at <= :now", now: now)
       .order(:id)
   }
