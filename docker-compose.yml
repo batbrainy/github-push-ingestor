@@ -48,6 +48,13 @@ x-app-env: &app_env
   ENRICHMENT_ELIGIBILITY_WINDOW_SECONDS: ${ENRICHMENT_ELIGIBILITY_WINDOW_SECONDS:-3600}
   ACTOR_REFRESH_TTL_SECONDS: ${ACTOR_REFRESH_TTL_SECONDS:-86400}
   REPOSITORY_REFRESH_TTL_SECONDS: ${REPOSITORY_REFRESH_TTL_SECONDS:-86400}
+  # §11's coverage window, forwarded for the same reason the four allowance inputs are —
+  # without this line `ENRICHMENT_COVERAGE_WINDOW_SECONDS=604800 docker compose up` sets
+  # the variable in the reviewer's shell and nothing at all inside the container. It sits
+  # in the shared anchor for consistency rather than for correctness: unlike every other
+  # member here it changes only what /status *reports*, never what any process *does*, so
+  # a disagreement between two processes would be cosmetic rather than a policy split.
+  ENRICHMENT_COVERAGE_WINDOW_SECONDS: ${ENRICHMENT_COVERAGE_WINDOW_SECONDS:-86400}
 
 services:
   db:

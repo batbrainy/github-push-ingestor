@@ -195,6 +195,137 @@ RSpec.describe Github::RequestExecutor do
     end
   end
 
+  describe "retry and failure logging (plan §11, §16)" do
+    def always(status)
+      recording_transport { response(status: status, headers: rate_limit_headers) }
+    end
+
+    # §11 names "retry scheduled" among the INFO events, and it was the only one named
+    # there with no implementation at all. Without it a retried fetch is
+    # indistinguishable from a slow one, and the extra reservations it spends out of sixty
+    # an hour are invisible.
+    it "announces every scheduled retry at info, naming the delay it is about to sleep" do
+      active_budget_window
+      allow(Rails.logger).to receive(:info)
+      slept = []
+
+      executor(always(500), sleeper: ->(seconds) { slept << seconds }).call(poll_request)
+
+      expect(Rails.logger).to have_received(:info)
+        .with(hash_including(event: "github.retry_scheduled", classification: :server_error,
+                             http_status: 500, next_attempt: 1, max_attempts: 2)).once
+      expect(Rails.logger).to have_received(:info)
+        .with(hash_including(event: "github.retry_scheduled", next_attempt: 2)).once
+    end
+
+    # RetryPolicy jitters, so a line that recomputed the delay would report a number this
+    # process never actually slept.
+    it "reports the delay it actually slept, not a freshly jittered one" do
+      active_budget_window
+      logged = []
+      slept = []
+      allow(Rails.logger).to receive(:info) { |payload| logged << payload }
+
+      executor(always(500), sleeper: ->(seconds) { slept << seconds }).call(poll_request)
+
+      scheduled = logged.select { |line| line[:event] == "github.retry_scheduled" }
+      expect(scheduled.map { |line| line[:backoff_seconds] })
+        .to eq(slept.map { |seconds| seconds.round(1) })
+    end
+
+    # §10's "persist the failure after attempts are exhausted", and §16's "retry behavior
+    # is visible". Before this, "retried twice over seven seconds and gave up" was
+    # byte-identical in the log stream to "failed once, permanently".
+    it "distinguishes running out of attempts from failing once" do
+      active_budget_window
+      allow(Rails.logger).to receive(:warn)
+
+      executor(always(500)).call(poll_request)
+
+      expect(Rails.logger).to have_received(:warn)
+        .with(hash_including(event: "github.retry_exhausted", classification: :server_error,
+                             attempt: 2, max_attempts: 2)).once
+    end
+
+    # The other half of that distinction: a classification that was never retryable did not
+    # run out of anything, and reporting exhaustion on every permanent 404 would make the
+    # line meaningless.
+    it "reports no exhaustion for a classification that was never retryable" do
+      active_budget_window
+      allow(Rails.logger).to receive(:warn)
+
+      executor(always(404)).call(poll_request)
+
+      expect(Rails.logger).not_to have_received(:warn)
+        .with(hash_including(event: "github.retry_exhausted"))
+    end
+
+    describe "the level of the per-request line" do
+      # §11 puts per-request lines at debug, and that is right for the ones that worked.
+      # But config.log_level defaults to info, so before this a 500, a timeout, a refused
+      # URL and a deleted entity produced no HTTP detail at all in a running system — while
+      # §11 also sizes the info stream so the events Story 4 asks reviewers to see are *in*
+      # it, and §16 requires failures to carry actionable context.
+      {
+        500 => :server_error, 404 => :not_found, 400 => :client_error
+      }.each do |status, classification|
+        it "raises a #{classification} to warning, so it survives the default log level" do
+          active_budget_window
+          allow(Rails.logger).to receive(:warn)
+
+          executor(always(status), retry_policy: Github::RetryPolicy.new(max_attempts: 0))
+            .call(poll_request)
+
+          expect(Rails.logger).to have_received(:warn)
+            .with(hash_including(event: "github.request", classification: classification,
+                                 http_status: status))
+        end
+      end
+
+      it "leaves a request that worked at debug, where §11 puts it" do
+        active_budget_window
+        allow(Rails.logger).to receive(:debug)
+        allow(Rails.logger).to receive(:warn)
+
+        executor(always(200)).call(poll_request)
+
+        expect(Rails.logger).to have_received(:debug)
+          .with(hash_including(event: "github.request", classification: :ok))
+        expect(Rails.logger).not_to have_received(:warn)
+      end
+
+      # Nothing was spent and nothing was attempted, and the caller emits its own deferral
+      # line. A rate limit is the same: GitHub answered and declined, and §11's line for
+      # that is budget.global_block_set — once per block rather than once per request.
+      it "leaves a deferral and a rate limit at debug, because neither is a failure" do
+        active_budget_window(poll_used: 12, poll_allowance: 12)
+        allow(Rails.logger).to receive(:debug)
+        allow(Rails.logger).to receive(:warn)
+
+        executor(always(200)).call(poll_request)
+
+        expect(Rails.logger).to have_received(:debug)
+          .with(hash_including(event: "github.request", classification: :budget_denied))
+        expect(Rails.logger).not_to have_received(:warn)
+      end
+
+      # One event name rather than two, so the same request never appears twice and
+      # `grep github.request` keeps meaning "every request".
+      it "keeps one event name across both levels" do
+        active_budget_window
+        logged = []
+        allow(Rails.logger).to receive(:warn) { |payload| logged << payload }
+        allow(Rails.logger).to receive(:debug) { |payload| logged << payload }
+
+        executor(always(500)).call(poll_request)
+
+        requests = logged.select { |line| line[:event] == "github.request" }
+        expect(requests.length).to eq(3)
+        expect(requests.map { |line| line[:attempt] }).to eq([ 0, 1, 2 ])
+      end
+    end
+  end
+
   describe "redirects (plan §10)" do
     let(:repository_request) do
       Github::Request.new(url: "https://api.github.com/repos/octocat/Hello-World", request_class: :repository)

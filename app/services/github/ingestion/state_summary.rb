@@ -14,8 +14,23 @@ module Github
     # BudgetLedger#bootstrap! from a read path.
     #
     # Splitting the snapshot from its rendering is what lets a spec assert §9's "1,284"
-    # delimiter without inserting 1,284 rows, and it is the seam PR 10's /status consumes
+    # delimiter without inserting 1,284 rows, and it is the *pattern* PR 10's /status
+    # adopted — a read-only value object with .capture and no collaborator that writes —
     # while the one-shot consumes #to_s.
+    #
+    # /status does not consume this class, and deliberately. Github::Status::Snapshot reads
+    # the ledger row once and passes it into all three of its parts; composing this object
+    # with Github::Enrichment::Summary would read the singleton twice more, so a reservation
+    # committing mid-request could produce one response whose poll block contradicted its
+    # ledger block. It also collapses PollSchedule to a single instant, where §11 asks for
+    # the components.
+    #
+    # One name means two numbers across the two objects, and both are correct for their own
+    # question. pending_actor_count here is the enrichment_candidates scope — pending *plus*
+    # retryable_failure, which is what "still to enrich" means for the operator about to run
+    # bin/enrich. /status reports the literal status under that name and publishes the scope
+    # beside it as `candidates`, because a JSON consumer has no §9 context to disambiguate
+    # from.
     class StateSummary < Data.define(
       :latest_run_at, :latest_run_id, :push_event_count,
       :pending_actor_count, :pending_repository_count,

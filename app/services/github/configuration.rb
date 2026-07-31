@@ -38,7 +38,8 @@ module Github
       "ACTOR_ENRICHMENT_SHARE" => "0.50",
       "ENRICHMENT_ELIGIBILITY_WINDOW_SECONDS" => "3600",
       "ACTOR_REFRESH_TTL_SECONDS" => "86400",
-      "REPOSITORY_REFRESH_TTL_SECONDS" => "86400"
+      "REPOSITORY_REFRESH_TTL_SECONDS" => "86400",
+      "ENRICHMENT_COVERAGE_WINDOW_SECONDS" => "86400"
     }.freeze
 
     # A zero here is a broken configuration, not a conservative one: a zero interval
@@ -50,6 +51,14 @@ module Github
     # so the sweep skips the entire backlog and enrichment can never run; a zero refresh
     # TTL makes every enriched entity instantly stale, turning off the freshness cache
     # §13 lists as a PR 7 capability. "Never refresh" is a large number, not zero.
+    #
+    # The coverage window is the fourth, and it fails the same way from the other end. It
+    # is the sole denominator of §11's three percentages, so a zero window puts every
+    # denominator at zero and Github::Enrichment::Coverage reports null for all three,
+    # permanently — §11's headline metric disabled by a number rather than by a decision.
+    # A negative value is worse than useless rather than merely useless: `now - (-N)` is a
+    # floor in the *future*, which empties the window just as completely while reading
+    # like a wider one.
     POSITIVE_INTEGERS = {
       poll_interval_seconds: "POLL_INTERVAL_SECONDS",
       max_pages_per_poll: "MAX_PAGES_PER_POLL",
@@ -59,7 +68,8 @@ module Github
       source_lock_wait_seconds: "SOURCE_LOCK_WAIT_SECONDS",
       enrichment_eligibility_window_seconds: "ENRICHMENT_ELIGIBILITY_WINDOW_SECONDS",
       actor_refresh_ttl_seconds: "ACTOR_REFRESH_TTL_SECONDS",
-      repository_refresh_ttl_seconds: "REPOSITORY_REFRESH_TTL_SECONDS"
+      repository_refresh_ttl_seconds: "REPOSITORY_REFRESH_TTL_SECONDS",
+      enrichment_coverage_window_seconds: "ENRICHMENT_COVERAGE_WINDOW_SECONDS"
     }.freeze
 
     # Zero is meaningful for all three: no reserve, no retries, no redirects.
@@ -76,15 +86,16 @@ module Github
       actor_enrichment_share: "ACTOR_ENRICHMENT_SHARE"
     }.freeze
 
-    # ENRICHMENT_COVERAGE_WINDOW_SECONDS is deliberately absent. §10 prints it in the
-    # same block as the three above, but it is an input to §11's coverage percentages,
-    # which §13 assigns to PR 10 — and §16 forbids speculative infrastructure.
+    # enrichment_coverage_window_seconds is the odd one out and worth naming as such: every
+    # other knob here changes what the system *does*, and this one changes only what
+    # Github::Enrichment::Coverage *reports*. Nothing schedules, reserves, or defers on it.
     attr_reader :mode, :fixture_scenario, :poll_interval_seconds, :max_pages_per_poll,
                 :enabled_live_source_count, :rate_limit_reserve,
                 :http_open_timeout_seconds, :http_read_timeout_seconds,
                 :max_http_retries, :max_redirects, :source_lock_wait_seconds,
                 :actor_enrichment_share, :enrichment_eligibility_window_seconds,
-                :actor_refresh_ttl_seconds, :repository_refresh_ttl_seconds
+                :actor_refresh_ttl_seconds, :repository_refresh_ttl_seconds,
+                :enrichment_coverage_window_seconds
 
     def initialize(env = ENV)
       @mode = read(env, "GITHUB_MODE").downcase

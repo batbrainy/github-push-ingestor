@@ -82,6 +82,18 @@ module ModelBuilders
   def create_budget(**overrides)
     GithubApiBudget.create!(overrides)
   end
+
+  # create! rather than PushEvent.insert_if_new, deliberately: created_at bounds §11's
+  # coverage window, and record_timestamps on the real write path stamps Time.current with
+  # no way to override it. create! honours an explicit created_at, which is what lets a
+  # spec place a row on either side of the window without travelling time.
+  #
+  # github_event_id defaults to one constant in push_event_attributes, so a series needs an
+  # explicit id per row — the unique index is the arbiter and a silent sequence here would
+  # hide that from the example reading it.
+  def create_push_event(actor:, repository:, **overrides)
+    PushEvent.create!(push_event_attributes(actor: actor, repository: repository, **overrides))
+  end
 end
 
 RSpec.configure do |config|

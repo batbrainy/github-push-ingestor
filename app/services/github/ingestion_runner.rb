@@ -211,7 +211,8 @@ module Github
       # Poll state first: next_poll_at has to reflect both this run's own cadence and any
       # block the rate-limit policy wrote while the pages were being walked, and the run's
       # completion line reports it.
-      next_poll_at = @poll_state.record!(event_source: event_source, outcome: outcome)
+      next_poll_at = @poll_state.record!(event_source: event_source, outcome: outcome,
+                                         run_id: recorder.run_id)
       run = recorder.finish!(status: outcome.status, tally: outcome.tally, last_error: outcome.last_error)
 
       Rails.logger.public_send(

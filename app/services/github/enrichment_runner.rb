@@ -46,7 +46,7 @@ module Github
     class Result < Data.define(:status, :entity_type, :github_id, :pool, :borrow,
                                :classification, :enrichment_status, :last_error,
                                :error_code, :deferral_reason, :next_retry_at, :aged_out,
-                               :duration_ms)
+                               :duration_ms, :enrichment_attempt)
       STATUSES = %w[ enriched failed deferred idle lease_lost ].freeze
 
       # §11 names the INFO events "enrichment completed/failed/skipped/reactivated", so the
@@ -62,7 +62,7 @@ module Github
       def initialize(status:, entity_type: nil, github_id: nil, pool: nil, borrow: false,
                      classification: nil, enrichment_status: nil, last_error: nil,
                      error_code: nil, deferral_reason: nil, next_retry_at: nil,
-                     aged_out: 0, duration_ms: nil)
+                     aged_out: 0, duration_ms: nil, enrichment_attempt: nil)
         raise ArgumentError, "unknown status #{status.inspect}" unless STATUSES.include?(status)
 
         super
@@ -80,7 +80,8 @@ module Github
       def to_log
         { enrichment_outcome: status, entity_type: entity_type, github_id: github_id,
           pool: pool, borrow: (true if borrow), classification: classification,
-          entity_status: enrichment_status, error_code: error_code,
+          entity_status: enrichment_status, enrichment_attempt: enrichment_attempt,
+          error_code: error_code,
           error_message: last_error, deferral_reason: deferral_reason,
           next_retry_at: next_retry_at&.utc&.iso8601,
           aged_out: (aged_out if aged_out.positive?), duration_ms: duration_ms }.compact
@@ -150,7 +151,14 @@ module Github
       # PageWriter's reasoning: an unexpected error "is a defect to fix, not a payload to
       # classify". Fabricating an entity status from one would make the defect durable.
       @claim.release!(lease)
-      Rails.logger.error(event: "enrichment.failed", **lease.to_log,
+      # enrichment.cycle_failed, not enrichment.failed: Result::EVENTS owns that name for
+      # the *ordinary* outcome §11 lists — INFO, with an entity status and a scheduled
+      # retry. This is an escaped exception with a released lease, an error pair and no
+      # entity outcome at all, and one event name carrying two field sets means an alert
+      # filtered on it matches two structurally different records.
+      # PollEventSourceJob's ingestion.cycle_failed is the same fact one level up, and
+      # shares its name deliberately.
+      Rails.logger.error(event: "enrichment.cycle_failed", **lease.to_log,
                          error_class: error.class.name, error_message: error.message)
       raise
     end
@@ -184,6 +192,11 @@ module Github
         status: written.outcome, entity_type: choice.entity_type.key,
         github_id: lease.github_id, pool: choice.pool, borrow: choice.borrow,
         classification: fetched.classification, enrichment_status: written.enrichment_status,
+        # §11's "attempt number", spelled enrichment_attempt for the reason #request_for's
+        # comment gives: `attempt` on a github.* line is the HTTP one. lease.to_log already
+        # carries this onto the DEBUG request line; without it here it never reaches the
+        # INFO outcome line, which is the line §11 actually asks reviewers to read.
+        enrichment_attempt: lease.enrichment_attempts + 1,
         last_error: written.last_error, error_code: written.error_code,
         deferral_reason: (fetched.classification.to_s if written.deferred?),
         next_retry_at: written.next_retry_at, aged_out: aged,

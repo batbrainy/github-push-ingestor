@@ -37,7 +37,7 @@ module Github
     def retry?(classification:, attempt:)
       return false if attempt >= max_attempts
 
-      ResponseClassifier.retryable?(classification) || classification == :transport_error
+      self.class.retryable_classification?(classification)
     end
 
     # Full jitter on top of an exponential base. Jitter matters even with one process:
@@ -65,6 +65,22 @@ module Github
       # as a classification, so the executor and the retry loop branch on one vocabulary.
       def classification_for(error)
         disposition(error) == :retry ? :transport_error : :permanent_error
+      end
+
+      # Whether this classification is retryable *at all*, with the attempt budget left out
+      # of the question.
+      #
+      # #retry? folds the two together, which is exactly what a caller deciding whether to
+      # loop again needs. A caller explaining why the loop *stopped* has to separate them:
+      # "never retryable" and "out of attempts" are different facts, and only the second is
+      # §10's "persist the failure after attempts are exhausted". Without the split, the
+      # exhaustion line would fire on every permanent 404.
+      #
+      # Named for the classification rather than as a bare retryable? because
+      # ResponseClassifier.retryable? answers a narrower question — only :server_error —
+      # and two same-named predicates with different answers is the drift trap.
+      def retryable_classification?(classification)
+        ResponseClassifier.retryable?(classification) || classification == :transport_error
       end
     end
   end

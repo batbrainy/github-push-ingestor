@@ -45,11 +45,18 @@ module Github
 
       loop do
         result = follow_redirects(request, attempt: attempt)
-        return result unless @retry_policy.retry?(classification: result.classification, attempt: attempt)
+        unless @retry_policy.retry?(classification: result.classification, attempt: attempt)
+          return exhausted(result)
+        end
+
+        # Computed once and both slept and logged, never recomputed: RetryPolicy jitters, so
+        # asking twice would report a delay this process never took.
+        backoff_seconds = @retry_policy.backoff_seconds(attempt)
+        log_retry_scheduled(result, backoff_seconds: backoff_seconds)
 
         # The backoff happens with no lock held and no reservation outstanding: the
         # previous attempt has already been debited and its gate hold released.
-        @sleeper.call(@retry_policy.backoff_seconds(attempt))
+        @sleeper.call(backoff_seconds)
         attempt += 1
       end
     end
@@ -151,10 +158,62 @@ module Github
       )
     end
 
+    # §11 names "retry scheduled" among the INFO events, and it is what makes §10's "retry
+    # up to MAX_HTTP_RETRIES with exponential backoff and jitter" observable rather than
+    # merely implemented. Without it a retried fetch is indistinguishable from a slow one,
+    # and the extra reservations it spends out of sixty an hour are invisible.
+    #
+    # Every §11 common field arrives free through FetchResult#to_log: it merges
+    # Request#to_log, whose context carries the run_id for a poll and the entity identifiers
+    # for an enrichment, so correlation needs no argument here.
+    #
+    # next_attempt is spelled out rather than left to arithmetic on a zero-based attempt,
+    # because the operator reading this line is being told what happens next.
+    def log_retry_scheduled(result, backoff_seconds:)
+      Rails.logger.info(
+        event: "github.retry_scheduled", **result.to_log,
+        next_attempt: result.attempt + 1, max_attempts: @retry_policy.max_attempts,
+        backoff_seconds: backoff_seconds.round(1)
+      )
+    end
+
+    # The loop stops for two different reasons and only one of them is news. A
+    # classification that was never retryable is an ordinary terminal outcome the caller
+    # already records; a retryable one that ran out of attempts is §10's "persist the
+    # failure after attempts are exhausted", and until now the stream could not tell them
+    # apart — "failed three times over seven seconds and gave up" was byte-identical to
+    # "failed once, permanently".
+    #
+    # WARN rather than ERROR, for the reason #log_result gives: the durable verdict belongs
+    # to the caller — a failed run, a retryable_failure entity — and this is the evidence
+    # behind it. With MAX_HTTP_RETRIES=0 the line still fires, carrying max_attempts: 0,
+    # which is the honest report that configuration rather than GitHub ended the attempt.
+    def exhausted(result)
+      return result unless RetryPolicy.retryable_classification?(result.classification)
+      return result unless result.attempt >= @retry_policy.max_attempts
+
+      Rails.logger.warn(event: "github.retry_exhausted", **result.to_log,
+                        max_attempts: @retry_policy.max_attempts)
+      result
+    end
+
     # §11 pins the common fields; the JSON formatter merges a hash into the log root.
-    # DEBUG because §11 puts per-request lines there and keeps INFO for run summaries.
+    #
+    # The level is a function of the outcome, the way Github::IngestionRunner#finish and
+    # Github::Enrichment::Dispatch already vary theirs. §11 puts per-request lines at DEBUG
+    # and that is right for the ones that worked — but §11 also sizes the INFO stream so the
+    # events Story 4 asks reviewers to see are *in* it, and §16 requires failures to carry
+    # actionable context. config.log_level defaults to info, so before this a 500, a
+    # timeout, a refused URL and a deleted entity produced no HTTP detail at all in a
+    # running system: the classification, the status, the URL and the attempt number live
+    # here and nowhere else.
+    #
+    # One event name rather than two, so the same request never appears twice and
+    # `grep github.request` keeps meaning "every request".
     def log_result(result)
-      Rails.logger.debug(result.to_log.merge(event: "github.request"))
+      payload = { event: "github.request", **result.to_log }
+
+      result.failed? ? Rails.logger.warn(payload) : Rails.logger.debug(payload)
       result
     end
   end

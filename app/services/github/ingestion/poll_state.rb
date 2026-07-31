@@ -27,13 +27,18 @@ module Github
       end
 
       # @param outcome [Github::Ingestion::PageLoop::Outcome]
+      # @param run_id [String, nil] §11's correlation identifier, carried purely so the two
+      #   failure lines below can be joined to the run that produced them. Optional because
+      #   this class writes source state whether or not a run row exists, and a nil is
+      #   compacted out rather than logged as null.
       # @return [Time, nil] the next_poll_at it wrote, which the runner puts on its Result
       #   so the one-shot can name §9's "Ingestion deferred until T" for any reason.
-      def record!(event_source:, outcome:, now: @clock.call)
+      def record!(event_source:, outcome:, now: @clock.call, run_id: nil)
         attributes = outcome.attempted? ? attempted(event_source, outcome, now: now) : {}
         attributes[:next_poll_at] = projected(event_source, attributes, now: now)
 
         event_source.update!(attributes)
+        log_failure(event_source, outcome, attributes, run_id: run_id, now: now)
         attributes[:next_poll_at]
       end
 
@@ -123,6 +128,60 @@ module Github
         projection.assign_attributes(attributes)
 
         PollSchedule.for(event_source: projection, now: now).effective_poll_time
+      end
+
+      # Logged from the attributes that were actually written, and only after the UPDATE
+      # committed them: a line claiming a source is out of service before the row says so is
+      # the one kind of log an operator cannot act on. Reading the written attributes rather
+      # than re-deriving outcome.source_failing also means a future second path to `failed`
+      # is reported without anyone remembering to extend this.
+      #
+      # This class logs rather than Github::IngestionRunner doing it on its behalf, for
+      # three reasons. Github::Enrichment::EntityState is this class's entity-side mirror and
+      # already logs three of its own anomalies, so a state writer announcing its own
+      # transitions is the established shape here. The runner would have to re-derive the
+      # predicate, and two readers of one rule is drift waiting to happen. And only this
+      # class knows the delay — backoff_seconds is retry_not_before_at minus its own `now`.
+      #
+      # ingestion.source_failed is §10's "/events returns permanent 4xx → source failed", and
+      # it was the largest failure-logging gap in the system: the transition is terminal and
+      # operator-recoverable only — nothing in this application writes `failed` back to
+      # `idle` — so it is the single poll outcome that will not resolve itself, and the only
+      # evidence of it was a status column nobody was told to read. Its entity-side twin,
+      # permanent_failure, already reaches the INFO stream as enrichment.failed's
+      # entity_status; this is the source-side line that was missing.
+      #
+      # It shares its token with IngestionRunner#out_of_service's deferral_reason, so one
+      # grep for source_failed returns the transition *and* every poll subsequently refused.
+      #
+      # ingestion.source_backoff is the counted-failure half. ingestion.run_completed already
+      # reports consecutive_failures and next_poll_at, but next_poll_at is the *maximum* of
+      # §9's five independent components, so it cannot say whether the source is deferred by
+      # its own backoff, by the server's poll floor, or by a global block. Naming the
+      # component and the delay is what makes the retry actionable — the same reason
+      # ingestion.not_due reports binding_component instead of only an instant.
+      #
+      # Nothing is logged for a run that was never attempted: attributes is empty, nothing
+      # was written, and the runner's own ERROR-level run_completed reports it.
+      def log_failure(event_source, outcome, attributes, run_id:, now:)
+        return unless outcome.failed?
+
+        if attributes[:status] == "failed"
+          Rails.logger.error({ event: "ingestion.source_failed", run_id: run_id,
+                               event_source_id: event_source.id, source_status: "failed",
+                               classification: outcome.classification,
+                               error_message: outcome.last_error }.compact)
+        elsif attributes[:retry_not_before_at]
+          retry_at = attributes[:retry_not_before_at]
+
+          Rails.logger.warn({ event: "ingestion.source_backoff", run_id: run_id,
+                              event_source_id: event_source.id,
+                              classification: outcome.classification,
+                              consecutive_failures: attributes[:consecutive_failures],
+                              backoff_seconds: (retry_at - now).round(1),
+                              retry_not_before_at: retry_at.utc.iso8601,
+                              error_message: outcome.last_error }.compact)
+        end
       end
     end
   end

@@ -27,15 +27,22 @@ RSpec.describe Github::Configuration do
         actor_enrichment_share: 0.5,
         enrichment_eligibility_window_seconds: 3600,
         actor_refresh_ttl_seconds: 86_400,
-        repository_refresh_ttl_seconds: 86_400
+        repository_refresh_ttl_seconds: 86_400,
+        # §11's coverage window, pinned at 86400 by §10. It arrives with the rich /status
+        # rather than earlier because until Github::Enrichment::Coverage existed nothing
+        # read it, and §16 forbids a knob with no consumer.
+        enrichment_coverage_window_seconds: 86_400
       )
     end
 
-    # §10 prints ENRICHMENT_COVERAGE_WINDOW_SECONDS in the same block as the three above,
-    # but it is an input to §11's coverage percentages, which §13 assigns to PR 10. §16
-    # forbids speculative infrastructure, so it is absent until something reads it.
-    it "carries no coverage window, which is PR 10's input and has no consumer yet" do
-      expect(described_class::DEFAULTS.keys).not_to include("ENRICHMENT_COVERAGE_WINDOW_SECONDS")
+    # The one knob here that changes what the system *reports* rather than what it *does*.
+    # Stated as its own example because the distinction is the reason it is safe for two
+    # processes to disagree about it, which is not true of any of its neighbours.
+    it "reports through the coverage window without scheduling, reserving or deferring on it" do
+      expect(configuration(ENRICHMENT_COVERAGE_WINDOW_SECONDS: "60"))
+        .to have_attributes(enrichment_coverage_window_seconds: 60,
+                            enrichment_eligibility_window_seconds: 3600,
+                            poll_interval_seconds: 300)
     end
 
     it "reads an override from the environment it was given" do

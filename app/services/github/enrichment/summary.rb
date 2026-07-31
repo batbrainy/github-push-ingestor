@@ -7,9 +7,10 @@ module Github
     # different questions and §13 splits them across two PRs: StateSummary is §9's
     # proof-of-state for the *polling* command, and §11 assigns the coverage percentages to
     # PR 10's /status. What lands here is the part PR 7's own outcome would otherwise be
-    # invisible without — the per-status counts and the per-class share usage §10 defines —
-    # and deliberately not the percentages, which need ENRICHMENT_COVERAGE_WINDOW_SECONDS
-    # and a join against push_events.
+    # invisible without — the per-status counts and the per-class share usage §10 defines.
+    # The percentages themselves are Github::Enrichment::Coverage, which needs
+    # ENRICHMENT_COVERAGE_WINDOW_SECONDS and a join against push_events; both arrived with
+    # PR 10, and /status renders the two objects side by side.
     #
     # **It never initiates a GitHub request**, structurally and for StateSummary's reason:
     # no executor, no transport, no ledger — three read statements over Active Record
@@ -19,9 +20,19 @@ module Github
     class Summary < Data.define(:actor_counts, :repository_counts, :actor_share_used,
                                 :repository_share_used, :actor_guarantee,
                                 :repository_guarantee, :enrichment_used,
-                                :enrichment_allowance, :window_status, :next_enrichment_at)
+                                :enrichment_allowance, :window_status, :claimable_now,
+                                :next_enrichment_at)
       NO_LEDGER = "not yet initialized".freeze
       DUE_NOW = "due now".freeze
+
+      # next_enrichment_at is nil in two states that are not the same fact: something is
+      # claimable *right now*, and nothing will ever become claimable without new ingest
+      # activity. Printing "due now" for both was wrong on an empty backlog — bin/enrich
+      # would say work was due in the same breath it reported nothing to enrich — and
+      # publishing the same nil as JSON would hand /status's consumers the identical
+      # ambiguity. claimable_now is the member that separates them; this is the label for
+      # the other side.
+      NOTHING_WAITING = "nothing waiting".freeze
 
       # The three statuses an operator acts on. permanent_failure and retryable_failure are
       # rolled into the pending/complete/skipped triple's remainder rather than printed
@@ -30,10 +41,18 @@ module Github
       REPORTED_STATUSES = %w[ pending complete skipped_budget ].freeze
 
       class << self
+        # @param budget [GithubApiBudget, nil] the ledger row, when the caller already holds
+        #   it. Github::Status::Snapshot passes one so /status reads the singleton exactly
+        #   once: three independent find_by calls could straddle a committing reservation
+        #   and produce one response whose poll block contradicts its ledger block. The
+        #   default keeps every existing caller reading it here, and keeps reading it with
+        #   find_by rather than through Github::BudgetLedger, because a read path must not
+        #   create the row.
         def capture(now: Time.current, configuration: Github.configuration,
-                    selector: CandidateSelector.new(configuration: configuration))
-          budget = GithubApiBudget.find_by(id: GithubApiBudget::SINGLETON_ID)
+                    selector: CandidateSelector.new(configuration: configuration),
+                    budget: GithubApiBudget.find_by(id: GithubApiBudget::SINGLETON_ID))
           guarantees = guarantees_for(budget, configuration)
+          claimable = claimable_now?(budget, selector, now: now)
 
           new(
             actor_counts: counts(GithubActor),
@@ -44,7 +63,8 @@ module Github
             enrichment_used: budget&.enrichment_used,
             enrichment_allowance: budget&.enrichment_allowance,
             window_status: budget&.window_status,
-            next_enrichment_at: next_enrichment_at(budget, selector, now: now)
+            claimable_now: claimable,
+            next_enrichment_at: next_enrichment_at(budget, selector, claimable, now: now)
           )
         end
 
@@ -72,14 +92,32 @@ module Github
         # complete row deferred by a failed refresh was invisible for the same reason; and
         # one candidate due now beside one deferred printed the deferred instant while work
         # was in fact claimable.
-        def next_enrichment_at(budget, selector, now:)
-          # A global block or a spent class outranks every per-entity instant, and is the
-          # one case where an answer exists without reading a single entity row.
-          global = [ budget&.global_blocked_until, budget&.enrichment_class_blocked_until(now: now) ].compact.max
-          return global if global&.>(now)
-          return nil if EntityType.all.any? { |type| selector.claimable?(type, now: now) }
+        def next_enrichment_at(budget, selector, claimable, now:)
+          blocked = blocked_until(budget, now: now)
+          return blocked if blocked
+          return nil if claimable
 
           EntityType.all.filter_map { |type| selector.earliest_claimable_at(type, now: now) }.min
+        end
+
+        # "A request would be issued if the runner ran right now." Both pools, and the
+        # ledger asked first: a global block or a spent class outranks every per-entity
+        # instant, and is the one case where the answer exists without reading an entity
+        # row at all.
+        def claimable_now?(budget, selector, now:)
+          return false if blocked_until(budget, now: now)
+
+          EntityType.all.any? { |type| selector.claimable?(type, now: now) }
+        end
+
+        # nil unless the instant is genuinely still ahead: BudgetLedger derives blocking
+        # from the timestamp rather than from the label precisely so an expired one cannot
+        # strand the row, and this reader has to agree with it.
+        def blocked_until(budget, now:)
+          blocked = [ budget&.global_blocked_until,
+                      budget&.enrichment_class_blocked_until(now: now) ].compact.max
+
+          blocked if blocked&.>(now)
         end
       end
 
@@ -102,7 +140,7 @@ module Github
           actor_share_used: actor_share_used, repository_share_used: repository_share_used,
           actor_guarantee: actor_guarantee, repository_guarantee: repository_guarantee,
           enrichment_used: enrichment_used, enrichment_allowance: enrichment_allowance,
-          window_status: window_status,
+          window_status: window_status, claimable_now: claimable_now,
           next_enrichment_at: Ingestion::Report.timestamp(next_enrichment_at) }.compact
       end
 
@@ -121,8 +159,14 @@ module Github
         "#{Ingestion::Report.count(used)} of #{Ingestion::Report.count(allowance)}"
       end
 
+      # Three answers, not two. A nil instant means "no deferral applies", which is true
+      # both when a candidate is claimable this second and when the backlog is empty —
+      # and an operator reads those two states completely differently. claimable_now is
+      # what tells them apart; without it this line said "due now" to a reviewer whose
+      # very next line of output was "nothing to enrich".
       def next_enrichment
-        return DUE_NOW if next_enrichment_at.nil?
+        return DUE_NOW if claimable_now
+        return NOTHING_WAITING if next_enrichment_at.nil?
 
         Ingestion::Report.timestamp(next_enrichment_at)
       end

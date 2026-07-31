@@ -145,10 +145,62 @@ RSpec.describe Github::Enrichment::Summary do
       expect(described_class.capture(now: now).to_s).to include("Actors pending/complete/skipped:", "1 / 1 / 0")
     end
 
-    it "says due now rather than printing an instant that has already passed" do
+    it "says due now when a candidate is actually claimable" do
+      create_actor(github_id: 1)
       active_budget_window(now: now)
 
       expect(described_class.capture(now: now).to_s).to include(described_class::DUE_NOW)
+    end
+
+    # The reason claimable_now exists. A nil next_enrichment_at means "no deferral
+    # applies", which is equally true of a claimable candidate and of an empty backlog —
+    # and this line used to say "due now" to a reviewer whose next line of output was
+    # "nothing to enrich".
+    it "says nothing waiting rather than due now on an empty backlog" do
+      active_budget_window(now: now)
+
+      expect(described_class.capture(now: now).to_s)
+        .to include(described_class::NOTHING_WAITING)
+    end
+  end
+
+  describe "#claimable_now" do
+    it "is false when nothing is enrichable, so a nil instant is never ambiguous" do
+      active_budget_window(now: now)
+
+      expect(described_class.capture(now: now))
+        .to have_attributes(claimable_now: false, next_enrichment_at: nil)
+    end
+
+    it "is true when a candidate could be claimed this second" do
+      create_actor(github_id: 1)
+      active_budget_window(now: now)
+
+      expect(described_class.capture(now: now))
+        .to have_attributes(claimable_now: true, next_enrichment_at: nil)
+    end
+
+    # A ledger block outranks every per-entity instant: the candidate is there, but no
+    # request may be issued for it, so it is not claimable.
+    it "is false under a global block, however many candidates are waiting" do
+      create_actor(github_id: 1)
+      active_budget_window(now: now, global_blocked_until: now + 300)
+
+      expect(described_class.capture(now: now))
+        .to have_attributes(claimable_now: false, next_enrichment_at: now + 300)
+    end
+  end
+
+  describe "the ledger row it reports on" do
+    # /status reads the singleton once and passes it down, so its poll block and its
+    # ledger block cannot straddle a committing reservation and disagree.
+    it "uses the row it was handed instead of reading its own" do
+      active_budget_window(now: now, enrichment_used: 7)
+      budget = current_budget
+      allow(GithubApiBudget).to receive(:find_by)
+
+      expect(described_class.capture(now: now, budget: budget).enrichment_used).to eq(7)
+      expect(GithubApiBudget).not_to have_received(:find_by)
     end
   end
 end
