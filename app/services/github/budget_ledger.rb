@@ -163,11 +163,12 @@ module Github
        WHERE id = ?
     SQL
 
-    def initialize(configuration: Github.configuration)
+    def initialize(configuration: Github.configuration, allocation: SourceAllocation.new(configuration: configuration))
       @configuration = configuration
+      @allocation = allocation
     end
 
-    attr_reader :configuration
+    attr_reader :configuration, :allocation
 
     # Debits one request attempt of the given class, transactionally, before the
     # request is performed.
@@ -265,7 +266,7 @@ module Github
     # the subsequent SELECT ... FOR UPDATE takes a fresh snapshot and sees the committed
     # row. Correct with no retry.
     def bootstrap!(now: Time.current)
-      derived = derived_allowances(nil)
+      derived = configured_allowances
 
       GithubApiBudget.connection.exec_insert(
         ActiveRecord::Base.sanitize_sql_array([ <<~SQL.squish,
@@ -643,9 +644,11 @@ module Github
     def apply_observation(budget, snapshot, now:)
       if budget.reset_at.nil?
         initialize_window!(budget, snapshot, now: now)
+        log_co_tenant_usage(budget, snapshot, phase: "initialized")
         :initialized
       elsif snapshot.reset_at == budget.reset_at
         apply_monotonic!(snapshot, now: now)
+        log_co_tenant_usage(budget, snapshot, phase: "updated")
         :updated
       elsif snapshot.reset_at < budget.reset_at
         # Out of order. The global serial gate makes this impossible in practice; the
@@ -668,8 +671,63 @@ module Github
         "Github::BudgetLedger InitializeWindow"
       )
 
+      log_reset_in_past(snapshot, now: now)
       Rails.logger.info(event: "budget.window_initialized",
                         **derived.to_log, **snapshot.to_log, poll_used: budget.poll_used)
+    end
+
+    # GitHub sends x-ratelimit-reset as an instant in the future, so seeing one in the past
+    # means this container's clock is ahead of GitHub's. The consequence is specific and
+    # otherwise invisible: #window_elapsed? fires on the very next reservation, the window
+    # rolls straight back to uninitialized, and enrichment — which §7 makes ineligible until
+    # a window is initialized — never gets a single request for as long as the skew lasts.
+    #
+    # Reported and not acted on. Refusing to initialize would leave enrichment exactly as
+    # starved while removing the one line that names why, and polling is unaffected either
+    # way because an uninitialized window is precisely the state §7 grants a poll in.
+    def log_reset_in_past(snapshot, now:)
+      return if snapshot.reset_at > now
+
+      Rails.logger.warn(event: "budget.window_reset_in_past",
+                        reset_at: snapshot.reset_at.utc.iso8601, observed_at: now.utc.iso8601,
+                        skew_seconds: (now - snapshot.reset_at).round)
+    end
+
+    # §7 and ADR 0004 both state the limitation this reports — "the ledger coordinates this
+    # application only. Other software behind the same public IP can consume capacity
+    # outside it" — and until now nothing in the running system evidenced it:
+    # x-ratelimit-used was parsed by Github::RateLimitSnapshot and read by no one.
+    #
+    # divergence is what GitHub counted in this window minus what this application counted.
+    # Both are window-scoped, and the debit precedes the request, so the comparison is
+    # like-for-like: anything positive is capacity someone else spent.
+    #
+    # Reported, never applied. GitHub's used carries no request class, so folding it into
+    # poll_used or enrichment_used would have to guess, and a guess breaks the invariant
+    # actor_share_used + repository_share_used == enrichment_used that the fairness split
+    # rests on. The guard that already acts on a co-tenant is `remaining <= reserve`, and it
+    # needs no attribution to work.
+    def log_co_tenant_usage(budget, snapshot, phase:)
+      return if snapshot.used.nil?
+
+      ledger_used = budget.poll_used + budget.enrichment_used
+      divergence = snapshot.used - ledger_used
+      return unless divergence.positive?
+
+      fields = { phase: phase, divergence: divergence, observed_used: snapshot.used,
+                 ledger_used: ledger_used, observed_remaining: snapshot.remaining,
+                 reserve: budget.reserve }
+
+      # DEBUG for the observation, which recurs on every reconciliation for as long as the
+      # co-tenant is there and is a per-request line by §11's placement. INFO for the one
+      # moment it becomes an operator's problem: the shared IP has taken remaining to the
+      # reserve, so :reserve_reached is about to deny every class for the rest of the window
+      # and the silence that follows needs a cause attached to it.
+      if snapshot.remaining <= budget.reserve
+        Rails.logger.info(event: "budget.co_tenant_pressure", **fields)
+      else
+        Rails.logger.debug(event: "budget.co_tenant_usage", **fields)
+      end
     end
 
     def apply_monotonic!(snapshot, now:)
@@ -687,8 +745,40 @@ module Github
     # is why rollover keeps "limit". Clamped, never raised: only boot-time validation
     # refuses a configuration, because a mid-flight header change is GitHub's business
     # and must degrade rather than crash-loop the worker.
+    #
+    # The source count comes from event_sources rather than from the environment (PR 9,
+    # ADR 0004). Reached only from #roll_window! and #initialize_window! — the two moments
+    # ADR 0004 already re-derives allowances at — so a live database read happens at most
+    # twice an hour rather than once per reservation. Github::SourceAllocation documents why
+    # the query is safe inside this transaction's row lock.
     def derived_allowances(observed_limit)
-      configuration.allowances(limit: configuration.effective_limit(observed_limit)).clamped
+      derived = configuration.allowances(limit: configuration.effective_limit(observed_limit),
+                                         live_source_count: allocation.live_source_count)
+
+      log_clamp(derived) unless derived.feasible?
+      derived.clamped
+    end
+
+    # The configuration's own arithmetic, with no database read at all. #bootstrap! runs
+    # ahead of *every* reservation, so asking event_sources here would put a second query on
+    # the hot path to write values that only matter until the first response arrives: the
+    # row it inserts is uninitialized, and #initialize_window! overwrites all three
+    # allowances from the observed count before enrichment may spend anything.
+    def configured_allowances
+      configuration.allowances.clamped
+    end
+
+    # Clamping is the runtime half of §10's startup rejection, and it has been silent since
+    # PR 4 — an operator whose enrichment allowance quietly became zero because GitHub
+    # reported a lower limit had nothing to grep for. WARN rather than INFO because the
+    # numbers now in force are not the ones the environment asks for.
+    def log_clamp(derived)
+      clamped = derived.clamped
+
+      Rails.logger.warn(event: "budget.allowances_clamped",
+                        requested_poll_allowance: derived.poll_allowance,
+                        requested_enrichment_allowance: derived.enrichment_allowance,
+                        **clamped.to_log)
     end
   end
 end

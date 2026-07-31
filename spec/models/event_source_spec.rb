@@ -137,6 +137,39 @@ RSpec.describe EventSource do
   # PR 8's recurring tick asks this once a minute. It is a pre-filter over the cached
   # projection, never the decision — Github::IngestionRunner reloads the row inside the
   # source lock and Github::PollSchedule decides there, from §9's four components.
+  # PR 9 pulled this out of .poll_due so §10's allowance formula and the poll filter are one
+  # predicate: Github::SourceAllocation counts these rows to derive ENABLED_LIVE_SOURCE_COUNT,
+  # and a source the tick would never pick up must not have poll allowance reserved for it.
+  describe ".pollable" do
+    def pollable(source_type: "github_public_events")
+      described_class.pollable(source_type: source_type)
+    end
+
+    it "ignores the schedule, which is about when rather than whether" do
+      soon = create_event_source(next_poll_at: frozen_time + 86_400)
+
+      expect(pollable).to contain_exactly(soon)
+    end
+
+    it "excludes a source belonging to another mode" do
+      create_event_source(source_type: "github_fixture_events")
+
+      expect(pollable).to be_empty
+    end
+
+    it "excludes a disabled source" do
+      create_event_source(enabled: false)
+
+      expect(pollable).to be_empty
+    end
+
+    it "excludes a source that is out of service" do
+      create_event_source(status: "failed")
+
+      expect(pollable).to be_empty
+    end
+  end
+
   describe ".poll_due" do
     def due(now: frozen_time, source_type: "github_public_events")
       described_class.poll_due(source_type: source_type, now: now)

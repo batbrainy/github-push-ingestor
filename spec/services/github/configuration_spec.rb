@@ -205,9 +205,70 @@ RSpec.describe Github::Configuration do
     end
   end
 
+  describe "#allowances" do
+    it "derives from the configured source count, which is what keeps boot database-free" do
+      expect(configuration(ENABLED_LIVE_SOURCE_COUNT: "2").allowances.poll_allowance).to eq(24)
+    end
+
+    # Github::BudgetLedger passes the count Github::SourceAllocation observed in
+    # event_sources, at window initialization and rollover only (ADR 0004).
+    it "accepts a count observed at runtime in place of the configured one" do
+      expect(configuration.allowances(live_source_count: 3).poll_allowance).to eq(36)
+    end
+  end
+
+  # The over-commitment the allowance formula cannot see: it counts one attempt per page,
+  # while §10 makes every retry and every redirect hop its own reservation.
+  describe "#worst_case_reservations_per_poll" do
+    it "multiplies the retry, redirect and page ceilings, which is what one poll can cost" do
+      expect(configuration.worst_case_reservations_per_poll).to eq(9)
+    end
+
+    it "is one request when nothing is retried, followed or paginated" do
+      expect(configuration(MAX_HTTP_RETRIES: "0", MAX_REDIRECTS: "0", MAX_PAGES_PER_POLL: "1")
+        .worst_case_reservations_per_poll).to eq(1)
+    end
+
+    it "counts every page, because a poll may fetch more than one" do
+      expect(configuration(MAX_HTTP_RETRIES: "0", MAX_REDIRECTS: "0", MAX_PAGES_PER_POLL: "3")
+        .worst_case_reservations_per_poll).to eq(3)
+    end
+
+    # A warning at boot rather than a rejection: this is a worst case a healthy endpoint
+    # never reaches, and §10 requires runtime conditions to degrade rather than crash-loop.
+    # The pinned defaults sit under the allowance, so a clean checkout says nothing.
+    it "stays inside the poll allowance at the pinned defaults" do
+      expect(configuration.worst_case_reservations_per_poll)
+        .to be <= configuration.allowances.poll_allowance
+    end
+
+    it "exceeds it once retries and redirects are raised together" do
+      raised = configuration(MAX_HTTP_RETRIES: "5", MAX_REDIRECTS: "5")
+
+      expect(raised.worst_case_reservations_per_poll).to eq(36)
+      expect(raised.worst_case_reservations_per_poll).to be > raised.allowances.poll_allowance
+    end
+
+    # It is a report, not a rule: §7 already accepts that these are request-*attempt*
+    # allowances, so an amplifying configuration must still boot.
+    it "is not a rejection, so an amplifying configuration still validates" do
+      expect { configuration(MAX_HTTP_RETRIES: "5", MAX_REDIRECTS: "5").validate! }.not_to raise_error
+    end
+  end
+
   describe "the boot-time contract" do
     it "validates the real environment, so a clean checkout boots" do
       expect { described_class.new.validate! }.not_to raise_error
+    end
+
+    # ADR 0004 fixes this property, and PR 9's runtime source count is placed in
+    # Github::SourceAllocation rather than here precisely to preserve it: `bin/rails
+    # db:prepare`, `rails runner` and CI's schema load all run validation before any table
+    # exists.
+    it "reads no database, so it is safe before the schema is loaded" do
+      expect(ActiveRecord::Base.connection).not_to receive(:exec_query)
+
+      described_class.new.validate!.allowances
     end
   end
 end

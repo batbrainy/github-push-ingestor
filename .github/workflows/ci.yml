@@ -66,6 +66,13 @@ jobs:
       - name: Run RSpec
         run: bundle exec rspec
 
+      # spec/stress opens several real PostgreSQL sessions to prove the budget ledger's row
+      # lock under contention, which breaks the single-pinned-session assumption the rest of
+      # the suite is built on. `.rspec` excludes the directory from the run above; this step
+      # is what executes it, in its own process. See spec/stress/README.md.
+      - name: Run the budget-ledger stress suite
+        run: bundle exec rspec spec/stress
+
       # The suite loads Rails through rails_helper, so it can never prove that the
       # one-shot's own boot path works: its shebang, its config/environment require, and
       # every stdlib the command depends on but the test harness happens to have loaded

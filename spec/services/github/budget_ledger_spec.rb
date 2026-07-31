@@ -533,7 +533,7 @@ RSpec.describe Github::BudgetLedger do
     # The guarantee is structural: there is no code path that gives a request back.
     it "exposes no way to credit a reservation back" do
       expect(described_class.instance_methods(false)).to contain_exactly(
-        :reserve!, :reconcile!, :bootstrap!, :block_globally!, :configuration
+        :reserve!, :reconcile!, :bootstrap!, :block_globally!, :configuration, :allocation
       )
     end
 
@@ -602,6 +602,104 @@ RSpec.describe Github::BudgetLedger do
                         now: frozen_time)
 
       expect(budget).to have_attributes(poll_allowance: 7, enrichment_allowance: 0, limit: 15)
+    end
+
+    # PR 4 clamped silently, and an operator whose enrichment allowance had become zero
+    # because GitHub reported a lower limit had nothing to grep for.
+    it "reports the clamp, because the numbers in force are no longer the configured ones" do
+      allow(Rails.logger).to receive(:warn)
+      ledger.bootstrap!(now: frozen_time)
+      ledger.reserve!(:poll, now: frozen_time)
+
+      ledger.reconcile!(snapshot("x-ratelimit-limit" => "15", "x-ratelimit-remaining" => "14"),
+                        now: frozen_time)
+
+      expect(Rails.logger).to have_received(:warn).with(
+        hash_including(event: "budget.allowances_clamped",
+                       requested_poll_allowance: 12, requested_enrichment_allowance: -5,
+                       poll_allowance: 7, enrichment_allowance: 0)
+      )
+    end
+
+    # The clamp's floor, from the ledger's side. Without it the observed limit of 4 derives
+    # poll_allowance = 0, every poll is then denied :class_allowance_exhausted, and no
+    # request can ever observe a better limit again — including the next window's, since
+    # rollover re-derives from the stored one.
+    it "keeps a poll attempt alive at a limit the reserve alone exhausts, or nothing recovers" do
+      ledger.bootstrap!(now: frozen_time)
+      ledger.reserve!(:poll, now: frozen_time)
+      ledger.reconcile!(snapshot("x-ratelimit-limit" => "4", "x-ratelimit-remaining" => "3"),
+                        now: frozen_time)
+
+      expect(budget).to have_attributes(poll_allowance: 1, enrichment_allowance: 0, limit: 4)
+    end
+
+    it "recovers the full allowance from the next window that reports a healthy limit" do
+      ledger.bootstrap!(now: frozen_time)
+      ledger.reserve!(:poll, now: frozen_time)
+      ledger.reconcile!(snapshot("x-ratelimit-limit" => "4", "x-ratelimit-remaining" => "3"),
+                        now: frozen_time)
+
+      # The window rolls, the surviving attempt polls, and its headers restore the formula.
+      later = window_reset + 1
+      ledger.reserve!(:poll, now: later)
+      ledger.reconcile!(Github::RateLimitSnapshot.from_headers(
+        { "x-ratelimit-resource" => "core", "x-ratelimit-limit" => "60",
+          "x-ratelimit-remaining" => "59", "x-ratelimit-reset" => (later + 3600).to_i.to_s },
+        observed_at: later
+      ), now: later)
+
+      expect(budget).to have_attributes(poll_allowance: 12, enrichment_allowance: 40, limit: 60)
+    end
+  end
+
+  # ADR 0004 assigned this to PR 9 by name: the allowance formula's source count comes from
+  # event_sources at runtime, while boot-time validation keeps using the environment so it
+  # stays safe to run before migrations.
+  describe "the runtime source count (plan §10, ADR 0004)" do
+    def live_sources(count)
+      count.times { create_event_source(source_type: "github_public_events") }
+    end
+
+    it "derives the poll allowance from the rows that exist when a window opens" do
+      live_sources(2)
+      ledger.bootstrap!(now: frozen_time)
+      ledger.reserve!(:poll, now: frozen_time)
+
+      ledger.reconcile!(snapshot, now: frozen_time)
+
+      expect(budget).to have_attributes(poll_allowance: 24, enrichment_allowance: 28)
+    end
+
+    it "re-derives it at rollover, so an added source takes effect within the hour" do
+      active_window
+      live_sources(2)
+
+      ledger.reserve!(:poll, now: window_reset + 1)
+
+      expect(budget).to have_attributes(poll_allowance: 24, enrichment_allowance: 28)
+    end
+
+    # #bootstrap! runs ahead of every reservation, so asking event_sources there would put a
+    # second query on the hot path to write values the first response overwrites anyway.
+    it "leaves the bootstrap row on the configured count, which the first response replaces" do
+      live_sources(2)
+
+      ledger.bootstrap!(now: frozen_time)
+
+      expect(budget).to have_attributes(poll_allowance: 12, enrichment_allowance: 40)
+    end
+
+    it "ignores a disabled or failed source, which will never spend a poll attempt" do
+      live_sources(1)
+      create_event_source(source_type: "github_public_events", enabled: false)
+      create_event_source(source_type: "github_public_events", status: "failed")
+
+      ledger.bootstrap!(now: frozen_time)
+      ledger.reserve!(:poll, now: frozen_time)
+      ledger.reconcile!(snapshot, now: frozen_time)
+
+      expect(budget).to have_attributes(poll_allowance: 12, enrichment_allowance: 40)
     end
   end
 

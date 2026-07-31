@@ -215,4 +215,34 @@ RSpec.describe GithubApiBudget do
       end
     end
   end
+
+  # One rendering of the row for §11's stream, so the budget lines cannot describe the same
+  # row with different field names than each other.
+  describe "#to_log" do
+    it "reports the whole budget state an operator reads a quiet system against" do
+      budget = create_budget(window_status: "active", limit: 60, remaining: 41, reserve: 8,
+                             reset_at: frozen_time + 3600, poll_used: 3, poll_allowance: 12,
+                             enrichment_used: 16, enrichment_allowance: 40,
+                             actor_share_used: 9, repository_share_used: 7)
+
+      expect(budget.to_log).to eq(
+        window_status: "active", resource: "core", limit: 60, remaining: 41, reserve: 8,
+        reset_at: "2026-07-29T13:00:00Z", global_blocked_until: nil,
+        poll_used: 3, poll_allowance: 12, enrichment_used: 16, enrichment_allowance: 40,
+        actor_share_used: 9, repository_share_used: 7
+      )
+    end
+
+    it "renders the instants as UTC ISO-8601, because a log stream is read across timezones" do
+      budget = create_budget(global_blocked_until: frozen_time + 60)
+
+      expect(budget.to_log[:global_blocked_until]).to eq("2026-07-29T12:01:00Z")
+    end
+
+    # Kept rather than compacted: "remaining is unknown" and "remaining was not reported"
+    # are different facts, and an uninitialized window is the first of them.
+    it "keeps an unknown value visible instead of dropping the key" do
+      expect(create_budget.to_log).to include(limit: nil, remaining: nil, reset_at: nil)
+    end
+  end
 end
