@@ -52,5 +52,29 @@ RSpec.describe Inspection::Cursor do
       expect(described_class.decode(nil)).to be_nil
       expect(described_class.decode("")).to be_nil
     end
+
+    # Well-formed but unrepresentable. Both halves reach the seek predicate as raw binds,
+    # where PostgreSQL raises rather than casts — PG::NumericValueOutOfRange one past
+    # BIGINT_MAX, and PG::DatetimeFieldOverflow one year past MAX_TIMESTAMP_YEAR — so
+    # without this a forged cursor is a 500 on input the client fully controls. Ruby is no
+    # help: Time.iso8601 parses a year in the hundreds of millions without complaint.
+    it "refuses a position the database could not compare against" do
+      [ "2026-07-29T12:00:00Z|#{Inspection::BIGINT_MAX + 1}",
+        "999999999-01-01T00:00:00Z|42",
+        "#{Inspection::MAX_TIMESTAMP_YEAR + 1}-01-01T00:00:00Z|42" ].each do |forged|
+        expect(described_class.decode(Base64.urlsafe_encode64(forged)))
+          .to be_nil, "expected #{forged.inspect} refused"
+      end
+    end
+
+    # The bounds are inclusive: the guard must refuse what the database cannot hold and
+    # nothing else.
+    it "accepts the exact edge of what the database can hold" do
+      edge = "#{Time.utc(Inspection::MAX_TIMESTAMP_YEAR).iso8601(6)}|#{Inspection::BIGINT_MAX}"
+
+      expect(described_class.decode(Base64.urlsafe_encode64(edge)))
+        .to have_attributes(id: Inspection::BIGINT_MAX,
+                            occurred_at: Time.utc(Inspection::MAX_TIMESTAMP_YEAR))
+    end
   end
 end

@@ -120,11 +120,16 @@ module Inspection
           raise(Errors::InvalidParameter.new(:cursor, "is not a cursor this endpoint issued"))
       end
 
+      # The upper bound is not belt and braces. github_actor_id and github_repository_id are
+      # signed bigints, and Active Record does *not* raise when a larger value is bound to a
+      # typed column — it casts it and the query returns normally, so an id no row could ever
+      # hold produces an empty page indistinguishable from a genuine miss. Refusing it here
+      # is the only way the client gets the documented 400 rather than a plausible lie.
       def parse_github_id(name, value)
         return nil if value.blank?
 
-        unless value.to_s.match?(DECIMAL) && value.to_i.positive?
-          raise Errors::InvalidParameter.new(name, "must be a positive GitHub id")
+        unless value.to_s.match?(DECIMAL) && value.to_i.between?(1, BIGINT_MAX)
+          raise Errors::InvalidParameter.new(name, "must be a GitHub id from 1 to #{BIGINT_MAX}")
         end
 
         value.to_i

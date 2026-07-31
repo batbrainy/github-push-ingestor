@@ -146,7 +146,7 @@ RSpec.describe Github::Status::Snapshot do
         .to include(status: "failed", enabled: true, consecutive_failures: 3)
     end
 
-    it "reports each source's own latest successful run" do
+    it "reports each source's own latest finished run" do
       first = create_event_source
       second = create_event_source(source_type: "github_fixture_events")
       IngestionRun.create!(event_source: first, started_at: now - 600, completed_at: now - 590,
@@ -160,6 +160,24 @@ RSpec.describe Github::Status::Snapshot do
                                completed_at: (now - 110).utc.iso8601)
       expect(runs.second).to be_nil
       expect(second.reload).to be_present
+    end
+
+    # §11 asks for the "last run", and the whole reason an operator opens /status is to
+    # find out why nothing is moving. Filtering to successes — §9's question, and the one
+    # StateSummary's "Latest successful run" line answers — would hide a fresh failure
+    # behind an older 200 and show a healthy last_run for a source that had just failed.
+    %w[failed deferred].each do |status|
+      it "does not hide a fresh #{status} run behind an older success" do
+        source = create_event_source
+        IngestionRun.create!(event_source: source, started_at: now - 600,
+                             completed_at: now - 590, status: "completed")
+        newest = IngestionRun.create!(event_source: source, started_at: now - 120,
+                                      completed_at: now - 110, status: status)
+
+        expect(payload[:sources].first[:last_run])
+          .to eq(run_id: newest.run_id, status: status,
+                 completed_at: (now - 110).utc.iso8601)
+      end
     end
 
     it "ignores a run still in flight, which has completed nothing to report" do

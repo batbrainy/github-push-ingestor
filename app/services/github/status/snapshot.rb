@@ -47,15 +47,28 @@ module Github
         )
       end
 
-      # One statement for every source's latest successful run, rather than one per source:
-      # DISTINCT ON collapses to the first row of each event_source_id group, and the ORDER
-      # BY is what defines "first". id DESC is the tie-break for two runs that completed in
-      # the same microsecond — without it the winner is whichever the plan happened to emit.
+      # Every source's latest *finished* run, whatever its outcome — §11 asks /status for the
+      # "last run", and the field is named last_run rather than last_successful_run because
+      # that is what it is.
       #
-      # Matches IngestionRun.latest_successful's definition of success, which includes a
-      # 304: the poll succeeded and GitHub reported nothing new.
+      # Deliberately not IngestionRun.latest_successful, which is §9's question and belongs
+      # to Github::Ingestion::StateSummary's "Latest successful run" line. Filtering to
+      # successes here would hide a fresh failed or deferred run behind an older 200 or 304,
+      # so an operator opening /status to find out why nothing is moving would be shown a
+      # healthy last_run for a source that had just failed or backed off — the one state
+      # this endpoint exists to surface. The status is in the payload, so a failed run
+      # reports itself rather than being inferred from its absence.
+      #
+      # completed_at IS NOT NULL stays: it excludes exactly the `running` status, a run
+      # still in flight that has reached no outcome to report. It is also what the ORDER BY
+      # sorts on, so a NULL would sort unpredictably against the rest.
+      #
+      # One statement for every source rather than one per source: DISTINCT ON collapses to
+      # the first row of each event_source_id group, and the ORDER BY defines "first". id
+      # DESC is the tie-break for two runs that finished in the same microsecond — without
+      # it the winner is whichever the plan happened to emit.
       def self.latest_runs
-        IngestionRun.successful.where.not(completed_at: nil)
+        IngestionRun.where.not(completed_at: nil)
                     .select("DISTINCT ON (event_source_id) event_source_id, run_id, status, completed_at")
                     .order(:event_source_id, completed_at: :desc, id: :desc)
                     .index_by(&:event_source_id)

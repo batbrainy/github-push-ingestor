@@ -164,8 +164,44 @@ RSpec.describe Inspection::PushEventPage do
 
     it "refuses a github id that is not a positive decimal" do
       expect { page(actor_id: "abc") }
-        .to raise_error(Inspection::Errors::InvalidParameter, /actor_id must be a positive/)
+        .to raise_error(Inspection::Errors::InvalidParameter, /actor_id must be a GitHub id/)
       expect { page(repository_id: "0") }.to raise_error(Inspection::Errors::InvalidParameter)
+    end
+
+    # The failure this prevents is silent, which is what makes it worth a guard rather than
+    # leaving it to the database. github_actor_id is a signed bigint, and Active Record does
+    # not raise when a larger value is bound to a typed column — it casts it and the query
+    # returns normally, so an id no row could ever hold yields an empty page a client cannot
+    # tell from a genuine miss.
+    it "refuses a github id past the bigint the column can hold" do
+      expect(page(actor_id: Inspection::BIGINT_MAX.to_s).actor_id)
+        .to eq(Inspection::BIGINT_MAX)
+
+      [ Inspection::BIGINT_MAX + 1, 10**24 ].each do |value|
+        expect { page(actor_id: value.to_s) }
+          .to raise_error(Inspection::Errors::InvalidParameter, /actor_id/)
+        expect { page(repository_id: value.to_s) }
+          .to raise_error(Inspection::Errors::InvalidParameter, /repository_id/)
+      end
+    end
+
+    # Unlike the filter above, these two reach the seek predicate as raw binds, where
+    # PostgreSQL raises rather than casts: PG::NumericValueOutOfRange for the id and
+    # PG::DatetimeFieldOverflow for the year. Either would be a 500 on input the client
+    # fully controls.
+    it "refuses a cursor the database could not compare against" do
+      [ "2026-07-29T12:00:00Z|#{Inspection::BIGINT_MAX + 1}",
+        "999999999-01-01T00:00:00Z|42" ].each do |forged|
+        expect { page(cursor: Base64.urlsafe_encode64(forged)) }
+          .to raise_error(Inspection::Errors::InvalidParameter, /cursor/),
+              "expected #{forged.inspect} refused"
+      end
+    end
+
+    it "still accepts a cursor at the exact edge of what the database can hold" do
+      edge = "#{Time.utc(Inspection::MAX_TIMESTAMP_YEAR).iso8601(6)}|#{Inspection::BIGINT_MAX}"
+
+      expect { page(cursor: Base64.urlsafe_encode64(edge)) }.not_to raise_error
     end
 
     it "refuses a cursor it did not issue" do

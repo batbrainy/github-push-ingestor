@@ -81,6 +81,26 @@ RSpec.describe "Event inspection API", type: :request do
         expect(response).to have_http_status(:bad_request)
         expect(response.parsed_body.dig("error", "parameter")).to eq("repo_id")
       end
+
+      # Asserted through HTTP as well as at the parser, because the two failure modes this
+      # replaces are exactly the ones a parser-only spec would not show: a 500 for the
+      # cursor, which PostgreSQL raises on, and a silent empty 200 for the filter, which
+      # Active Record casts rather than raising on.
+      it "answers 400 rather than 500 for an id past the bigint the column can hold" do
+        get "/api/push_events?actor_id=999999999999999999999999"
+
+        expect(response).to have_http_status(:bad_request)
+        expect(response.parsed_body.dig("error", "parameter")).to eq("actor_id")
+      end
+
+      it "answers 400 rather than 500 for a cursor the database could not compare" do
+        forged = Base64.urlsafe_encode64("999999999-01-01T00:00:00Z|42")
+
+        get "/api/push_events?cursor=#{forged}"
+
+        expect(response).to have_http_status(:bad_request)
+        expect(response.parsed_body.dig("error", "parameter")).to eq("cursor")
+      end
     end
   end
 

@@ -29,19 +29,34 @@ module Inspection
         new(occurred_at: record.occurred_at, id: record.id)
       end
 
-      # @return [Cursor, nil] nil for anything this cannot read. The caller turns that into
-      #   a 400 rather than silently restarting from the top: a paging client that corrupts
-      #   its cursor and gets page one back would loop forever without ever seeing an error.
+      # @return [Cursor, nil] nil for anything this cannot read — including anything the
+      #   *database* could not read. The caller turns that into a 400 rather than silently
+      #   restarting from the top: a paging client that corrupts its cursor and gets page one
+      #   back would loop forever without ever seeing an error.
+      #
+      #   Both halves need a range check, and neither is hypothetical, because both reach
+      #   the seek predicate as raw binds where PostgreSQL raises rather than casts. An id
+      #   past BIGINT_MAX raises PG::NumericValueOutOfRange, and Time.iso8601 will happily
+      #   parse a year in the hundreds of millions that raises PG::DatetimeFieldOverflow.
+      #   Either would surface as a 500 on input a client fully controls.
       def decode(value)
         return nil if value.blank?
 
         timestamp, id = Base64.urlsafe_decode64(value.to_s).split(SEPARATOR, 2)
         return nil unless timestamp.present? && id.to_s.match?(/\A\d+\z/)
 
-        new(occurred_at: Time.iso8601(timestamp), id: Integer(id, 10))
+        position = new(occurred_at: Time.iso8601(timestamp), id: Integer(id, 10))
+        position if representable?(position)
       rescue ArgumentError
         # Both urlsafe_decode64 and Time.iso8601 signal unreadable input this way.
         nil
+      end
+
+      private
+
+      def representable?(position)
+        position.id.between?(0, BIGINT_MAX) &&
+          position.occurred_at.year.between?(0, MAX_TIMESTAMP_YEAR)
       end
     end
 
