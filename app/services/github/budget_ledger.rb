@@ -488,9 +488,8 @@ module Github
     #
     # Emitted from the debit that *reached* the allowance, not from denial_reason. A
     # denial recurs on every attempt — under PR 8's recurring task that is a line a minute
-    # for the rest of the window, burying the stream §11 explicitly sizes. The debit that
-    # takes used to allowance happens exactly once per class per window, which is what a
-    # transition means.
+    # for the rest of the window, burying the stream §11 explicitly sizes. Only the debit
+    # that first takes used to allowance represents the class transition for that window.
     def log_class_exhausted(budget, request_class)
       used = class_used(budget, request_class)
       allowance = class_allowance(budget, request_class)
@@ -511,8 +510,8 @@ module Github
     #
     # Two edges worth naming. With a guarantee of zero the INFO never fires — the
     # post-debit share is 1 and never 0 — which is correct, because nothing transitioned:
-    # that class was borrowing from its first request. And under a sustained borrow the
-    # INFO still fires exactly once, at the guarantee, with budget.class_exhausted
+    # that class was borrowing from its first request. Under a sustained borrow, the INFO
+    # fires on the debit that first reaches the guarantee, with budget.class_exhausted
     # following later at the class cap.
     def log_share_transitions(budget, request_class, borrow:)
       return unless enrichment?(request_class)

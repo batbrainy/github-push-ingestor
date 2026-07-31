@@ -114,8 +114,8 @@ RSpec.describe "Event inspection API", type: :request do
     end
 
     # Both identifiers are numeric strings, so :id is genuinely ambiguous and only one
-    # reading can be right. github_event_id is the unique index the idempotency story rests
-    # on and the identifier §11 puts on every log line — which is what makes "log line ->
+    # reading can be right. github_event_id is the unique index that prevents a second event
+    # row and the identifier §11 puts on every log line — which is what makes "log line ->
     # record" a URL a reviewer can type.
     it "resolves :id as the GitHub event id, never as the surrogate primary key" do
       get "/api/push_events/#{event.id}"

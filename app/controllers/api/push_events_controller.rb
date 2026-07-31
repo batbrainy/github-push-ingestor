@@ -22,7 +22,7 @@ module Api
     # ambiguous — real GitHub event ids are numeric strings, so only one reading can be
     # right. §7 keeps the surrogate key out of this application's identity vocabulary
     # entirely (even the foreign keys target github_id), github_event_id is the unique index
-    # the whole idempotency story rests on, and it is the identifier §11 puts on every log
+    # that prevents a second event row, and it is the identifier §11 puts on every log
     # line — which is what makes "log line -> record" a URL a reviewer can type.
     #
     # find_by! rather than find_by plus an explicit render: ApplicationController maps

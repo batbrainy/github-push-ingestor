@@ -70,6 +70,10 @@ fi
 
 PHASE="all"
 CONFIRMED=""
+# Never inherit GITHUB_FIXTURE_SCENARIO from the caller. The baseline and every recovery
+# operation use the default corpus unless a scenario phase creates a dynamically scoped
+# override with this verifier-only variable.
+RECOVERY_FIXTURE_SCENARIO="default"
 
 for argument in "$@"; do
   case "$argument" in
@@ -145,16 +149,41 @@ fi
 # Plumbing
 # ---------------------------------------------------------------------------------------
 
+# This verifier is an offline operation even when the caller exported neither variable — or
+# exported a non-default scenario. Pinning every Compose invocation here prevents `compose up
+# -d worker` from recreating the preflighted fixture worker in live mode and makes the baseline
+# independent of the caller's shell. Preflight still inspects the environment inside the
+# already-running worker; this wrapper changes interpolation, not what `printenv` reports from
+# an existing container.
+compose() {
+  GITHUB_MODE=fixture GITHUB_FIXTURE_SCENARIO="$RECOVERY_FIXTURE_SCENARIO" docker compose "$@"
+}
+
+# If an unexpected command fails after test isolation stops the worker, the EXIT trap is the
+# last line of defence against leaving the reviewer's stack disabled. The phase also performs
+# and verifies an explicit restart on its normal path; this is only emergency cleanup.
+TEST_WORKER_RESTART_PENDING=0
+restore_test_worker_on_exit() {
+  if [ "$TEST_WORKER_RESTART_PENDING" = "1" ]; then
+    if compose start worker >/dev/null 2>&1; then
+      TEST_WORKER_RESTART_PENDING=0
+    else
+      echo "warning: could not restore the worker stopped for test isolation" >&2
+    fi
+  fi
+}
+trap restore_test_worker_on_exit EXIT
+
 # Every psql call in this file goes through one of these two functions, and both hard-code a
 # _development database name. There is deliberately no helper that takes a database
 # argument: §16 gates that the test databases are never touched by anything but the suite,
 # and the cheapest way to keep that true is to make the wrong database unspellable here.
 psql_dev() {
-  docker compose exec -T db psql -U postgres -d "$DEV_DB" -tAc "$1" | tr -d '[:space:]'
+  compose exec -T db psql -U postgres -d "$DEV_DB" -tAc "$1" | tr -d '[:space:]'
 }
 
 psql_queue_dev() {
-  docker compose exec -T db psql -U postgres -d "$DEV_QUEUE_DB" -tAc "$1" | tr -d '[:space:]'
+  compose exec -T db psql -U postgres -d "$DEV_QUEUE_DB" -tAc "$1" | tr -d '[:space:]'
 }
 
 # Exactly one id, always. `docker compose ps -q` lists running containers only, and every
@@ -163,8 +192,8 @@ psql_queue_dev() {
 # prefer the running container, fall back to the most recent stopped one.
 container_id() {
   local id
-  id="$(docker compose ps -q "$1" 2>/dev/null | head -1)"
-  [ -n "$id" ] || id="$(docker compose ps -aq "$1" 2>/dev/null | head -1)"
+  id="$(compose ps -q "$1" 2>/dev/null | head -1)"
+  [ -n "$id" ] || id="$(compose ps -aq "$1" 2>/dev/null | head -1)"
 
   printf '%s' "$id"
 }
@@ -220,6 +249,24 @@ ready() {
 
 live() {
   curl --silent --show-error --fail -o /dev/null "$LIVE_URL"
+}
+
+worker_mode() {
+  compose exec -T worker printenv GITHUB_MODE | tr -d '[:space:]'
+}
+
+worker_fixture_scenario() {
+  compose exec -T worker printenv GITHUB_FIXTURE_SCENARIO | tr -d '[:space:]'
+}
+
+verify_final_worker_mode() {
+  local mode
+
+  if mode="$(worker_mode 2>/dev/null)"; then
+    check "the worker is still in fixture mode before verifier exit" "fixture" "$mode"
+  else
+    check "the worker is still in fixture mode before verifier exit" "fixture" "unavailable"
+  fi
 }
 
 push_events() { psql_dev "SELECT COUNT(*) FROM push_events;"; }
@@ -281,6 +328,18 @@ redact() {
     -e 's#("api_url":")[^"]*#\1<redacted>#g'
 }
 
+# A redacted transcript still has to retain the command's real exit status. `set +e` lets the
+# transcript continue far enough to print a final verdict; PIPESTATUS records Compose rather
+# than sed, and each caller turns a non-zero value into a failed check immediately after the
+# closing code fence.
+LAST_COMPOSE_STATUS=0
+run_redacted_compose() {
+  set +e
+  compose "$@" 2>&1 | redact
+  LAST_COMPOSE_STATUS="${PIPESTATUS[0]}"
+  set -e
+}
+
 # ---------------------------------------------------------------------------------------
 # preflight
 # ---------------------------------------------------------------------------------------
@@ -302,12 +361,19 @@ preflight() {
   # puts third-party logins, avatar URLs embedding numeric user ids, and repository names
   # into `docker compose logs worker` — which this script then prints into a transcript
   # somebody commits.
-  local mode
-  mode="$(docker compose exec -T worker printenv GITHUB_MODE | tr -d '[:space:]')"
+  local mode scenario
+  mode="$(worker_mode)"
 
   if [ "$mode" != "fixture" ]; then
     echo "refusing: the worker is running in GITHUB_MODE=${mode:-unset}, not fixture." >&2
     echo "  restart the stack offline: GITHUB_MODE=fixture docker compose up --build -d" >&2
+    exit 2
+  fi
+
+  scenario="$(worker_fixture_scenario)"
+  if [ "$scenario" != "default" ]; then
+    echo "refusing: the worker is running GITHUB_FIXTURE_SCENARIO=${scenario:-unset}, not default." >&2
+    echo "  recreate the offline stack without an inherited fixture scenario." >&2
     exit 2
   fi
 
@@ -352,25 +418,34 @@ preflight() {
 phase_baseline() {
   heading "Baseline"
 
+  local ingest_status enrich_status
+
   echo '```'
-  GITHUB_MODE=fixture docker compose run --rm ingest 2>&1 | redact || true
+  run_redacted_compose run --rm ingest
+  ingest_status="$LAST_COMPOSE_STATUS"
   echo '```'
   echo
 
+  check "baseline fixture ingestion exited successfully" "0" "$ingest_status"
+  echo
+
   echo '```'
-  GITHUB_MODE=fixture docker compose run --rm enrich --limit 6 2>&1 | redact || true
+  run_redacted_compose run --rm enrich --limit 6
+  enrich_status="$LAST_COMPOSE_STATUS"
   echo '```'
   echo
 
-  # Expected, and worth keeping in the transcript rather than engineering around: a
-  # development database that has previously polled live GitHub holds actors and repositories
-  # whose api_urls are real. Fixture mode has no entry for them, so the cycle refuses with a
-  # corpus gap and exit 2 instead of quietly reaching api.github.com. That is §6's fail-closed
-  # rule holding in the running stack, which no unit test can show.
-  echo "A corpus gap above is not a fault. It means this development database holds entities"
-  echo "from an earlier live run, and fixture mode refused to fetch them rather than falling"
-  echo "back to the network — exit 2, \"refused to run\", per §9's exit-code contract."
+  check "baseline fixture enrichment exited successfully" "0" "$enrich_status"
   echo
+
+  if [ "$ingest_status" -ne 0 ] || [ "$enrich_status" -ne 0 ]; then
+    # A corpus gap is worth retaining in a failed transcript: it proves fixture mode refused
+    # to fall back to api.github.com. It is nevertheless a failed authoritative baseline.
+    echo "If the output above reports a corpus gap, fixture mode failed closed instead of using"
+    echo "the network. Its non-zero exit still fails this verification; rerun the authoritative"
+    echo "baseline from the documented empty fixture volume."
+    echo
+  fi
 
   if [ "$MODE" = "absolute" ]; then
     echo "The development database was empty at the start of this run, so the counts below are"
@@ -404,7 +479,7 @@ api_kill_observation() {
 
   echo "\$ docker compose ps"
   echo '```'
-  docker compose ps
+  compose ps
   echo '```'
   echo
 
@@ -433,8 +508,14 @@ api_kill_observation() {
   echo
 
   echo "\$ docker compose up -d ${service}"
-  docker compose up -d "$service" >/dev/null 2>&1
+  compose up -d "$service" >/dev/null 2>&1
   echo
+
+  if [ "$service" = "worker" ]; then
+    wait_for "the recreated worker container to be running" 60 running worker
+    check "the recreated worker remains in fixture mode" "fixture" "$(worker_mode)"
+    echo
+  fi
 }
 
 # The crash the restart policy actually exists for: SIGKILL delivered to the container's main
@@ -447,8 +528,9 @@ api_kill_observation() {
 crash_recovery_observation() {
   local service="$1" wait_description="$2" wait_timeout="$3"
   shift 3
+  CRASH_OBSERVATION_COMPLETED=0
 
-  local pid before_started before_restarts
+  local pid before_started before_restarts helper_status
   pid="$(docker inspect -f '{{.State.Pid}}' "$(container_id "$service")")"
   before_started="$(started_at "$service")"
   before_restarts="$(restart_count "$service")"
@@ -459,10 +541,21 @@ crash_recovery_observation() {
   # a helper running as that user can signal the worker and web processes (same uid) but not
   # postgres, which runs as its own user inside the db container — `kill` answers "Operation
   # not permitted" and only the database phase fails, which is a confusing way to find out.
-  if ! docker run --rm --pid=host --privileged --user 0 "$APP_IMAGE" sh -c "kill -9 ${pid}" >/dev/null 2>&1; then
+  if docker run --rm --pid=host --privileged --user 0 "$APP_IMAGE" \
+    sh -c "kill -9 ${pid}" >/dev/null 2>&1; then
+    helper_status=0
+  else
+    helper_status=$?
+  fi
+
+  check "the ${service} process-crash helper exited successfully" "0" "$helper_status"
+
+  if [ "$helper_status" -ne 0 ]; then
     echo
-    echo "The crash-kill helper exited non-zero. The observation below is still taken, but"
-    echo "treat it as inconclusive rather than as evidence the policy worked."
+    echo "The crash-kill helper exited non-zero, so no restart-policy observation is claimed."
+    echo "The failed check remains in the final verdict; later independent checks still run."
+    echo
+    return 0
   fi
   echo
 
@@ -483,6 +576,7 @@ crash_recovery_observation() {
   check "${service} was restarted by its policy after a process crash" "true" "$running"
   check "${service}'s RestartCount incremented" \
     "$((before_restarts + 1))" "$after_restarts"
+  CRASH_OBSERVATION_COMPLETED=1
   echo
   echo "Docker restarted \`${service}\` on its own. No operator step."
   echo
@@ -491,7 +585,7 @@ crash_recovery_observation() {
 phase_kill_worker() {
   heading "Worker kill (§15 step 8)"
 
-  local before
+  local before after_api after_crash
   before="$(push_events)"
   echo "Count before the kill: push_events = ${before}"
   echo
@@ -499,25 +593,40 @@ phase_kill_worker() {
   echo "### Part 1 — the command §15 documents"
   echo
   api_kill_observation worker
-  wait_for "the worker container to be running again" 60 running worker
+
+  after_api="$(push_events)"
+  echo "Count after API-stop recovery: push_events = ${after_api}"
+  check "push_events is unchanged across the worker API stop and operator recovery" \
+    "$before" "$after_api"
+  echo
 
   echo "### Part 2 — a process crash, which is what the policy is for"
   echo
   crash_recovery_observation worker "the worker container to be running again" 60 running worker
 
-  echo "\$ docker compose logs worker --since 2m"
-  echo '```'
-  docker compose logs worker --since 2m --no-log-prefix 2>/dev/null | tail -20 | redact
-  echo '```'
+  after_crash="$(push_events)"
+  if [ "$CRASH_OBSERVATION_COMPLETED" = "1" ]; then
+    echo "Count after process-crash recovery: push_events = ${after_crash}"
+    check "push_events is unchanged across the worker process crash and policy recovery" \
+      "$after_api" "$after_crash"
+    check "the policy-restarted worker remains in fixture mode" "fixture" "$(worker_mode)"
+  else
+    echo "Count after the failed process-crash attempt: push_events = ${after_crash}"
+    check "push_events is unchanged during the failed worker process-crash attempt" \
+      "$after_api" "$after_crash"
+  fi
   echo
 
-  echo "Count after recovery: push_events = $(push_events)"
+  echo "\$ docker compose logs worker --since 2m"
+  echo '```'
+  compose logs worker --since 2m --no-log-prefix 2>/dev/null | tail -20 | redact
+  echo '```'
 }
 
 phase_kill_db() {
   heading "Database kill (§15 step 8)"
 
-  local before
+  local before after_api after_crash
   before="$(push_events)"
   echo "Count before the kill: push_events = ${before}"
   echo
@@ -528,24 +637,45 @@ phase_kill_db() {
   wait_for "the database to report healthy again" 180 db_healthy
   wait_for "/health/ready to return 200 once the database is back" 180 ready
 
+  after_api="$(push_events)"
+  echo "Count after API-stop recovery: push_events = ${after_api}"
+  check "push_events is unchanged across the database API stop and operator recovery" \
+    "$before" "$after_api"
+  echo
+
   echo "### Part 2 — a process crash, which is what the policy is for"
   echo
   crash_recovery_observation db "the database to report healthy again" 180 db_healthy
-  wait_for "/health/ready to return 200 once the database is back" 180 ready
+  if [ "$CRASH_OBSERVATION_COMPLETED" = "1" ]; then
+    wait_for "/health/ready to return 200 once the database is back" 180 ready
+  fi
 
-  local after
-  after="$(push_events)"
-  echo "Count after recovery: push_events = ${after}"
+  after_crash="$(push_events)"
+  if [ "$CRASH_OBSERVATION_COMPLETED" = "1" ]; then
+    echo "Count after process-crash recovery: push_events = ${after_crash}"
+    check "push_events is unchanged across the database process crash and policy recovery" \
+      "$after_api" "$after_crash"
+  else
+    echo "Count after the failed process-crash attempt: push_events = ${after_crash}"
+    check "push_events is unchanged during the failed database process-crash attempt" \
+      "$after_api" "$after_crash"
+  fi
   echo
-
-  check "push_events is unchanged across two SIGKILLs of the database" "$before" "$after"
-  echo
-  echo "PostgreSQL replayed its WAL onto the same named volume, which is §15 step 8's actual"
-  echo "question."
+  if [ "$CRASH_OBSERVATION_COMPLETED" = "1" ]; then
+    echo "PostgreSQL replayed its WAL onto the same named volume, which is §15 step 8's actual"
+    echo "question."
+  else
+    echo "The crash helper failed, so this run makes no WAL-replay or automatic-restart claim."
+  fi
 }
 
 phase_kill_web() {
   heading "Web kill (beyond §15's list — verifies the Dockerfile's pid-file claim)"
+
+  local before after_api after_crash
+  before="$(push_events)"
+  echo "Count before the kill: push_events = ${before}"
+  echo
 
   echo "§16's durability gate names db, web and worker; §15 step 8 kills only two. The"
   echo "Dockerfile runs puma directly rather than \`bin/rails server\` so that a stale"
@@ -558,12 +688,34 @@ phase_kill_web() {
   api_kill_observation web
   wait_for "/health/ready to return 200 again" 180 ready
 
+  after_api="$(push_events)"
+  echo "Count after API-stop recovery: push_events = ${after_api}"
+  check "push_events is unchanged across the web API stop and operator recovery" \
+    "$before" "$after_api"
+  echo
+
   echo "### Part 2 — a process crash, which is what the policy is for"
   echo
   crash_recovery_observation web "/health/ready to return 200 from the restarted container" 180 ready
 
-  echo "\`/health/live\` and \`/health/ready\` both answer again after an uncooperative kill, so no"
-  echo "pid file survived to block the restart."
+  after_crash="$(push_events)"
+  if [ "$CRASH_OBSERVATION_COMPLETED" = "1" ]; then
+    echo "Count after process-crash recovery: push_events = ${after_crash}"
+    check "push_events is unchanged across the web process crash and policy recovery" \
+      "$after_api" "$after_crash"
+  else
+    echo "Count after the failed process-crash attempt: push_events = ${after_crash}"
+    check "push_events is unchanged during the failed web process-crash attempt" \
+      "$after_api" "$after_crash"
+  fi
+  echo
+
+  if [ "$CRASH_OBSERVATION_COMPLETED" = "1" ]; then
+    echo "\`/health/live\` and \`/health/ready\` both answer again after an uncooperative kill, so no"
+    echo "pid file survived to block the restart."
+  else
+    echo "The crash helper failed, so this run makes no web process-crash recovery claim."
+  fi
 }
 
 phase_restart() {
@@ -575,7 +727,7 @@ phase_restart() {
   echo "\$ docker compose restart"
   started="$(date +%s)"
   echo '```'
-  docker compose restart
+  compose restart
   echo '```'
   elapsed=$(( $(date +%s) - started ))
   echo
@@ -586,11 +738,20 @@ phase_restart() {
 
   wait_for "/health/ready to return 200 after the restart" 120 ready
 
-  echo "push_events before: ${before}, after: $(push_events)"
+  local after
+  after="$(push_events)"
+  echo "push_events before: ${before}, after: ${after}"
+  echo
+  check "push_events is unchanged across a normal Compose restart" "$before" "$after"
+  check "the normally restarted worker remains in fixture mode" "fixture" "$(worker_mode)"
 }
 
 phase_test_isolation() {
   heading "Test isolation (§16's reviewer-experience gate)"
+
+  local stop_status test_status worker_start_status
+  local before_primary before_queue before_setup after_primary after_queue after_setup
+  local before_primary_status before_queue_status after_primary_status after_queue_status
 
   echo "§16 requires that \`docker compose run --rm test\` never touches the development"
   echo "databases (app or queue) and never triggers the development \`setup\` service."
@@ -605,27 +766,78 @@ phase_test_isolation() {
   # 56 -> 62 and still printed that the gate held. Stopping the worker removes the only other
   # writer, so a difference here can mean nothing except the suite.
   echo "\$ docker compose stop worker    # the only other writer to these databases"
-  docker compose stop worker >/dev/null 2>&1
+  if compose stop worker >/dev/null 2>&1; then
+    stop_status=0
+  else
+    stop_status=$?
+  fi
+  check "the worker stopped for the test-isolation measurement" "0" "$stop_status"
+
+  if [ "$stop_status" -ne 0 ]; then
+    echo
+    echo "The worker could not be stopped, so the isolation measurement is skipped rather"
+    echo "than producing counts with a concurrent writer. The final verdict remains failed."
+    return 0
+  fi
+
+  TEST_WORKER_RESTART_PENDING=1
   sleep 3
   echo
 
-  local before_primary before_queue before_setup
-  before_primary="$(push_events)"
-  before_queue="$(queue_jobs)"
+  if before_primary="$(push_events)"; then
+    before_primary_status=0
+  else
+    before_primary_status=$?
+    before_primary="unavailable"
+  fi
+
+  if before_queue="$(queue_jobs)"; then
+    before_queue_status=0
+  else
+    before_queue_status=$?
+    before_queue="unavailable"
+  fi
+
   before_setup="$(docker inspect -f '{{.State.FinishedAt}}' "$(container_id setup)" 2>/dev/null || echo "absent")"
 
   echo '```'
-  docker compose run --rm test 2>&1 | tail -8
+  run_redacted_compose run --rm test
+  test_status="$LAST_COMPOSE_STATUS"
   echo '```'
   echo
 
-  local after_primary after_queue after_setup
-  after_primary="$(push_events)"
-  after_queue="$(queue_jobs)"
+  if after_primary="$(push_events)"; then
+    after_primary_status=0
+  else
+    after_primary_status=$?
+    after_primary="unavailable"
+  fi
+
+  if after_queue="$(queue_jobs)"; then
+    after_queue_status=0
+  else
+    after_queue_status=$?
+    after_queue="unavailable"
+  fi
+
   after_setup="$(docker inspect -f '{{.State.FinishedAt}}' "$(container_id setup)" 2>/dev/null || echo "absent")"
 
   echo "\$ docker compose start worker"
-  docker compose start worker >/dev/null 2>&1
+  if compose start worker >/dev/null 2>&1 && \
+    wait_for "the worker stopped for test isolation to be running again" 60 running worker; then
+    worker_start_status=0
+    TEST_WORKER_RESTART_PENDING=0
+  else
+    worker_start_status=$?
+  fi
+  echo
+
+  check "the test service exited successfully" "0" "$test_status"
+  check "the worker restarted after the test-isolation measurement" "0" "$worker_start_status"
+  check "push_events could be measured before the suite" "0" "$before_primary_status"
+  check "the development queue could be measured before the suite" "0" "$before_queue_status"
+  check "push_events could be measured after the suite" "0" "$after_primary_status"
+  check "the development queue could be measured after the suite" "0" "$after_queue_status"
   echo
 
   echo "| observable | before | after |"
@@ -661,7 +873,7 @@ phase_scenarios() {
   # matching id, which RepositoryDocument.parse checks), and the worker is stopped for the
   # duration so nothing else can move last_seen_at underneath the selection.
   echo "\$ docker compose stop worker    # so nothing re-orders the candidate set mid-scenario"
-  docker compose stop worker >/dev/null 2>&1
+  compose stop worker >/dev/null 2>&1
   sleep 3
   echo
 
@@ -671,7 +883,7 @@ phase_scenarios() {
     "an off-host redirect is refused by the URL policy"
 
   echo "\$ docker compose start worker"
-  docker compose start worker >/dev/null 2>&1
+  compose start worker >/dev/null 2>&1
   echo
 
   count_header
@@ -681,6 +893,8 @@ phase_scenarios() {
 # One redirect scenario, end to end, with a verdict rather than a hope.
 redirect_scenario() {
   local scenario="$1" expected_status="$2" description="$3"
+  local RECOVERY_FIXTURE_SCENARIO="$scenario"
+  local enrich_status
 
   echo "### ${scenario} — ${description}"
   echo
@@ -706,9 +920,12 @@ redirect_scenario() {
   fi
 
   echo '```'
-  GITHUB_MODE=fixture GITHUB_FIXTURE_SCENARIO="$scenario" \
-    docker compose run --rm enrich --limit 1 --class repository 2>&1 | redact || true
+  run_redacted_compose run --rm enrich --limit 1 --class repository
+  enrich_status="$LAST_COMPOSE_STATUS"
   echo '```'
+  echo
+
+  check "${scenario} fixture enrichment exited successfully" "0" "$enrich_status"
   echo
 
   local actual
@@ -721,13 +938,20 @@ redirect_scenario() {
 phase_rate_limit() {
   heading "Rate-limit scenario (opt-in)"
 
+  local RECOVERY_FIXTURE_SCENARIO="rate_limited"
+  local ingest_status
+
   echo "\`rate_limited\` writes a real one-hour \`global_blocked_until\`. It is never part of the"
   echo "default run, because every later phase would report a deferral. Cleanup runs immediately."
   echo
 
   echo '```'
-  GITHUB_MODE=fixture GITHUB_FIXTURE_SCENARIO=rate_limited docker compose run --rm ingest || true
+  run_redacted_compose run --rm ingest
+  ingest_status="$LAST_COMPOSE_STATUS"
   echo '```'
+  echo
+
+  check "rate-limit fixture ingestion exited successfully" "0" "$ingest_status"
   echo
 
   echo "Budget row after the scenario:"
@@ -793,7 +1017,7 @@ Verification date:  $(date -u +%Y-%m-%d)
 Compose project:    ${PROJECT}
 Git revision:       $(git rev-parse HEAD 2>/dev/null || echo "unknown")
 Docker version:     $(docker version -f '{{.Server.Version}}')
-Compose version:    $(docker compose version --short)
+Compose version:    $(compose version --short)
 Host:               $(uname -srm)
 Worker mode:        fixture (enforced by preflight)
 Count mode:         ${MODE}
@@ -829,6 +1053,8 @@ case "$PHASE" in
     exit 2
     ;;
 esac
+
+verify_final_worker_mode
 
 heading "Verdict"
 

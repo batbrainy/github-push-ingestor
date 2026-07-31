@@ -27,8 +27,8 @@ class PushEvent < ApplicationRecord
             format: { with: SHA_FORMAT,
                       message: "must be 40 or 64 hexadecimal characters" }
 
-  # The idempotent insert the whole durability story rests on (§7, §8). Returns the
-  # new row's id, or nil when the event was already persisted — and the caller uses
+  # The duplicate-event insert gate the accepted-row guarantee rests on (§7, §8). Returns
+  # the new row's id, or nil when the event was already persisted — and the caller uses
   # exactly that distinction to decide whether entity activity may be updated, so a
   # re-polled window cannot resurrect skipped entities.
   #

@@ -12,7 +12,7 @@
 # uncoordinated Active Job ladder would re-poll a source whose backoff was just written and
 # spend the hourly allowance twice on the same failure. The 60-second recurring tick is the
 # retry — an escaped exception is a defect, so it fails the execution, job.failed says why,
-# and the next tick starts from committed state.
+# and a later successful scheduled tick starts from committed state.
 #
 # No discard_on ActiveJob::DeserializationError either: no job here takes a record argument.
 class ApplicationJob < ActiveJob::Base

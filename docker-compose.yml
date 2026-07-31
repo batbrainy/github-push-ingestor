@@ -133,10 +133,9 @@ services:
   # stop_grace_period pairs with SolidQueue.shutdown_timeout (20s, set in
   # config/application.rb from §2A's pinned HTTP timeouts): 20s for an in-flight
   # attempt that already holds the request gate, and 10s of margin for the
-  # supervisor to reap its children. A job still *waiting* for the gate has
-  # reserved nothing and is safe to kill — §8's at-least-once execution with
-  # idempotent writes is what makes that true, and both advisory locks die with
-  # the session.
+  # supervisor to reap its children. A job still *waiting* for the gate has not
+  # reserved budget, so terminating it cannot leak a debit; a redelivery re-enters
+  # the normal selector, and both advisory locks die with the session.
   #
   # No healthcheck. Nothing depends on this service, `unless-stopped` already
   # covers process death, and the only probe that could tell a hung worker from

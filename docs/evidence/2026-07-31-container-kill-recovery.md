@@ -2,7 +2,17 @@
 
 Date: 2026-07-31
 
-Status: First-party observation
+Status: Historical first-party observation; superseded for submission gating
+
+> [!CAUTION]
+> **Erratum — do not use the green verdict in this file as the submission gate.** The script
+> revision that produced the raw transcript suppressed non-zero fixture ingestion and
+> enrichment exits with `|| true`, printed `push_events` counts without asserting equality
+> after every recovery, and did not carry `GITHUB_MODE=fixture` into every Compose
+> recreation. A recreated worker could therefore default to live mode and spend GitHub
+> budget. The transcript is preserved verbatim below as a historical observation. Re-run the
+> corrected script against the final default-branch SHA and record that result in the
+> external findings report.
 
 ## Why this verification exists
 
@@ -99,29 +109,37 @@ application image declares a non-root user which cannot signal postgres.
   outcome for *that* repository rather than a property of the selection policy. The policy
   itself is asserted in `spec/services/github/enrichment/redirect_boundary_spec.rb`.
 
-## Every check in this run
+## Every check reported by this historical run
 
-The script records a verdict per check and exits non-zero if any failed, so a committed
-transcript and a green exit code cannot disagree. This run: **19 checks, all passing.** The
-per-check list is in the transcript below, under each phase.
+This run reported **19 checks, all passing**. That is what the preserved transcript says, not
+a current submission verdict: the erratum above identifies failures that were outside those
+19 checks or whose exit statuses were suppressed.
 
 ## Reproducing it
 
 ```bash
 GITHUB_MODE=fixture docker compose up --build -d
-script/verify_recovery.sh --confirm
+GITHUB_MODE=fixture script/verify_recovery.sh --confirm
+docker compose exec worker printenv GITHUB_MODE   # must print fixture
 ```
 
-The script refuses to run under `CI`, without `--confirm`, against a stack whose worker is not
-in fixture mode, with `RAILS_ENV` set to anything but `development`, or when the container
-names do not match the literals §15 uses. It never runs `docker compose down`, never drops a
-database, and never issues psql against a `_test` database.
+The corrected script refuses to run under `CI`, without `--confirm`, against a stack whose
+worker is not in fixture mode, with `RAILS_ENV` set to anything but `development`, or when the
+container names do not match the literals §15 uses. It passes fixture mode to every internal
+Compose invocation, checks every fixture command's status, asserts `push_events` equality,
+and verifies the recreated worker is still offline. It never runs `docker compose down`,
+never drops a database, and never issues psql against a `_test` database.
+
+The two kill paths remain intentionally distinct. `docker kill` asks the Docker API to stop a
+container, so it is a negative control and `restart: unless-stopped` leaves the container
+down. The host-PID-namespace kill terminates the main process without recording an operator
+stop; that process-crash path must restart automatically.
 
 Nothing in the suite, in `config/ci.rb`, in `bin/ci` or in the workflows executes it —
 `spec/docker_compose_spec.rb` asserts that, so "CI never runs the verification" is a red test
 rather than a promise.
 
-## Raw transcript
+## Raw historical transcript — preserved verbatim
 
 Captured by `script/verify_recovery.sh` on the date above. `login`, `display_login`,
 `full_name`, `api_url`, `avatar_url` and the corpus-miss payload are redacted in place — names

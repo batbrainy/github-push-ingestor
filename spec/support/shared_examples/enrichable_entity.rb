@@ -191,7 +191,7 @@ RSpec.shared_examples "an enrichable entity" do
       expect(record.reload).to have_attributes(enrichment_status: "pending", skipped_at: nil)
     end
 
-    # §7 line 572: "A complete enrichment is not reset to pending by any duplicate."
+    # §7 line 572: "An entity in the complete state is not reset to pending by a duplicate."
     it "leaves every other status alone, so no enriched or terminally failed row is disturbed" do
       (Enrichable::ENRICHMENT_STATUSES - [ "skipped_budget" ]).each do |status|
         described_class.where(id: record.id).update_all(enrichment_status: status)

@@ -372,7 +372,7 @@ RSpec.describe Github::BudgetLedger do
       end
     end
 
-    it "rolls the window exactly once, however the move is detected" do
+    it "emits one window-roll transition when the response advances the window" do
       active_window
       ledger.reserve!(:poll, now: window_reset - 1)
 

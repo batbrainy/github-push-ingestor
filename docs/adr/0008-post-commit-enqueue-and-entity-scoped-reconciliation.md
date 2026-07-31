@@ -38,17 +38,19 @@ So an enqueue cannot mean "enrich this actor". It can only mean "there may be ac
    row of the run has committed, the run row is finalized, and the source advisory lock is
    gone.
 
-3. **`ReconcilePendingEnrichmentsJob` runs every 60 seconds and is the recovery
+3. **`ReconcilePendingEnrichmentsJob` is scheduled every 60 seconds and is the recovery
    mechanism.** It asks the same object the same question, from committed state alone. Work
-   whose enqueue was lost — to a kill, to a queue-database failure, to a discarded job —
-   is rediscovered on the next tick, within a minute, with no operator step and no cleanup
-   job.
+   whose enqueue was lost — to a crash, to a queue-database failure, to a discarded job —
+   is eligible for rediscovery on a later successful scheduled tick, with no cleanup job.
+   The schedule is nominal; queueing, worker downtime, or database unavailability can delay
+   execution.
 
 4. **At most one job per class per dispatch**, whatever the backlog depth.
 
 5. **No `retry_on` on any job.** The durable retry ladders already exist and are
    coordinated with the ledger: `Github::Ingestion::PollState` for a source,
-   `Github::Enrichment::EntityState` for an entity. The 60-second tick is the retry.
+   `Github::Enrichment::EntityState` for an entity. A later successful scheduled tick
+   initiates eligible retry work.
 
 ## Consequences
 
@@ -67,8 +69,8 @@ Positive:
 
 Negative, and accepted:
 
-- Enrichment latency after a lost enqueue is up to 60 seconds. That is the cadence's
-  cost, and it is far inside the 30s–6h latency of the feed being sampled.
+- Recovery after a lost enqueue is not immediate. The 60-second schedule sets the nominal
+  opportunity; queueing and service outages can extend the delay.
 - A dispatch that finds work still only *schedules* one cycle per class, so a large backlog
   drains at the reconciler's cadence rather than in a burst. `bin/enrich --limit N` remains
   the operator's handle when a burst is wanted.
@@ -91,10 +93,10 @@ precede the commit it is supposed to follow.
 
 **Solid Queue concurrency limits keyed by source id** (§9's third multi-poller bullet).
 Rejected for PR 8 with a reason, not deferred silently: a `limits_concurrency` semaphore has
-a fixed `duration`, so a container killed mid-poll would suppress that source until the
+a fixed `duration`, so a process crash mid-poll would suppress that source until the
 semaphore expired. The session advisory lock this system already holds is released by
 PostgreSQL the instant the backend dies. Adopting a weaker, crash-unsafe duplicate of an
-existing lock — in the PR whose subject is surviving container kills — would be a
+existing lock — in the PR whose subject is surviving process crashes — would be a
 regression. The source lock, the global request gate and the unique event constraint are
 the protections in force; revisit when PR 11's multi-poller tests can measure a gap.
 
@@ -138,6 +140,6 @@ each held a database connection. Deferred to PR 9, which owns multi-source alloc
 - ADR 0002 — advisory locks and the request gate (the crash-safety property this decision
   leans on)
 - ADR 0004 — the class-aware budget ledger (what bounds enrichment throughput)
-- ADR 0005 — at-least-once execution with idempotent writes (why a duplicate delivery is
-  safe)
+- ADR 0005 — repeated execution with duplicate-safe event writes (the narrow event-row and
+  skipped-reactivation guarantees under redelivery)
 - ADR 0007 — enrichment fairness shares and borrowing (why a job cannot carry an entity id)

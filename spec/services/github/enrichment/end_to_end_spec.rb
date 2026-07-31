@@ -36,14 +36,14 @@ RSpec.describe "enrichment end to end", type: :integration do
       expect(GithubRepository.count).to eq(3)
     end
 
-    it "enriches every actor the corpus can resolve" do
+    it "enriches both resolvable actors in the finite fixture corpus" do
       expect(GithubActor.find_by(github_id: 583_231))
         .to have_attributes(enrichment_status: "complete", name: "The Octocat", fetched_at: now)
       expect(GithubActor.find_by(github_id: 1_024_025))
         .to have_attributes(enrichment_status: "complete", name: "Mona Lisa Octocat")
     end
 
-    it "enriches every repository with §7's four enrichment-owned columns" do
+    it "writes §7's enrichment-owned columns for the fixture's resolved repository" do
       expect(GithubRepository.find_by(github_id: 1_296_269)).to have_attributes(
         enrichment_status: "complete", description: "My first repository on GitHub!",
         language: "Ruby", owner_github_id: 583_231

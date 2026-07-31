@@ -12,7 +12,7 @@
 #
 # Configuration is memoised per process and cleared by config/initializers/github.rb
 # on every reload, so a development edit takes effect without a restart while a
-# production process reads the environment exactly once.
+# production process retains its first environment-derived configuration.
 module Github
   class << self
     def configuration

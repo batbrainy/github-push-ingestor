@@ -67,7 +67,7 @@ RSpec.describe Github::BudgetLedger, "under concurrency" do
       expect(budget.poll_used).to eq(8)
     end
 
-    it "counts every granted reservation exactly once, with no lost debits" do
+    it "records one debit per granted reservation, with no lost debits" do
       active_window(poll_allowance: 30)
 
       outcomes = reserve_all(30, :poll)
@@ -150,7 +150,7 @@ RSpec.describe Github::BudgetLedger, "under concurrency" do
     # second caller arriving mid-roll must either wait for it or find it already done. The
     # failure this rules out is two rollovers — which would zero a counter that had already
     # been debited in the new window.
-    it "rolls exactly once, and every reservation lands in the new window" do
+    it "performs one rollover before every reservation lands in the new window" do
       active_window(poll_allowance: 12, reset_at: now - 1, poll_used: 12)
 
       outcomes = reserve_all(12, :poll)

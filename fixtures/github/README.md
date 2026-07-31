@@ -12,8 +12,8 @@ One corpus serves three consumers, which is what §12 requires:
 3. `GITHUB_MODE=fixture` at runtime, for the reviewer's offline scenario.
 
 It lives at the repository root rather than under `spec/`, because in fixture mode it is
-runtime data read by the `web` and `worker` containers. Excluding `spec/` from the image
-is a normal future hardening step and must not be able to break the demo.
+runtime data read by the `web` and `worker` containers. Keeping runtime fixtures separate
+also means an image that excludes test files cannot break the offline demo.
 
 ## Layout
 
@@ -109,8 +109,8 @@ commands.
 
 ## What is in `bodies/events/page-1.json`
 
-Eight event envelopes, deliberately mixed so PR 5's tolerant parser and quarantine
-taxonomy have real material:
+Eight event envelopes, deliberately mixed so the tolerant parser and quarantine taxonomy
+have real material:
 
 | Entry | Event id | Shape |
 |---|---|---|
@@ -129,5 +129,9 @@ absorption across pages is exercisable.
 The `PushEvent` payloads carry exactly the five fields the post-2025-10-07 API documents —
 `repository_id`, `push_id`, `ref`, `head`, `before` — and no `commits` array.
 
-**What each of those becomes once processed is PR 5's to define and assert.** This file
-describes the corpus, not outcomes that no code produces yet.
+The shipped processor outcomes are asserted in
+`spec/services/github/ingestion_runner_spec.rb`: four event rows, one ignored non-push
+event, and three quarantined envelopes with the classifications described above. Entity
+enrichment outcomes are asserted in
+`spec/services/github/enrichment/end_to_end_spec.rb`. This file remains the corpus contract;
+the specs are the executable outcome contract.
