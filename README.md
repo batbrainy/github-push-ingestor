@@ -113,13 +113,18 @@ Run the test suite (isolated `*_test` databases; never touches the
 development databases):
 
 ```bash
-docker compose run --rm test
+docker compose run --rm --build test
 ```
 
 That runs `rspec` twice: the suite, and then [`spec/stress`](spec/stress/) — the threaded
 budget-ledger stress specs, which open several real PostgreSQL sessions and therefore need
 their own process ([`spec/stress/README.md`](spec/stress/README.md) explains why). CI runs
 the same two steps.
+
+**`--build` is not optional if you have edited anything.** The application code is baked
+into the image rather than bind-mounted, so `docker compose run --rm test` against a stale
+image silently tests the code the image was built from — green, and meaningless. On an
+unmodified checkout the flag costs a cached no-op.
 
 Rails, Active Job and application logs are one structured JSON stream;
 PostgreSQL and Puma startup output remain their own plain-text formats:
@@ -275,7 +280,9 @@ scenarios are in the [fixture scenario matrix](#fixture-scenario-matrix).
 docker compose run --rm test
 ```
 
-Two `rspec` invocations against isolated `*_test` databases, the same two CI runs.
+Two `rspec` invocations against isolated `*_test` databases, the same two CI runs. On an
+unmodified checkout that is the whole story; **if you have edited anything, add `--build`**
+— the code is baked into the image, not mounted.
 
 If something looks wrong, [Troubleshooting and reset](#troubleshooting-and-reset) has a
 symptom table and a three-level reset ladder.

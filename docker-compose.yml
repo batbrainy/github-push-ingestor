@@ -78,6 +78,20 @@ services:
   # One-shot: prepares BOTH the primary and queue databases declared in
   # config/database.yml, so web and worker never race concurrent db:prepare
   # runs.
+  #
+  # It is also the ONE service on the `up` path that declares a build, and that is
+  # load-bearing rather than tidiness. Compose Bake (the Docker Desktop default) turns
+  # every service with a `build:` into its own bake target, and targets that export the
+  # same `image:` tag race each other: a cold `docker compose up --build` died with
+  # `failed to solve: image "github-push-ingestor-app:latest": already exists` and started
+  # zero containers. It only reproduced on a machine where the image did not already
+  # exist — which is exactly a reviewer's first command, and no other run.
+  #
+  # `web` and `worker` therefore reference the tag and never build it. Both wait on
+  # `setup: service_completed_successfully`, and Compose finishes the build phase before
+  # the create phase, so the image is always present by the time they are created.
+  # The one-shots under the `tools` profile keep their own `build:` because each is
+  # invoked alone by `docker compose run`, which is a single target and cannot collide.
   setup:
     build: .
     image: github-push-ingestor-app
@@ -89,7 +103,7 @@ services:
         condition: service_healthy
 
   web:
-    build: .
+    # No `build:` — see the note on `setup`. Built by `setup`, which this waits on.
     image: github-push-ingestor-app
     restart: unless-stopped
     # Puma directly (no `bin/rails server` pid file) so `unless-stopped`
@@ -129,7 +143,7 @@ services:
   # a busy one would have to boot Rails on every interval; Solid Queue's own
   # heartbeats in solid_queue_processes are the durable evidence instead.
   worker:
-    build: .
+    # No `build:` — see the note on `setup`. Built by `setup`, which this waits on.
     image: github-push-ingestor-app
     restart: unless-stopped
     command: ["bin/jobs"]
@@ -161,6 +175,10 @@ services:
   ingest:
     build: .
     image: github-push-ingestor-app
+    # pull_policy: build — this tag is local-only and never published, so Compose
+    # attempting a registry pull first is a guaranteed-failing round trip that
+    # prints "pull access denied" before falling back to the build.
+    pull_policy: build
     profiles: ["tools"]
     restart: "no"
     entrypoint: ["bin/ingest"]
@@ -184,6 +202,10 @@ services:
   enrich:
     build: .
     image: github-push-ingestor-app
+    # pull_policy: build — this tag is local-only and never published, so Compose
+    # attempting a registry pull first is a guaranteed-failing round trip that
+    # prints "pull access denied" before falling back to the build.
+    pull_policy: build
     profiles: ["tools"]
     restart: "no"
     entrypoint: ["bin/enrich"]
@@ -207,6 +229,10 @@ services:
   test:
     build: .
     image: github-push-ingestor-app
+    # pull_policy: build — this tag is local-only and never published, so Compose
+    # attempting a registry pull first is a guaranteed-failing round trip that
+    # prints "pull access denied" before falling back to the build.
+    pull_policy: build
     profiles: ["tools"]
     restart: "no"
     command: ["bash", "-c", "bin/rails db:test:prepare && bundle exec rspec && bundle exec rspec spec/stress"]

@@ -31,9 +31,16 @@ RSpec.describe "Health endpoints", type: :request do
       expect(write_statements { get "/health/live" }).to be_empty
     end
 
-    it "does not create the ledger row or provision an event source" do
-      expect { get "/health/ready" }.to not_change(GithubApiBudget, :count).from(0)
-        .and not_change(EventSource, :count).from(0)
+    # Github::BudgetLedger#bootstrap! is public and inserts even when it inserts nothing,
+    # so a readiness probe that reached for the ledger would create from a health path the
+    # very row a reservation owns. Its mirror: reaching for SourceProvisioner to decide
+    # whether there is anything to be ready *for* would provision a source from a GET.
+    it "does not create the ledger row it would report on" do
+      expect { get "/health/ready" }.not_to change(GithubApiBudget, :count).from(0)
+    end
+
+    it "does not provision an event source" do
+      expect { get "/health/ready" }.not_to change(EventSource, :count).from(0)
     end
   end
 
