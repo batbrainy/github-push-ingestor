@@ -752,9 +752,7 @@ effectively-once persisted outcomes — never exactly-once execution.
 | Section | Lands with |
 |---|---|
 | Data model reference | PR 12 (design brief) |
-| Full fixture scenario matrix (retries, rate limits, redirects) | PR 11 |
 | API and database inspection examples | PR 10, 12 |
-| Crash-recovery verification (container kills) | PR 11, 12 |
 | Known limitations (sampling-based enrichment, no complete-capture guarantee, shared-IP budget) | PR 12 |
 
 ## Reviewer commands
@@ -769,6 +767,7 @@ docker compose run --rm enrich --limit 6              # available now — up to 
 GITHUB_MODE=fixture docker compose up --build         # available now — the whole system, no network
 GITHUB_MODE=fixture docker compose run --rm ingest    # available now — deterministic, no network
 GITHUB_MODE=fixture docker compose run --rm enrich --limit 6
+script/verify_recovery.sh --confirm                   # §15 step 8's container kills; nothing in CI runs it
 ```
 
 The queue is a database, so it is inspectable with the same tool as everything else:
@@ -793,8 +792,64 @@ docker compose start worker
 docker compose logs -f worker    # enrichment.dispatched, then enrichment.completed
 ```
 
-Container-kill verification against the restart policies is `IMPLEMENTATION_PLAN.md`
-§15's reviewer step and lands with PR 11; nothing above claims it.
+## Crash recovery, verified
+
+`IMPLEMENTATION_PLAN.md` §15 step 8 asks a reviewer to kill containers and watch them come
+back. Run it with one command, against a stack started in fixture mode:
+
+```bash
+GITHUB_MODE=fixture docker compose up --build -d
+script/verify_recovery.sh --confirm
+```
+
+A dated transcript of that run is committed at
+[`docs/evidence/2026-07-31-container-kill-recovery.md`](docs/evidence/2026-07-31-container-kill-recovery.md).
+Nothing in CI runs the script — it kills containers and writes to the development databases,
+and `spec/docker_compose_spec.rb` asserts that no workflow references it.
+
+**Read §15's command knowing what it does.** `docker kill` is an API stop: the daemon records
+the container as manually stopped, and `restart: unless-stopped` is defined to skip exactly
+that case. So the documented command leaves the container down, and
+
+```bash
+docker kill github-push-ingestor-worker-1
+docker compose ps          # Exited (137) — and it stays that way
+docker compose up -d worker
+```
+
+is the honest sequence. The restart policy is sound; it is the *kill* that does not exercise
+it. A crash — the container's main process dying rather than being stopped through the API —
+does, and every service recovered on its own with no operator step. The script performs both
+and reports both.
+
+One reading tip for §15 step 8's `docker compose ps` output: `web`'s container healthcheck
+curls `/health/live`, which never touches the database, so `web` stays green throughout a `db`
+kill. `/health/ready` is the observable that flips.
+
+### Fixture scenario matrix
+
+Every scenario resolves inside [`fixtures/github/`](fixtures/github/) with no network at all.
+Each poll obeys GitHub's `X-Poll-Interval` floor of 60s, which `--force` deliberately does not
+bypass, so allow a minute between successive ingestion scenarios.
+
+| Scenario | Command | What it shows | Cleanup |
+|---|---|---|---|
+| `default` | `GITHUB_MODE=fixture docker compose run --rm ingest` | 4 push events, 3 actors, 3 repositories, 3 quarantined | none |
+| `default` (replay) | `… run --rm ingest --force` after 60s | `duplicates_skipped > 0`, occurrence counts climb, no skipped entity reactivated | none |
+| `default` (enrich) | `… run --rm enrich --limit 6` | both classes enrich within their fairness shares | none |
+| `paginated` | `GITHUB_FIXTURE_SCENARIO=paginated MAX_PAGES_PER_POLL=3 … ingest` | `Link`-driven walk over 3 pages | none |
+| `paginated_final_page` | `GITHUB_FIXTURE_SCENARIO=paginated_final_page … ingest` | the walk stops when no `next` link exists | none |
+| `transient_failure` | `GITHUB_FIXTURE_SCENARIO=transient_failure … ingest` | one `500`, then success on retry | none |
+| `transient_failure_exhausted` | `GITHUB_FIXTURE_SCENARIO=transient_failure_exhausted … ingest` | retries exhausted; the source backs off | source backoff |
+| `redirecting_repository` | `GITHUB_FIXTURE_SCENARIO=redirecting_repository … enrich --class repository` | a renamed repository followed across one validated hop, debited twice | none |
+| `hostile_redirect` | `GITHUB_FIXTURE_SCENARIO=hostile_redirect … enrich --class repository` | an off-host `Location` refused by the URL policy; the second hop is never sent and the event source stays in service | none |
+| `secondary_rate_limited` | `GITHUB_FIXTURE_SCENARIO=secondary_rate_limited … ingest` | a secondary limit blocks globally | global block |
+| `rate_limited` | `GITHUB_FIXTURE_SCENARIO=rate_limited … ingest` | primary exhaustion → `global_blocked_until` | **a real one-hour global block** |
+
+The last two leave durable state behind on purpose — that is the behaviour being demonstrated.
+`script/verify_recovery.sh --phase=cleanup` runs the SQL under
+[Recovering from a fixture rate-limit run](#recovering-from-a-fixture-rate-limit-run), and
+`--phase=rate-limit` plays the rate-limit scenario and cleans up immediately after.
 
 ## Development
 
