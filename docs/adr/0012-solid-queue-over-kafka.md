@@ -17,8 +17,9 @@ The arithmetic:
 - The source is **one polled HTTP endpoint** under an unauthenticated ceiling of 60
   requests per hour per IP. At the default cadence the system issues twelve poll requests
   an hour and reads at most ~100 events per page.
-- Peak sustained ingest is therefore on the order of **a few hundred events an hour**,
-  bounded by upstream quota rather than by anything downstream.
+- At the default one-page cap, the arithmetic upper bound is roughly **1,200 event
+  envelopes an hour** before filtering, still bounded by upstream quota rather than by
+  anything downstream.
 - Enrichment is bounded by the same 60-request ceiling — around 40 requests an hour after
   the poll allowance and reserve, which §10 states plainly is a *sample* of demand rather
   than coverage of it.
@@ -38,17 +39,18 @@ Three reasons, in order of weight:
    durability boundary is the committed `push_events` row (ADR 0005), and pending
    enrichment work is not a message — it is the state of a committed entity row
    (`enrichment_status`, `next_retry_at`). `ReconcilePendingEnrichmentsJob` rebuilds the
-   work list from those rows every 60 seconds, which is why ADR 0008 can call the enqueue
-   a *hint*. Delete every queued job and the system loses nothing: the next tick
-   re-derives the same work. A broker would be a second, weaker copy of a record
-   PostgreSQL already holds under constraints.
-2. **One database is one backup, one restore, one transaction boundary.** The queue lives
-   beside the business tables in the same PostgreSQL instance, so a `pg_dump` captures
-   both consistently, `docker compose exec db psql` inspects the queue with the same tool
-   as everything else, and `enqueue_after_transaction_commit` gives a real ordering
-   guarantee between a committed event and the job that reacts to it. With a broker,
-   "committed but not enqueued" and "enqueued but not committed" both become states
-   someone has to reason about.
+   work list from those rows on a nominal 60-second schedule, which is why ADR 0008 can call
+   the enqueue a *hint*. Removing queued enrichment hints does not erase eligible pending
+   entity state; a later successful reconciler tick can derive class-scoped work again.
+   This does not claim that arbitrary queue history or operational state is reconstructible.
+2. **One PostgreSQL service and toolchain, with an explicit two-database boundary.** The
+   queue and business databases share one server and are inspected with the same SQL tools,
+   but they remain separate backup/restore units: `pg_dump` targets one database and cannot
+   create a transactionally consistent snapshot across both. Likewise,
+   `enqueue_after_transaction_commit` orders enqueue after the business commit but cannot
+   make the two writes atomic. The resulting "committed but not enqueued" gap is accepted
+   and recovered from committed entity state by ADR 0008; "enqueued before commit" is
+   avoided by the post-commit hook.
 3. **A component a reviewer has to run is a component that has to earn its place.**
    `IMPLEMENTATION_PLAN.md` §17 states the target: small enough to understand, complete
    enough to trust. Kafka adds a broker, a coordination layer, its own durability
@@ -68,8 +70,8 @@ What this buys:
 - Queue state is inspectable with SQL, which is what makes the crash-recovery drill in the
   README runnable by hand — truncate `solid_queue_jobs`, restart the worker, and watch
   reconciliation rebuild the work from committed rows.
-- The job system inherits PostgreSQL's durability rather than having its own. There is one
-  answer to "what survives a crash", not two.
+- The job system uses the same PostgreSQL operational toolchain. Business durability remains
+  in the business database, while queue state has its own database and recovery semantics.
 
 What it costs, stated plainly:
 

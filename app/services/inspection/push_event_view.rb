@@ -3,8 +3,8 @@ module Inspection
   #
   # A module of functions rather than a method on PushEvent, following the convention this
   # codebase already holds twenty times over: there are twenty #to_log methods and not one
-  # of them lives on a model. A model owns its columns, its constraints and its idempotent
-  # write; how a row is shaped for a reader belongs to the reader — and there are two
+  # of them lives on a model. A model owns its columns, constraints, and duplicate-event
+  # insert gate; how a row is shaped for a reader belongs to the reader — and there are two
   # readers here whose answers deliberately differ, so a single #to_api would need a mode
   # flag on the model.
   #

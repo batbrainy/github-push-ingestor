@@ -76,9 +76,9 @@ module GithubPushIngestor
     # long for in-flight work and no longer. docker-compose.yml pairs it with
     # stop_grace_period: 30s, leaving margin for the supervisor to reap its children.
     #
-    # A job still *waiting* for the gate has reserved nothing and is safe to kill: §8's
-    # at-least-once execution with idempotent writes is what makes that true, and both
-    # advisory locks die with the session.
+    # A job still *waiting* for the gate has not reserved budget, so terminating it cannot
+    # leak a debit. A redelivery re-enters the normal selector, and both advisory locks die
+    # with the session.
     config.solid_queue.shutdown_timeout = 20.seconds
   end
 end

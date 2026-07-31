@@ -48,8 +48,8 @@ module Github
   # jobs being class-scoped: the runner chooses the entity by fairness, so N enqueues carry
   # no more information than one, and §8's property that matters — the enqueue happens after
   # the rows are durable — is stronger here, where every commit of the run is behind us.
-  # Losing the dispatch to a crash loses nothing: ReconcilePendingEnrichmentsJob sweeps the
-  # same committed state every 60 seconds.
+  # If a crash loses this dispatch hint, the committed pending entity state remains.
+  # ReconcilePendingEnrichmentsJob can rediscover eligible work on a later successful tick.
   class IngestionRunner
     MONOTONIC = -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) }
 

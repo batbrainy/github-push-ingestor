@@ -376,8 +376,8 @@ RSpec.describe Github::IngestionRunner do
   end
 
   # §10 makes every retry its own reservation "through the same gate and ledger", so the
-  # ledger is where the retries are visible — and the page must be processed exactly once.
-  it "processes a page recovered by retries exactly once" do
+  # ledger exposes all three attempts while only the recovered response reaches processing.
+  it "processes the recovered response after two failed request attempts" do
     result = ingest(fixture_runner(transport: fixture_transport(scenario: "transient_failure")))
 
     expect(result).to be_completed

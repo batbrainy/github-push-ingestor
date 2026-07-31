@@ -53,11 +53,15 @@ acquire `SourceLock` — they take only the request gate.
 
 ### Processing semantics (plan §8)
 
-At-least-once execution + idempotent writes + unique constraints =
-effectively-once persisted outcomes. Never claim or code against exactly-once
-execution.
+Repeated observation and job execution are expected. State only the two proved ingestion
+invariants: a duplicate GitHub event ID cannot create another `push_events` row, and that
+duplicate cannot register entity activity or reactivate a `skipped_budget` entity.
+Executions, ingestion runs, quarantine occurrence counts, budget debits, and logs may
+repeat or change. Recovery before commit is conditional on the event remaining in a later
+sliding-feed response. Never claim or code against exactly-once execution or universal
+idempotency of persisted state.
 
-### Idempotency invariants (plan §7)
+### Duplicate-event invariants (plan §7)
 
 - `push_events` inserts use `ON CONFLICT (github_event_id) DO NOTHING RETURNING id`.
 - Entity activity fields (`last_seen_at`, `latest_event_at`, reactivation) update
@@ -75,7 +79,7 @@ Fixture mode fails closed — never a live fallback.
 ## Database changes
 
 Schema changes go through migrations with intentional indexes, constraints where
-correctness depends on them, and tests for uniqueness/idempotency (plan §7, §12).
+correctness depends on them, and tests for uniqueness and replay behavior (plan §7, §12).
 
 ## Testing rules (plan §12)
 

@@ -3,10 +3,9 @@
 # seconds.
 #
 # **This is the crash-recovery mechanism, and its input is committed entity state.** The
-# post-commit enqueue in Github::IngestionRunner is a hint; a process killed between the
-# COMMIT and the enqueue, a worker that was down for an hour, a job that failed permanently
-# — all of them lose the hint, and none of them lose the work, because the entity rows still
-# say `pending` and the partial index that answers that predicate has existed since PR 3.
+# post-commit enqueue in Github::IngestionRunner is a hint. If a crash loses that hint while
+# the entity row remains eligible and `pending`, a later successful scheduled tick can find
+# it through the partial index that has answered that predicate since PR 3.
 #
 # **Entity-scoped, structurally.** It reads github_actors, github_repositories and one
 # github_api_budget row through Github::Enrichment::Dispatch, and never push_events. §8's

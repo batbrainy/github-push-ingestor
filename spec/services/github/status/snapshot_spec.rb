@@ -192,7 +192,7 @@ RSpec.describe Github::Status::Snapshot do
     # The reason this is one aggregate rather than StateSummary and Summary side by side.
     # Three independent reads could straddle a committing reservation and produce a body
     # whose poll block contradicts its ledger block.
-    it "reads the ledger row exactly once" do
+    it "performs one ledger-row read for a snapshot" do
       active_budget_window(now: now)
       allow(GithubApiBudget).to receive(:find_by).and_call_original
 

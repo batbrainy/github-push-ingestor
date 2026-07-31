@@ -12,7 +12,7 @@ The implementation will prioritize:
 
 - Correctness and durability
 - Clear separation of responsibilities
-- Idempotent and restart-safe processing
+- Duplicate-safe accepted-event persistence and explicit restart recovery
 - Predictable GitHub API usage driven by an **explicit, formula-derived, class-aware request budget**
 - Simple local operation through Docker Compose
 - Observable system behavior
@@ -33,7 +33,7 @@ The delivered implementation will satisfy the required public-events source whil
 - Raw event payload retention (semantic retention via `jsonb` — see Section 7)
 - Structured push-event fields
 - Actor and repository enrichment (**budget-bounded, best-effort sampling with per-class fairness** — see Section 10)
-- Idempotent ingestion
+- Duplicate-safe `push_events` persistence
 - Pagination via the `Link` response header
 - ETag and `304 Not Modified` handling (bandwidth/correctness measure, scoped to the canonical first-page request — see Sections 9–10)
 - `X-Poll-Interval` support (treated as a server-imposed floor, never the cadence)
@@ -175,7 +175,7 @@ Child issues:
 5. Implement `PushEvent` filtering and tolerant normalization
 6. Add one-shot ingestion command with defined contention semantics (Section 9)
 7. Add recurring polling via Solid Queue recurring task
-8. Add idempotency and restart safety
+8. Add duplicate-safe event persistence and restart recovery
 
 ### Story 2 — Persist Raw and Structured Data
 
@@ -237,19 +237,19 @@ Child issues:
 9. Implement enrichment fairness shares (floor/remainder rounding) with eligibility-aware borrowing
 10. Implement the per-window budget bootstrap (first real poll initializes each window)
 
-### Extension B — Idempotency and Restart Safety
+### Extension B — Duplicate-safe Event Persistence and Restart Safety
 
 Child issues:
 
 1. Add unique GitHub event constraint
-2. Add idempotent event persistence (`ON CONFLICT DO NOTHING RETURNING id`)
-3. Add idempotent actor and repository upserts (`ON CONFLICT DO UPDATE` with merge rules; activity updates only for newly inserted events)
+2. Add conflict-safe event persistence (`ON CONFLICT DO NOTHING RETURNING id`)
+3. Add merge-rule actor and repository upserts (`ON CONFLICT DO UPDATE`; activity updates only for newly inserted events)
 4. Use PostgreSQL-backed jobs (Solid Queue)
 5. Preserve pending work in business tables
 6. Reconcile work not enqueued before a crash
 7. Add crash-safe source ownership (session advisory lock; verify release on session death)
 8. Bound the enrichment backlog via the eligibility window and `skipped_budget` state (no unbounded growth)
-9. Add Docker restart policies; test crash-window scenarios including container kills
+9. Add Docker restart policies; test API-stop and main-process-crash paths separately
 10. Document processing guarantees
 
 ### Extension C — Object Storage
@@ -606,7 +606,7 @@ A GitHub event is considered accepted only after its `push_events` row is commit
 4. Filter `PushEvent` entries; route valid non-push events to counters.
 5. Normalize required attributes tolerantly; route failures to `quarantined_events`.
 6. Upsert stub actor and repository rows (identity fields only).
-7. Insert raw and structured records idempotently (`RETURNING id`).
+7. Insert the raw and structured event row with conflict skipping (`RETURNING id`).
 8. For rows actually inserted: apply entity activity updates and reactivation (Section 7).
 9. Commit the PostgreSQL transaction (short-lived — the advisory lock, not the transaction, spans the HTTP work).
 10. Enqueue enrichment after commit — Solid Queue lives in its own database, so same-transaction enqueue is not available; the committed entity state is the durable record of pending work (outbox-style recovery, per Section 2A).
@@ -617,7 +617,9 @@ A GitHub event is considered accepted only after its `push_events` row is commit
 
 #### Crash before commit
 
-The transaction rolls back; the session advisory lock releases with the dead session. The event may appear again in an overlapping GitHub poll.
+The transaction rolls back; the session advisory lock releases with the dead session. The
+event is recoverable only if it remains present in a later response from GitHub's sliding
+feed. If the window advances past it first, this service does not recover it.
 
 #### Crash after commit
 
@@ -629,27 +631,25 @@ The job is retried.
 
 #### Worker crash after enrichment commit but before acknowledgement
 
-The job may execute again. Idempotent upserts produce the same durable outcome.
+The job may execute again. Selector leases, freshness checks, and constrained upserts
+prevent duplicate entity rows, but execution and operational side effects may repeat.
 
 ### Processing semantics
 
-The system provides:
-
-```text
-At-least-once execution
-+
-Idempotent writes
-+
-Unique constraints
-=
-Effectively-once persisted outcomes
-```
-
-The system does not claim exactly-once execution.
+Repeated observation and job delivery are expected. The system enforces two narrower
+invariants: a duplicate GitHub event ID cannot create another `push_events` row, and that
+duplicate cannot register entity activity or reactivate a `skipped_budget` entity. A
+duplicate may refresh permitted identity fields. Executions, `ingestion_runs`, quarantine
+occurrence counts, budget debits, and logs may repeat or change. The system does not claim
+exactly-once execution or universal idempotency of persisted state.
 
 ### Docker persistence
 
-PostgreSQL will use a named Docker volume. Normal container stop, restart, crash, recreation, or `docker compose down` must not remove stored events. An explicit volume deletion is treated as an intentional destructive reset. Restart policies (Section 2A) make crash recovery automatic; Section 15 verifies it with actual container kills.
+PostgreSQL will use a named Docker volume. Normal container stop, restart, crash,
+recreation, or `docker compose down` must not remove stored events. An explicit volume
+deletion is treated as an intentional destructive reset. Restart policies (Section 2A)
+recover main-process crashes automatically; a daemon API stop such as `docker kill` leaves
+the container down until an operator recreates it. Section 15 verifies both paths.
 
 ## 9. Polling, Pagination, and Concurrency
 
@@ -995,7 +995,7 @@ Testing focuses on correctness boundaries rather than exhaustive framework behav
 - Worker failure before completion
 - Advisory locks released on session death (simulated connection kill)
 - Multiple pollers attempt the same source
-- Container kill + Docker restart-policy recovery (manual reviewer steps — Section 15)
+- Daemon API-stop semantics plus host-PID-namespace process-crash recovery (manual reviewer script — Section 15)
 
 ### End-to-end verification
 
@@ -1018,7 +1018,7 @@ Rails 8.1 API-only app on Ruby 3.4.10; PostgreSQL; Dockerfile; Docker Compose pe
 `Github::SourceLock` (namespaced session advisory lock, polling-only) and `Github::RequestGate` with the lock-order invariant; **`Github::BudgetLedger` core: transactional reservation, allowance formula, startup validation, per-window bootstrap**; live + fixture transports; public + fixture event sources; protocol headers; `Github::UrlPolicy`; timeout/retry defaults; basic response classification; fixture corpus
 
 ### PR 5 — Push-event ingestion
-Processor registry; tolerant `PushEvent` processor; quarantine taxonomy + canonical fingerprints; stub entity upserts with envelope mappings and distinct-event activity gating (`RETURNING id`); raw + structured persistence; idempotent insert/upsert semantics; one-shot ingestion command with contention contract and state summary; ingestion run summaries and persisted/duplicate/quarantined logging
+Processor registry; tolerant `PushEvent` processor; quarantine taxonomy + canonical fingerprints; stub entity upserts with envelope mappings and distinct-event activity gating (`RETURNING id`); raw + structured persistence; conflict-safe event insertion and explicit entity merge rules; one-shot ingestion command with contention contract and state summary; ingestion run summaries and persisted/duplicate/quarantined logging
 
 ### PR 6 — Poll budget and scheduling
 Poll-attempt allowance enforcement; `Link`-header pagination with budget-bounded stops (no known-event stop, ETag scoped to page 1); corrected `304` debit; `effective_poll_time` with independent components; `global_blocked_until` vs derived class blocking; secondary-limit global handling; `Retry-After` handling; persisted poll state; **committed dated live-probe transcript for the 304 finding (required validation gate)**
@@ -1073,7 +1073,7 @@ Must include:
 - Expected time before records appear — grounded in GitHub’s documented 30s–6h event latency plus the 5-minute default poll cadence, and the 30-day retention window
 - Fixture-based deterministic verification with exact expected counts
 - Rate-limit behavior: the allowance formula, the budget table, global-vs-class blocking, and per-window bootstrap
-- Crash-recovery verification steps (container kills — Section 15)
+- Separate API-stop and main-process-crash verification steps (Section 15)
 - Reset instructions
 - Known limitations (sampling-based enrichment coverage; no guaranteed complete capture; shared-IP budget interference)
 
@@ -1096,11 +1096,11 @@ Keep within one to two pages — the brief is the reviewer’s primary architect
 - Durability boundary
 - **The request-budget formula and table, and the unauthenticated `304` finding** — worded precisely: the endpoint documentation contains a general statement that `304` responses do not affect the rate limit, while the REST best-practices documentation limits that exemption to correctly authorized requests; dated unauthenticated probes showed `x-ratelimit-used` increasing across a `304`; this implementation therefore budgets unauthenticated conditional requests as one request
 - **Enrichment as bounded best-effort sampling with per-class fairness; eligibility windows, `skipped_budget`, and distinct-event reactivation as the answer to unbounded growth**
-- Idempotency and restart safety (advisory-lock ownership; outbox-style recovery; Docker restart policies)
+- Duplicate-safe event persistence and restart recovery (advisory-lock ownership; outbox-style recovery; Docker restart policies)
 - Enrichment strategy and the SSRF boundary
 - Tradeoffs and assumptions (including `jsonb` semantic retention)
 - Intentional omissions (Extension C; authentication; complete capture)
-- Future scaling path (authenticated token → 5,000 req/hr changes the enrichment story entirely; API-version upgrade to `2026-03-10` after payload re-verification)
+- Future scaling path (a larger authenticated allowance could materially increase feasible coverage without guaranteeing capture or enrichment; API-version upgrade to `2026-03-10` after payload re-verification)
 
 ### Plan history
 
@@ -1112,7 +1112,7 @@ Short ADRs for:
 
 - Solid Queue + post-commit enqueue with durable work-state reconciliation (outbox-style recovery; separate queue database; `enqueue_after_transaction_commit`)
 - Session advisory locks for source ownership and the global request gate (vs `FOR UPDATE` row claims; lock-order invariant)
-- At-least-once processing with idempotent writes
+- Repeated execution with duplicate-safe event writes and distinct-event activity gating
 - Event-source adapter and transport seams, each with a shipped fixture implementation
 - Class-aware budget ledger, allowance formula, global-vs-class blocking, and the enrichment fairness/sampling policy
 - `jsonb` semantic retention (not byte-exact)
@@ -1130,22 +1130,20 @@ The README must provide exact steps to:
 5. Query persisted push events.
 6. Inspect PostgreSQL record counts.
 7. Run the fixture replay scenario and confirm `duplicates_skipped > 0` in the summary — and that no skipped entity was reactivated by the replay. (Live re-runs are not relied upon to demonstrate dedup: probe-dated observations showed little or no overlap between consecutive live polls.)
-8. **Verify crash recovery with actual container kills:**
+8. **Verify operator-stop semantics and restart-policy crash recovery as separate paths:**
 
 ```bash
-# Record existing state
-docker compose exec db psql -U postgres -d github_push_ingestor_development \
-  -c "SELECT COUNT(*) FROM push_events;"
-
-# Simulate worker failure; confirm Docker restarts it and pending work resumes
-docker kill github-push-ingestor-worker-1
-docker compose ps
-docker compose logs worker --since 2m
-
-# Simulate database failure; confirm restart and that the count is unchanged
-docker kill github-push-ingestor-db-1
-docker compose ps
+GITHUB_MODE=fixture docker compose up --build -d
+GITHUB_MODE=fixture script/verify_recovery.sh --confirm
 ```
+
+The script exercises `db`, `web`, and `worker` twice each. Its `docker kill` path proves
+that a daemon API stop leaves an `unless-stopped` container down, records the unchanged
+`push_events` count, and performs the required operator recreation. Its process-crash path
+uses a privileged helper in the host PID namespace to signal the container's main process;
+that path must increment `RestartCount`, recover without an operator step, preserve the
+event count, and retain fixture mode in the recreated worker. Neither result may be used as
+evidence for the other.
 
 9. Restart containers normally (`docker compose restart`) and confirm existing records remain.
 10. Run the full deterministic fixture scenario and compare against the documented expected counts.
@@ -1160,7 +1158,7 @@ docker compose ps
 - Required fields are structured, typed, and `NOT NULL`; unknown payload fields tolerated; 40- and 64-char SHAs accepted
 - Raw payload is retained (semantic retention, documented)
 - **Both actor and repository enrichment demonstrably occur** within their fairness guarantees
-- Duplicate ingestion is safe — and duplicate replays never reactivate skipped entities
+- Duplicate event IDs cannot create another `push_events` row, and duplicate replays never reactivate skipped entities
 - `Link`-header pagination is handled; every fetched page fully processed
 - Rate-limit behavior is demonstrated: `304` quota accounting, class-aware ledger enforcement, global-vs-class blocking, per-window bootstrap, scheduling rules
 - Malformed data is quarantined durably per the taxonomy (canonical fingerprints, occurrence-counted) and does not terminate the batch
@@ -1168,12 +1166,13 @@ docker compose ps
 ### Durability
 
 - PostgreSQL uses a named volume
-- Docker restart policies recover crashed `db`/`web`/`worker` containers automatically (verified by container kills)
+- Docker restart policies recover main-process crashes in `db`/`web`/`worker` automatically (verified by the script's host-PID-namespace crash path)
+- A daemon API stop leaves an `unless-stopped` container down until operator recreation (verified independently by the script's `docker kill` path)
 - Application restart preserves events
 - Worker restart preserves pending work
-- An event committed before a crash remains recoverable
+- An event row committed before a crash remains stored
 - Advisory locks provably release on session death (tested)
-- Duplicate jobs do not duplicate durable data
+- The covered enrichment redelivery cannot create another entity row
 - Reconciliation recovers missing enrichment scheduling
 - The enrichment backlog is bounded (eligibility window + `skipped_budget` + distinct-event reactivation)
 
@@ -1296,7 +1295,7 @@ A fourth review round validated the external facts (GitHub, Rails, Ruby, Solid Q
 | 1 | **Source lock separated from the request executor**: polling path takes `SourceLock` then the gate; enrichment takes only the gate; lock-order invariant stated; advisory keys namespaced `(SOURCE_LOCK, id)` / `(REQUEST_GATE, 1)` | Enrichment requests belong to no event source — routing them through a source lock was wrong; unnamespaced keys risk collisions | Sections 2A, 5, 8, 10 |
 | 2 | **Global vs class blocking split**: `global_blocked_until` stores only truly global conditions (primary exhaustion, reserve reached, secondary limits); class blocking derived from counters (`poll_used >= poll_allowance ? reset_at : nil`); separate `effective_enrichment_time`; **secondary limits block globally** (they can arise on enrichment requests, which have no source row) | One timestamp could not defer “only that class”: enrichment exhaustion would have stopped polling and vice versa — a direct contradiction in the C-round text | Sections 7, 9, 10 |
 | 3 | **Bootstrap = the first real poll of every window**, not an extra discovery request: window lifecycle (`uninitialized → active → globally_blocked`), counters reset per window, enrichment ineligible until initialized from authoritative headers | An extra quota-discovery request wastes budget; per-window (not just fresh-install) matters because IP co-tenants may spend immediately after each reset | Sections 7, 10 |
-| 4 | **Docker restart policies added** (`unless-stopped` for `db`/`web`/`worker`, `stop_grace_period: 30s` on worker, `no` for one-shots) plus container-kill verification steps in Section 15 | Docker’s default restart policy is `no` — the durability story silently assumed restarts that would never happen | Sections 2A, 8, 15, 16 |
+| 4 | **Docker restart policies added** (`unless-stopped` for `db`/`web`/`worker`, `stop_grace_period: 30s` on worker, `no` for one-shots), with the recovery runbook later corrected by Appendix E's API-stop/process-crash distinction | Docker’s default restart policy is `no` — the durability story silently assumed restarts that would never happen | Sections 2A, 8, 15, 16 |
 | 5 | **Entity activity gated on distinct events**: `last_seen_at`/`latest_event_at`/reactivation update only when `INSERT … RETURNING id` produces a row; duplicate replays may refresh identity fields but never reactivate | “Every observed event updates `last_seen_at`” let a replayed duplicate resurrect a `skipped_budget` entity with no new activity | Sections 5, 7, 8, 12 |
 | 6 | **SHA columns widened to `varchar(64)`** accepting 40- or 64-char hex | Git object names are 40 hex (SHA-1) or 64 hex (SHA-256); hard-coding 40 contradicted the tolerant-parser goal | Section 7 |
 | 7 | **Quarantine identity made unambiguous**: `payload_fingerprint` is the sole unique key (`github_event_id` indexed, not unique); one canonicalization definition (SHA-256 of compact UTF-8 JSON with recursively sorted keys) | Dual unique keys left an unhandled conflict path (same event ID, different malformed payload); “or equivalently normalized `jsonb`” specified two algorithms | Section 7 |
@@ -1304,14 +1303,21 @@ A fourth review round validated the external facts (GitHub, Rails, Ruby, Solid Q
 
 ## Appendix E — Execution summary (2026-07-31)
 
-**The plan body above is unchanged.** Sections 1–17 and Appendices A–D are exactly as frozen on 2026-07-29. This appendix records how the build diverged from that plan and why, as Section 14 requires at completion.
+Sections 1–17 and Appendices A–D preserve the frozen architecture from 2026-07-29. A
+2026-07-31 hardening amendment narrows Section 8's guarantee wording and pre-commit recovery
+claim without changing behavior or architecture. This appendix records that clarification
+and the implementation deltas required by Section 14.
 
-The plan held. Every P0 story and extension shipped, no descope rung was used, and the architecture — the executor chain, the lock-order invariant, the class-aware ledger, at-least-once with idempotent writes — is what was frozen. What follows is the delta, and most of it is the plan meeting a fact it could not have known in advance.
+The plan held. Every P0 story and extension shipped, no descope rung was used, and the
+executor chain, lock-order invariant, class-aware ledger, event uniqueness constraint, and
+distinct-event activity gate are what was frozen. What follows is the delta, and most of it
+is the plan meeting a fact it could not have known in advance.
 
 | What the plan said | What was built | Why | Record |
 |---|---|---|---|
+| Section 8 used a broad persisted-outcome equivalence and implied every uncommitted event would return on the next poll | The documented guarantee is limited to one `push_events` row per GitHub event ID and no activity/reactivation from duplicate observations; pre-commit recovery depends on the event remaining in a later sliding-feed response | Quarantine counters, run summaries, budget debits, executions, and logs may repeat, while the upstream window can advance past an uncommitted event. The old shorthand overstated both persistence and source-delivery guarantees; this is a wording correction, not an architecture change | ADR 0005; Section 8 amendment |
 | Section 16 gates on “plain `docker compose up --build` starts exactly `db`, `setup`, `web`, `worker`” | `web` and `worker` no longer declare a `build:`; `setup` builds the shared image and they wait on it, while the `tools` one-shots keep their own build plus `pull_policy: build` | **The clean-checkout verification found the gate was false.** Compose Bake — on by default in Docker Desktop — makes every service with a `build:` its own bake target, and targets exporting the same `image:` tag race. From a cold image the reviewer's first command failed with `image "github-push-ingestor-app:latest": already exists` and started **zero** containers. It reproduces only when the image is absent, so every prior run on a warm machine passed. This is the defect the deliverable exists to catch | `docker-compose.yml`, `spec/docker_compose_spec.rb` |
-| Section 15 step 8 verifies restart policies with `docker kill` | `script/verify_recovery.sh` performs **both** the documented `docker kill` and a real in-container process crash, and reports both outcomes separately | `docker kill` is an API stop, and `restart: unless-stopped` is *defined* to skip a container the daemon recorded as manually stopped. The plan's own command cannot exercise the policy it verifies. Substituting the kill that works and staying quiet about it would have been the dishonest fix | [`docs/evidence/2026-07-31-container-kill-recovery.md`](docs/evidence/2026-07-31-container-kill-recovery.md), README “Crash recovery, verified” |
+| Section 15 step 8 originally treated `docker kill` as restart-policy verification | `script/verify_recovery.sh` performs **both** the documented API stop and a host-PID-namespace main-process crash, and reports both outcomes separately | `docker kill` is an API stop, and `restart: unless-stopped` skips a container the daemon recorded as manually stopped. Only the independently observed process-crash path exercises automatic restart; substituting that path without recording the distinction would hide the original defect | [`docs/evidence/2026-07-31-container-kill-recovery.md`](docs/evidence/2026-07-31-container-kill-recovery.md), README “Crash recovery verification” |
 | `ENABLED_LIVE_SOURCE_COUNT` is the allowance formula's source-count input | Demoted to a **fallback**. The formula counts enabled, in-service `event_sources` rows of the running mode at window initialization and rollover, and logs `budget.source_allocation_drift` when the two disagree | A configured count that drifts from the table silently mis-sizes every allowance. Boot validation still reads no database, so the refuse-to-boot check is unchanged | ADR 0009 |
 | Secondary-limit backoff is “≥ 1 minute with exponential backoff when `Retry-After` is absent” | A persisted `github_api_budget.consecutive_secondary_limits` counter escalates 60 → 120 → 240s capped at one hour, **survives window rollover**, and is cleared by one clean response | Secondary limits are IP-scoped, not window-scoped. A counter that reset with the window would restart the ladder at 60s every hour against a limit that had not relented | ADR 0010 |
 | Section 10's fairness ladder covers the pending pool | The **TTL-refresh pool** allocates by the same prefer-then-borrow steps as the pending pool | The ladder was specified for pending candidates only, which left the refresh pool able to starve one class. Found by reading merged code against the plan rather than by a failing test | ADR 0010 |
@@ -1320,7 +1326,7 @@ The plan held. Every P0 story and extension shipped, no descope rung was used, a
 | ADRs are written alongside the code they describe | ADR 0011 (pinned API version) and ADR 0012 (Solid Queue over Kafka) were written in PR 12 | Both are Section 14 deliverables that no implementation PR owned, because neither records a decision made *during* a PR — they record decisions made before PR 1 and never written down. PR 12 is the last opportunity, and Section 16 forbids a plan that points at documents which do not exist | ADR 0011, ADR 0012 |
 | The plan is the reviewer's architecture document until the brief exists | [`docs/DESIGN_BRIEF.md`](docs/DESIGN_BRIEF.md) is the reviewer's entry point; this plan is the internal execution and traceability artifact | As Section 14 intended. Stated here because the README's pointer changed with it | README “Development” |
 
-Two things worth stating that are not divergences:
+Two things worth stating after hardening:
 
-- **No forbidden claim was ever written.** The scan in [`docs/SUBMISSION_CHECKLIST.md`](docs/SUBMISSION_CHECKLIST.md) §7 returns only negations, in every document, at every revision.
+- **Guarantee wording now names only proved invariants.** Broad outcome shorthand was removed; any reference to exactly-once behavior or complete capture/enrichment is a negation or limitation.
 - **The 304 finding survived first-party re-verification.** PR 6's required gate re-ran the probe under `X-GitHub-Api-Version: 2022-11-28` and committed a dated transcript; `x-ratelimit-used` incremented across an unauthenticated `304`, exactly as the review-supplied evidence in Appendix A had reported. The budget arithmetic that rests on it did not have to change.

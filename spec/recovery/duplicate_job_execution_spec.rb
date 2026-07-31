@@ -1,9 +1,10 @@
 require "rails_helper"
 
-# §12's "Enrichment job executed twice", which is §8's processing semantics stated as a test:
-# at-least-once execution + idempotent writes + unique constraints = effectively-once
-# persisted outcomes. Never exactly-once execution — the second execution really happens here,
-# and what is asserted is that it changes nothing.
+# §12's "Enrichment job executed twice" exercises one redelivery case. The ingestion-wide
+# guarantees are narrower: a duplicate event ID cannot create another push_events row or
+# reactivate a skipped entity. Executions, run summaries, quarantine counters, budget use,
+# and logs can repeat. Here the second execution really happens, and this scenario asserts
+# only that an already-complete actor is left unchanged by the freshness check.
 #
 # The redelivery is modelled as the *same job instance* performed twice: one job id, two
 # executions, which is what Solid Queue produces when a worker dies after the job ran and

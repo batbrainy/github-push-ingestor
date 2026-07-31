@@ -7,8 +7,9 @@ module Github
     # "is there durable enrichment work this class could do right now?" — and the answer is
     # read from the committed entity rows and the ledger, never from the queue. That is what
     # makes the enqueue a *hint*: §2A's outbox-style recovery says "the committed entity
-    # state is the durable record of pending work", so a process killed between the COMMIT
-    # and the enqueue loses the hint and never the work.
+    # state is the durable record of pending work". A process killed between the COMMIT and
+    # enqueue can lose that hint while leaving eligible pending entity state discoverable by
+    # a later successful reconciler tick.
     #
     # **At most one job per class per call**, however deep the backlog. §5 gives each class
     # one job and Github::EnrichmentRunner enriches at most one entity per call, so the

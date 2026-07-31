@@ -4,14 +4,15 @@
 # PollEventSourceJob computes effective_poll_time and no-ops unless a poll is due". A tick
 # is not a poll: against the default POLL_INTERVAL_SECONDS (300) roughly four ticks in five
 # find nothing due and cost one indexed SELECT. That ratio is the point — it is what makes a
-# source that becomes due at T get polled within a minute of T, without a cadence that the
-# allowance formula (12 poll requests an hour, zero headroom) cannot pay for.
+# source that becomes due at T become eligible on the next successful scheduled tick,
+# without a cadence that the allowance formula (12 poll requests an hour, zero headroom)
+# cannot pay for.
 #
 # reconcile_pending_enrichments — §8 step 11, the sweep behind the outbox-style recovery.
 # The post-commit enqueue in Github::IngestionRunner is only a hint; a SIGKILL between the
-# COMMIT and the enqueue loses the hint and never the work, because the committed entity
-# rows are the durable record. This task rediscovers that work, entity-scoped, and enqueues
-# nothing when there is none or when the ledger says the class is spent.
+# COMMIT and the enqueue can lose the hint while the committed pending entity state remains.
+# On a later successful tick, this task can rediscover eligible work from that state and
+# enqueues nothing when there is none or when the ledger says the class is spent.
 #
 # The cadences live here rather than in an environment variable because §9's cadence is
 # POLL_INTERVAL_SECONDS and it is enforced in the scheduling components, not in the tick.

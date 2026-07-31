@@ -24,7 +24,7 @@ and worker crashes.
 - [Architecture](#architecture)
 - [Continuous ingestion](#continuous-ingestion)
 - [Processing guarantees](#processing-guarantees)
-- [Crash recovery, verified](#crash-recovery-verified)
+- [Crash recovery verification](#crash-recovery-verification)
 - [Troubleshooting and reset](#troubleshooting-and-reset)
 - [Known limitations](#known-limitations)
 - [Development](#development)
@@ -58,9 +58,11 @@ unauthenticated quota** — twelve poll requests an hour at the default cadence,
 enrichment inside its allowance. That is the intended runtime behaviour (plan §2A);
 `GITHUB_MODE=fixture docker compose up --build` runs the same flow entirely offline.
 
-The processing guarantee is stated exactly: at-least-once execution plus idempotent writes
-plus unique constraints gives **effectively-once persisted outcomes**. This system does not
-claim exactly-once execution. See [Processing guarantees](#processing-guarantees).
+Poll observations and job deliveries may repeat. The proven write invariant is narrower:
+observing the same valid event again cannot add another `push_events` row or reactivate an
+entity that was skipped for budget. Executions, ingestion-run rows, quarantine occurrence
+counters, budget use, and logs may repeat. This system does not claim exactly-once execution. See
+[Processing guarantees](#processing-guarantees).
 
 [`docs/DESIGN_BRIEF.md`](docs/DESIGN_BRIEF.md) is the two-page architecture summary and the
 best place to start. The authoritative execution plan is
@@ -88,8 +90,8 @@ This starts, in dependency order (plan §2A):
 3. `web` — the Rails API on http://localhost:3000, started only after `setup`
    completes successfully
 4. `worker` — the Solid Queue supervisor, started on the same condition.
-   **Continuous polling begins here**: its scheduler fires the 60-second tick, so
-   the first poll happens within a minute and every 300 seconds after that.
+   **Continuous polling begins here**: its scheduler nominally fires every 60 seconds;
+   due sources are considered on the next successful tick, subject to worker availability.
 
 Those four are the whole stack. `ingest`, `enrich`, and `test` sit behind a compose
 profile, so a plain `up` never starts them.
@@ -121,10 +123,10 @@ budget-ledger stress specs, which open several real PostgreSQL sessions and ther
 their own process ([`spec/stress/README.md`](spec/stress/README.md) explains why). CI runs
 the same two steps.
 
-**`--build` is not optional if you have edited anything.** The application code is baked
-into the image rather than bind-mounted, so `docker compose run --rm test` against a stale
-image silently tests the code the image was built from — green, and meaningless. On an
-unmodified checkout the flag costs a cached no-op.
+The application code is baked into the image rather than bind-mounted. The `test`, `ingest`,
+and `enrich` services therefore declare `pull_policy: build`: even the assignment's bare
+`docker compose run --rm test` asks Compose to build the current checkout. Adding `--build`
+is harmless and makes that intent explicit, but is not required for those tool services.
 
 Rails, Active Job and application logs are one structured JSON stream;
 PostgreSQL and Puma startup output remain their own plain-text formats:
@@ -151,140 +153,147 @@ docker compose run --rm test
 docker compose logs -f
 ```
 
-`IMPLEMENTATION_PLAN.md` §15 asks a reviewer to walk eleven steps. Each one below is the
-command plus the result to look for; the linked section carries the explanation.
+For a reproducible review, run the phases below **in order** from a fresh clone. Compose fixes
+the project name to `github-push-ingestor`, so every clone on a Docker host refers to the same
+`github-push-ingestor_pgdata` volume. Do not assume a fresh clone means a fresh database.
 
-**1. Start all services.**
+### Phase A — cold-image live startup
 
-```bash
-docker compose up --build          # live mode — spends real quota
-GITHUB_MODE=fixture docker compose up --build    # the same flow, zero network
-```
-
-Exactly four containers come up: `db`, `setup`, `web`, `worker`. See
-[Quick start](#quick-start).
-
-**2. Wait for health checks.**
+This phase deliberately uses the default live mode and can spend unauthenticated GitHub
+quota. Archive any valued global-volume data first, then remove prior project resources and
+prove the volume is absent. Build without cache, remove only the local application image, and
+prove that `up --build` can recreate it:
 
 ```bash
+docker compose down -v --remove-orphans
+if docker volume inspect github-push-ingestor_pgdata >/dev/null 2>&1; then
+  echo "github-push-ingestor_pgdata still exists" >&2
+  exit 1
+fi
+docker compose build --no-cache --pull
+docker image rm github-push-ingestor-app:latest
+docker compose up --build -d
+docker compose ps --all
 until curl -fsS http://localhost:3000/health/ready; do sleep 2; done
 ```
 
-`{"status":"ok"}`. `/health/live` reports the process; `/health/ready` reports the database
-and schema. Neither consumes budget.
+The only services are `db` (healthy), `setup` (exited 0), `web` (healthy), and `worker`
+(running); `ingest`, `enrich`, and `test` do not start. The readiness response is
+`{"status":"ok"}`. `/health/live`, `/health/ready`, and `/status` read local state only and
+never call GitHub or reserve budget.
 
-**3. Run one-shot ingestion.**
+A live one-shot may complete, defer until `cadence_due_at`, or report that the source is busy
+because the worker owns it. Each is a valid state report:
 
 ```bash
 docker compose run --rm ingest
+docker compose logs --since 5m worker
 ```
 
-Either a completed-run summary or a deferral — `Ingestion deferred until … — cadence_due_at`
-or `source busy — poller cycle in progress`. **A deferred or busy result is a valid result**:
-the state summary prints on every path and the exit code is 0, so the command always proves
-system state rather than just its own outcome. See [One-shot ingestion](#one-shot-ingestion).
+### Phase B — reset, then verify the fixture from an empty volume
 
-**4. Follow application and worker logs.**
+The expected fixture totals are absolute, so they are valid only after this destructive phase
+boundary. Preserve any valued database first. `down -v` removes the globally named volume and
+every stored event; the explicit inspection must fail before the fixture stack starts.
 
 ```bash
-docker compose logs -f
-docker compose logs -f worker
+docker compose down -v --remove-orphans
+if docker volume inspect github-push-ingestor_pgdata >/dev/null 2>&1; then
+  echo "github-push-ingestor_pgdata still exists" >&2
+  exit 1
+fi
+GITHUB_MODE=fixture docker compose up --build -d db setup web
+until curl -fsS http://localhost:3000/health/ready; do sleep 2; done
 ```
 
-One structured JSON stream. See [Logs](#logs).
-
-**5. Query persisted push events.**
-
-```bash
-curl -s 'http://localhost:3000/api/push_events?limit=5' | jq
-curl -s http://localhost:3000/api/push_events/<github_event_id> | jq .data.raw_payload
-```
-
-The list nests each event's actor and repository with their `enrichment_status`; the
-detail endpoint returns the retained raw payload. See
-[Inspecting the data](#inspecting-the-data).
-
-**6. Inspect PostgreSQL record counts.**
+Starting only `db`, `setup`, and `web` keeps the continuous worker from racing the one-shot
+fixture commands. Capture the one-shot output directly: `docker compose run --rm` removes its
+container, so there is no `ingest` service log to inspect afterward.
 
 ```bash
+set -o pipefail
+fixture_ingest_output="$(mktemp)"
+GITHUB_MODE=fixture docker compose run --rm ingest 2>&1 | tee "$fixture_ingest_output"
+grep -E 'Push events created:[[:space:]]+4' "$fixture_ingest_output"
+grep -E 'Events quarantined:[[:space:]]+3' "$fixture_ingest_output"
+grep -E 'Non-push events ignored:[[:space:]]+1' "$fixture_ingest_output"
+
+GITHUB_MODE=fixture docker compose run --rm enrich --limit 6
 docker compose exec db psql -U postgres -d github_push_ingestor_development -c "
   SELECT (SELECT COUNT(*) FROM push_events)                     AS push_events,
          (SELECT COUNT(*) FROM github_actors)                   AS actors,
          (SELECT COUNT(*) FROM github_repositories)             AS repositories,
          (SELECT COUNT(*) FROM quarantined_events)              AS quarantined,
-         (SELECT SUM(occurrence_count) FROM quarantined_events) AS occurrences;"
+         (SELECT SUM(occurrence_count) FROM quarantined_events) AS occurrences;
+  SELECT 'actor' AS class, enrichment_status, COUNT(*) FROM github_actors GROUP BY 2
+  UNION ALL
+  SELECT 'repository', enrichment_status, COUNT(*) FROM github_repositories GROUP BY 2;"
 ```
 
-More queries in [Database inspection](#database-inspection); what each table means is in
-[The data model](#the-data-model).
+The first query must return `4 / 3 / 3 / 3 / 3`. The status query must return
+`complete 2 / permanent_failure 1` for each entity class.
 
-**7. Run the fixture replay and confirm duplicates are absorbed.**
+To verify replay behavior, wait for the fixture's poll floor and capture the second command's
+output too. The removed one-shot container cannot be queried with `docker compose logs`.
 
 ```bash
-GITHUB_MODE=fixture docker compose run --rm ingest
-sleep 60    # GitHub's X-Poll-Interval floor, which --force deliberately does not bypass
-GITHUB_MODE=fixture docker compose run --rm ingest --force
+sleep 60
+fixture_replay_output="$(mktemp)"
+GITHUB_MODE=fixture docker compose run --rm ingest --force 2>&1 | tee "$fixture_replay_output"
+grep -E 'Duplicates skipped:[[:space:]]+4' "$fixture_replay_output"
+if grep -q 'enrichment.reactivated' "$fixture_replay_output"; then
+  echo "duplicate replay reactivated an entity" >&2
+  exit 1
+fi
+rm -f "$fixture_ingest_output" "$fixture_replay_output"
 ```
 
-Two things to confirm, not one. `Duplicates skipped: 4` in the second summary — and that
-**no skipped entity was reactivated**. The second is falsifiable: `enrichment.reactivated`
-is emitted only on a real reactivation, so it should be absent, and the `skipped_budget`
-count should be unchanged.
-
-```bash
-docker compose logs ingest | grep enrichment.reactivated     # expect no output
-docker compose exec db psql -U postgres -d github_push_ingestor_development -c "
-  SELECT COUNT(*) FROM github_actors WHERE enrichment_status = 'skipped_budget';"
-```
-
-See [Deterministic fixture verification](#deterministic-fixture-verification).
-
-**8. Verify crash recovery with actual container kills.**
-
-```bash
-GITHUB_MODE=fixture docker compose up --build -d
-script/verify_recovery.sh --confirm
-```
-
-Read §15's literal `docker kill` command knowing what it does: it is an API stop, and
-`restart: unless-stopped` is *defined* to skip exactly that case, so the documented command
-leaves the container down. The script performs both that and a real process crash, and
-reports both. See [Crash recovery, verified](#crash-recovery-verified).
-
-**9. Restart normally and confirm records remain.**
-
-```bash
-docker compose exec db psql -U postgres -d github_push_ingestor_development \
-  -c "SELECT COUNT(*) FROM push_events;"
-docker compose restart
-docker compose exec db psql -U postgres -d github_push_ingestor_development \
-  -c "SELECT COUNT(*) FROM push_events;"
-```
-
-Identical counts. The volume is named; only `down -v` removes it.
-
-**10. Run the full deterministic fixture scenario.**
-
-```bash
-GITHUB_MODE=fixture docker compose run --rm ingest
-GITHUB_MODE=fixture docker compose run --rm enrich --limit 6
-```
-
-From an empty database: **4 push events created, 3 quarantined, 1 ignored, 3 actors, 3
-repositories** — then `complete 2 / permanent_failure 1` in each entity class. Eleven more
-scenarios are in the [fixture scenario matrix](#fixture-scenario-matrix).
-
-**11. Run tests.**
+Run the isolated suite; `pull_policy: build` means this bare assignment command builds the
+current source before it runs:
 
 ```bash
 docker compose run --rm test
 ```
 
-Two `rspec` invocations against isolated `*_test` databases, the same two CI runs. On an
-unmodified checkout that is the whole story; **if you have edited anything, add `--build`**
-— the code is baked into the image, not mounted.
+### Phase C — recovery and persistence
 
-A transcript of this whole walk, run from a fresh clone on a machine with no image, is at
+Reset once more so recovery starts from a deterministic fixture database, then start the
+full offline stack. The script keeps every recreation in fixture mode and asserts that the
+worker remains there:
+
+```bash
+docker compose down -v --remove-orphans
+GITHUB_MODE=fixture docker compose up --build -d
+GITHUB_MODE=fixture script/verify_recovery.sh --confirm
+docker compose exec worker printenv GITHUB_MODE   # fixture
+```
+
+`docker kill` is an API-requested stop, so it is the negative control: `unless-stopped` leaves
+that container down. The script separately kills each container's main process from the host
+PID namespace; that is the crash path on which the policy restarts `db`, `web`, and `worker`.
+It also requires `push_events` to remain unchanged after every crash and recovery.
+
+Finally, compare the count around both a normal restart and a Compose down/up cycle. Prefix
+every recreation with fixture mode so the worker never spends live quota:
+
+```bash
+docker compose exec db psql -U postgres -d github_push_ingestor_development \
+  -Atc "SELECT COUNT(*) FROM push_events;"
+docker compose restart
+docker compose exec db psql -U postgres -d github_push_ingestor_development \
+  -Atc "SELECT COUNT(*) FROM push_events;"
+docker compose down --remove-orphans
+GITHUB_MODE=fixture docker compose up --build -d
+docker compose exec db psql -U postgres -d github_push_ingestor_development \
+  -Atc "SELECT COUNT(*) FROM push_events;"
+```
+
+All three values must be identical. Plain `down` preserves the named volume; only `down -v`
+deletes it. See [Crash recovery verification](#crash-recovery-verification) for the
+API-stop/process-crash distinction.
+
+A historical transcript of an earlier clean-checkout walk, run from a fresh clone on a
+machine with no image, is at
 [`docs/evidence/2026-07-31-clean-checkout-verification.md`](docs/evidence/2026-07-31-clean-checkout-verification.md)
 — including the live half, which is what shows the public API works with no token.
 
@@ -362,7 +371,21 @@ to do it.
 ## Deterministic fixture verification
 
 Fixture mode resolves every request inside [`fixtures/github/`](fixtures/github/)
-with no network at all, so the numbers are exact:
+with no network at all. The numbers below are absolute and require an empty volume; a fresh
+checkout is not sufficient because Compose's fixed project name makes the volume global to
+the Docker host. Preserve any valued data, then establish the fixture-only baseline:
+
+```bash
+docker compose down -v --remove-orphans
+if docker volume inspect github-push-ingestor_pgdata >/dev/null 2>&1; then
+  echo "github-push-ingestor_pgdata still exists" >&2
+  exit 1
+fi
+GITHUB_MODE=fixture docker compose up --build -d db setup web
+```
+
+The worker is intentionally absent so it cannot consume the fixture before the one-shot.
+Now the numbers are exact:
 
 ```bash
 GITHUB_MODE=fixture docker compose run --rm ingest
@@ -407,7 +430,8 @@ Once past it, nothing is created: the same page is absorbed as **4 duplicates**,
 three quarantine rows stay three rows with their occurrence counts at 2, and no
 entity's activity moves — and **no skipped entity is reactivated**, which is the
 half of plan §7's merge rules a re-polled window would otherwise break. Re-running
-ingestion is safe at any frequency — see
+ingestion cannot duplicate accepted event rows or reactivate a skipped entity from the
+same event ID; run summaries, quarantine counters, budget use, and logs may still change. See
 [ADR 0005](docs/adr/0005-at-least-once-with-idempotent-writes.md).
 
 ### Enrichment, offline
@@ -416,7 +440,6 @@ The same corpus resolves every entity the page referenced, so the whole flow —
 persist, stub, enrich — runs with no network:
 
 ```bash
-GITHUB_MODE=fixture docker compose run --rm ingest
 GITHUB_MODE=fixture docker compose run --rm enrich --limit 6
 ```
 
@@ -656,9 +679,11 @@ Seven business tables in three groups:
 - **The global ledger** — `github_api_budget`, one row.
 
 A second database, `github_push_ingestor_queue_development`, holds Solid Queue's tables.
-That is job state, not business state: deleting all of it loses nothing, because pending
-work is rebuilt from committed entity rows
-([ADR 0008](docs/adr/0008-post-commit-enqueue-and-entity-scoped-reconciliation.md)).
+Queued enrichment dispatches are hints, not the pending-enrichment source of truth: removing
+those hints does not erase eligible entity state committed in the business database, and a
+later successful reconciler tick can rediscover that work. Other operational queue state is
+not claimed to be reconstructible. See
+[ADR 0008](docs/adr/0008-post-commit-enqueue-and-entity-scoped-reconciliation.md).
 
 | Table | What a row is | Identity | Written by |
 |---|---|---|---|
@@ -730,7 +755,7 @@ limits are IP-scoped rather than window-scoped
 but never reactivates a skipped entity — that is the half of §7's merge rules a re-polled
 window would otherwise break.
 
-### The idempotency contract
+### Replay behavior by table
 
 | Table | Write | Effect on replay |
 |---|---|---|
@@ -763,8 +788,9 @@ truth:
 docker compose exec db psql -U postgres -d github_push_ingestor_development -c "\d+ push_events"
 ```
 
-The entity-relationship diagram is Figure 2 of
-[`docs/DESIGN_BRIEF.md`](docs/DESIGN_BRIEF.md).
+The compact architecture figure in
+[`docs/DESIGN_BRIEF.md`](docs/DESIGN_BRIEF.md) shows how the runtime and PostgreSQL state
+fit together.
 
 ## Logs
 
@@ -1087,7 +1113,7 @@ There is deliberately no variable for the API host or the API version — see
 ## Architecture
 
 [`docs/DESIGN_BRIEF.md`](docs/DESIGN_BRIEF.md) is the two-page architecture summary, with
-rendered request-path and data-model figures. This section is the annotated call chain.
+one compact architecture figure. This section is the annotated call chain.
 
 Every live GitHub request — polling and enrichment, from the poller, the worker, or the
 one-shot — takes one chain, and nothing outside it calls GitHub
@@ -1234,7 +1260,7 @@ and debited twice.
 Decisions behind this are recorded in
 [`docs/adr/`](docs/adr/): `jsonb` semantic retention (0001), advisory locks and the gate
 (0002), the source and transport seams (0003), the class-aware ledger (0004),
-at-least-once processing with idempotent writes (0005), decomposed poll deferral state
+repeated execution with duplicate-safe event writes (0005), decomposed poll deferral state
 (0006), enrichment fairness shares and borrowing (0007), post-commit enqueue with
 entity-scoped reconciliation (0008), runtime source allocation with shared-IP
 observability (0009), secondary-limit escalation with refresh-pool fairness (0010), the
@@ -1251,19 +1277,20 @@ threads from [`config/queue.yml`](config/queue.yml), and a scheduler running
 inside its advisory lock and applies §9's five components before spending anything.
 At the default 300-second cadence roughly four ticks in five cost one indexed
 `SELECT` and nothing else. The tick exists so a source that becomes due at T is
-polled within a minute of T — not so that polls happen every minute, which the
-allowance formula (twelve poll requests an hour, no headroom) could not pay for.
+eligible on the next successful scheduled tick — not so that polls happen every minute,
+which the allowance formula (twelve poll requests an hour, no headroom) could not pay for.
 A source another process is polling is reported at INFO and left alone; the tick
-never retries it, because the next tick is 60 seconds away.
+does not retry it in the same execution; another tick is nominally scheduled 60 seconds later.
 
 **Enrichment is scheduled twice over, deliberately.** A run that created events
 schedules one cycle per class as soon as its rows are committed and its advisory
 lock is released. That enqueue is a *hint*: the durable record of pending work is the
 entity rows themselves, so `ReconcilePendingEnrichmentsJob` sweeps them every 60
 seconds and schedules a cycle for any class that has claimable work and is not
-blocked by the ledger. Work committed before a crash but never enqueued is
-rediscovered on the next tick — no operator step, no cleanup job, and no queue
-inspection (plan §8, [ADR 0008](docs/adr/0008-post-commit-enqueue-and-entity-scoped-reconciliation.md)).
+blocked by the ledger. If a crash loses an enrichment-dispatch hint, the committed eligible
+entity state remains discoverable on a later successful scheduled tick without a special
+cleanup job or queue inspection (plan §8,
+[ADR 0008](docs/adr/0008-post-commit-enqueue-and-entity-scoped-reconciliation.md)).
 
 Each cycle enriches at most one entity, chosen by §10's fairness policy under a
 lease, so a backlog of ninety pending actors is one queued job rather than ninety.
@@ -1273,21 +1300,21 @@ requests an hour split between the two classes.
 ## Processing guarantees
 
 **An event is accepted when its `push_events` row commits** — not when GitHub returns it,
-not when a job is enqueued, not when a log line says so. That commit is the durability
-boundary; everything upstream of it is retryable and everything downstream is derived.
+not when a job is enqueued, not when a log line says so. That row is durable. Work lost
+before its commit is recoverable only while the event remains in a later GitHub feed window;
+pending enrichment can be reconstructed from committed entity state.
 
-```text
-At-least-once execution
-+ Idempotent writes
-+ Unique constraints
-= Effectively-once persisted outcomes
-```
+The demonstrated invariant is deliberately specific: a duplicate observation of a valid
+event cannot create another `push_events` row, and cannot reactivate an entity already in
+`skipped_budget`. That does not make the surrounding execution singular. A retry may create
+another ingestion-run row, increment a malformed payload's occurrence counter, spend another
+budget reservation, execute another job, or emit another log line, depending on its crash
+boundary.
 
 ### What is not claimed, and why
 
-- **Not exactly-once execution.** A job may run twice; the second run changes nothing
-  durable. Side effects that are not idempotent writes — a log line, a duration metric —
-  can and will repeat.
+- **Not exactly-once execution.** A job may run twice. The unique event row and guarded entity
+  activity update are replay-safe; execution records, counters, budget use, and logs may repeat.
 - **Not complete upstream capture.** The feed is a sliding window with hours of latency;
   see [Known limitations](#known-limitations).
 - **Not complete enrichment coverage.** Demand exceeds the hourly budget by roughly fifty
@@ -1297,10 +1324,10 @@ At-least-once execution
 
 | Crash point | What survives | What recovers it |
 |---|---|---|
-| Before the event commits | Nothing from this page | The next overlapping poll re-fetches it — there is no stop-on-known-event |
-| After the event commits, before enrichment is enqueued | The `push_events` row and its stub entities | `ReconcilePendingEnrichmentsJob`, from committed entity rows, within 60s |
+| Before the event commits | Nothing from this page | A later overlapping poll can re-fetch it only while it remains in GitHub's feed window; there is no stop-on-known-event |
+| After the event commits, before enrichment is enqueued | The `push_events` row and its stub entities | `ReconcilePendingEnrichmentsJob`, from committed entity rows, on a later successful tick (scheduled every 60s) |
 | Worker dies before the enrichment commit | The entity row, still `pending`, its lease expiring by arithmetic | The next reconcile tick after `next_retry_at` passes |
-| Worker dies after the enrichment commit, before acknowledgement | The enriched entity row | Solid Queue re-runs the job; the re-run is a no-op |
+| Worker dies after the enrichment commit, before acknowledgement | The enriched entity row | Solid Queue may re-run the job; the freshness check leaves that row unchanged |
 
 ### The mechanisms
 
@@ -1319,20 +1346,22 @@ At-least-once execution
 
 [ADR 0005](docs/adr/0005-at-least-once-with-idempotent-writes.md) argues the choice;
 [ADR 0008](docs/adr/0008-post-commit-enqueue-and-entity-scoped-reconciliation.md) covers
-recovery; [Crash recovery, verified](#crash-recovery-verified) demonstrates it.
+recovery; [Crash recovery verification](#crash-recovery-verification) exercises it.
 
-## Crash recovery, verified
+## Crash recovery verification
 
-`IMPLEMENTATION_PLAN.md` §15 step 8 asks a reviewer to kill containers and watch them come
-back. Run it with one command, against a stack started in fixture mode:
+`IMPLEMENTATION_PLAN.md` §15 step 8 asks a reviewer to exercise both operator-requested stops
+and main-process crashes. Run it with one command against a stack started in fixture mode:
 
 ```bash
 GITHUB_MODE=fixture docker compose up --build -d
-script/verify_recovery.sh --confirm
+GITHUB_MODE=fixture script/verify_recovery.sh --confirm
 ```
 
-A dated transcript of that run is committed at
+A historical transcript from an earlier script revision is committed at
 [`docs/evidence/2026-07-31-container-kill-recovery.md`](docs/evidence/2026-07-31-container-kill-recovery.md).
+Its prominent erratum explains why its green verdict is not the current submission gate; the
+corrected script must be rerun against the final default-branch SHA.
 Nothing in CI runs the script — it kills containers and writes to the development databases,
 and `spec/docker_compose_spec.rb` asserts that no workflow references it.
 
@@ -1343,7 +1372,7 @@ that case. So the documented command leaves the container down, and
 ```bash
 docker kill github-push-ingestor-worker-1
 docker compose ps          # Exited (137) — and it stays that way
-docker compose up -d worker
+GITHUB_MODE=fixture docker compose up -d worker
 ```
 
 is the honest sequence. The restart policy is sound; it is the *kill* that does not exercise
@@ -1355,15 +1384,13 @@ One reading tip for §15 step 8's `docker compose ps` output: `web`'s container 
 curls `/health/live`, which never touches the database, so `web` stays green throughout a `db`
 kill. `/health/ready` is the observable that flips.
 
-**The stack comes back in live mode, so put it back offline when you are done.** Bringing a
-killed container back means `docker compose up -d <service>`, which recreates it from the
-*current* shell environment — and `GITHUB_MODE` defaults to `live` there. A reviewer who
-started the stack with `GITHUB_MODE=fixture` and then ran the script ends up with a worker
-polling real GitHub and spending real quota. Check it and reset it:
+The recovery script passes fixture mode to every internal Compose recreation and asserts the
+worker's mode after recreation and again before exit. When performing a recovery manually,
+carry the mode on every `docker compose up` command and verify it before watching the worker:
 
 ```bash
-docker compose exec worker printenv GITHUB_MODE     # `live` after a recovery run
 GITHUB_MODE=fixture docker compose up -d --force-recreate worker
+docker compose exec worker printenv GITHUB_MODE     # fixture
 ```
 
 Recovery is also watchable by hand in under a minute — stop the worker, put the entities back
@@ -1379,8 +1406,9 @@ docker compose start worker
 docker compose logs -f worker    # enrichment.dispatched, then enrichment.completed
 ```
 
-Emptying the queue loses nothing, which is the point: the work is rebuilt from committed
-entity rows.
+In this scenario, emptying the queue does not discard pending enrichment state: that work is
+rebuilt from committed entity rows. This does not claim that arbitrary operational queue
+state can be reconstructed.
 
 ## Troubleshooting and reset
 
@@ -1468,13 +1496,19 @@ broken system.
 **Level 3 — destroy everything, including the volume.**
 
 ```bash
-docker compose down -v
+docker compose down -v --remove-orphans
+if docker volume inspect github-push-ingestor_pgdata >/dev/null 2>&1; then
+  echo "github-push-ingestor_pgdata still exists" >&2
+  exit 1
+fi
 docker compose up --build
 ```
 
-`-v` deletes the named `pgdata` volume and **every stored event**. Plain
-`docker compose down` does not: it stops and removes the containers and leaves the volume
-intact, which is why step 9 of the verification walk finds identical counts afterwards.
+Because the Compose project name is fixed, `pgdata` resolves to the globally named
+`github-push-ingestor_pgdata`; every clone on the same Docker host refers to it. `-v` deletes
+that volume and **every stored event**. Plain `docker compose down` does not: it stops and
+removes the containers and leaves the volume intact, which is why the persistence check finds
+identical counts afterward.
 
 ## Known limitations
 
@@ -1490,7 +1524,7 @@ samples the public feed rather than mirroring it.**
 The eight limitations that follow are consequences of that, and of the 60-request hourly
 ceiling. None is a gap to be closed later; each is a stated boundary.
 
-**1. Enrichment coverage is a sample, not coverage.** One observed live page held ~92–95
+**1. Enrichment is sampled, not exhaustive.** One observed live page held ~92–95
 `PushEvent` records with ~89 distinct actors and ~92 distinct repositories — 181 cold
 entity requests per page, ~2,172 an hour at twelve polls, against 40 available. That is
 roughly 1.8% theoretical cold coverage. `skipped_budget` is a normal documented outcome,
@@ -1516,9 +1550,9 @@ count, but a second *live* source is a documented seam rather than shipped behav
 key order, and duplicate keys are lost; array order is preserved because it is meaningful
 ([ADR 0001](docs/adr/0001-jsonb-semantic-retention.md)).
 
-**6. No authentication.** A token would raise the ceiling from 60 to 5,000 requests an
-hour and change the enrichment story entirely — which is the point of the constraint, not
-an oversight. See the scaling path in
+**6. No authentication.** A larger authenticated budget could materially increase feasible
+coverage, but would not make upstream capture or enrichment complete. The unauthenticated
+constraint is deliberate, not an oversight. See the scaling path in
 [`docs/DESIGN_BRIEF.md`](docs/DESIGN_BRIEF.md).
 
 **7. An enriched entity can be up to 24 hours stale.** `ACTOR_REFRESH_TTL_SECONDS` and

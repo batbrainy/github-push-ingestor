@@ -168,11 +168,11 @@ RSpec.describe "docker-compose.yml" do
     end
   end
 
-  # Everything below is what §16's durability gate — "Docker restart policies recover crashed
-  # db/web/worker containers automatically (verified by container kills)" — actually rests on.
-  # script/verify_recovery.sh proves the runtime behaviour once, on one host, on one date.
-  # These examples prove the declarations that behaviour comes from, on every push, and they
-  # are the reason a compose edit cannot silently invalidate the committed transcript.
+  # Everything below is what §16's durability gate for db/web/worker actually rests on.
+  # script/verify_recovery.sh records `docker kill` as an API-stop negative control, then uses
+  # a host-PID SIGKILL to verify automatic process-crash recovery on one host and date. These
+  # examples prove the declarations behind that behaviour on every push, so a compose edit
+  # cannot silently invalidate the committed transcript.
   describe "the db service" do
     let(:db) { services.fetch("db") }
 
@@ -414,11 +414,12 @@ RSpec.describe "docker-compose.yml" do
   # network boundary, and this script makes no network calls at all — fixture mode is one of
   # its preflight requirements.
   describe "script/verify_recovery.sh" do
-    it "exists and is executable, because the README tells a reviewer to run it" do
-      script = Rails.root.join("script/verify_recovery.sh")
+    let(:script_path) { Rails.root.join("script/verify_recovery.sh") }
+    let(:script_source) { script_path.read }
 
-      expect(script).to exist
-      expect(script).to be_executable
+    it "exists and is executable, because the README tells a reviewer to run it" do
+      expect(script_path).to exist
+      expect(script_path).to be_executable
     end
 
     it "is referenced by no workflow, no compose service, and no CI entry point" do
@@ -432,6 +433,100 @@ RSpec.describe "docker-compose.yml" do
       end
 
       expect(referencing).to be_empty
+    end
+
+    it "forces every internal Compose invocation to fixture mode without replacing preflight" do
+      expect(script_source).to include(<<~'SHELL'.strip)
+        compose() {
+          GITHUB_MODE=fixture GITHUB_FIXTURE_SCENARIO="$RECOVERY_FIXTURE_SCENARIO" docker compose "$@"
+        }
+      SHELL
+      expect(script_source).to include('RECOVERY_FIXTURE_SCENARIO="default"')
+
+      # Remove the quoted usage document, then admit only comments and pure echo statements
+      # that cannot evaluate a command substitution. Everything else is executable shell, so
+      # this catches direct, environment-prefixed and negated Compose calls alike.
+      without_usage = script_source.sub(/cat >&2 <<'USAGE'\n.*?^USAGE\n/m, "")
+      compose_lines = without_usage.lines.select { |line| line.include?("docker compose") }
+      executable_compose_lines = compose_lines.reject do |line|
+        stripped = line.strip
+        safe_echo = stripped.match?(/\Aecho (?:".*"|'.*')(?:\s+>&2)?\z/) &&
+                    !stripped.include?("$(") && !stripped.match?(/(?<!\\)`/)
+
+        stripped.start_with?("#") || safe_echo
+      end.map(&:strip)
+
+      expect(executable_compose_lines).to eq([
+        'GITHUB_MODE=fixture GITHUB_FIXTURE_SCENARIO="$RECOVERY_FIXTURE_SCENARIO" docker compose "$@"'
+      ])
+
+      # The wrapper controls future interpolation; this still reads the environment from the
+      # already-running container, so a live worker cannot pass by construction.
+      expect(script_source).to include('mode="$(worker_mode)"')
+      expect(script_source).to include('scenario="$(worker_fixture_scenario)"')
+      expect(script_source).to include(
+        'check "the recreated worker remains in fixture mode" "fixture" "$(worker_mode)"'
+      )
+      expect(script_source).to include(
+        'local RECOVERY_FIXTURE_SCENARIO="$scenario"',
+        'local RECOVERY_FIXTURE_SCENARIO="rate_limited"'
+      )
+      expect(script_source).not_to include("export GITHUB_FIXTURE_SCENARIO")
+    end
+
+    it "records redacted fixture one-shot exit statuses in the final verdict" do
+      expect(script_source).to include('compose "$@" 2>&1 | redact')
+      expect(script_source).to include('LAST_COMPOSE_STATUS="${PIPESTATUS[0]}"')
+      expect(script_source).to include(
+        'check "baseline fixture ingestion exited successfully" "0" "$ingest_status"',
+        'check "baseline fixture enrichment exited successfully" "0" "$enrich_status"'
+      )
+
+      executable_one_shots = script_source.lines.grep(/run --rm (?:ingest|enrich)/)
+                                          .reject { |line| line.lstrip.start_with?("#", "echo") }
+      expect(executable_one_shots).to all(satisfy { |line| !line.include?("|| true") })
+    end
+
+    it "records a failed test service and restores the worker before continuing" do
+      expect(script_source).to include(
+        "trap restore_test_worker_on_exit EXIT",
+        "run_redacted_compose run --rm test",
+        'test_status="$LAST_COMPOSE_STATUS"',
+        'check "the test service exited successfully" "0" "$test_status"',
+        'check "the worker restarted after the test-isolation measurement" "0" "$worker_start_status"',
+        "TEST_WORKER_RESTART_PENDING=0"
+      )
+      expect(script_source).not_to include("compose run --rm test 2>&1 | tail")
+    end
+
+    it "asserts event-count preservation for every recovery phase" do
+      expect(script_source).to include(
+        "push_events is unchanged across the worker API stop and operator recovery",
+        "push_events is unchanged across the worker process crash and policy recovery",
+        "push_events is unchanged across the database API stop and operator recovery",
+        "push_events is unchanged across the database process crash and policy recovery",
+        "push_events is unchanged across the web API stop and operator recovery",
+        "push_events is unchanged across the web process crash and policy recovery",
+        "push_events is unchanged across a normal Compose restart"
+      )
+    end
+
+    it "keeps API stops distinct from process crashes" do
+      expect(script_source).to include(
+        "`docker kill` is an API stop",
+        "SIGKILL delivered to the container's main",
+        "process from *outside* its PID namespace",
+        'check "the ${service} process-crash helper exited successfully" "0" "$helper_status"',
+        "CRASH_OBSERVATION_COMPLETED=0",
+        "CRASH_OBSERVATION_COMPLETED=1"
+      )
+    end
+
+    it "asserts fixture mode again immediately before the final verdict" do
+      expect(script_source).to include(
+        'check "the worker is still in fixture mode before verifier exit" "fixture" "$mode"',
+        "verify_final_worker_mode\n\nheading \"Verdict\""
+      )
     end
   end
 end

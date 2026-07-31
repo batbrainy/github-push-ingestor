@@ -74,7 +74,7 @@ RSpec.describe "enrichment fairness under a flood", type: :integration do
     end
 
     # Story 3's requirement, measured over a window rather than asserted about one choice.
-    it "enriches every actor candidate, which is what §10 says a repo-first policy would not" do
+    it "serves all three actor candidates in this finite contention setup" do
       expect(sequence.count { |(key, _)| key == :actor }).to eq(3)
     end
 
@@ -93,7 +93,7 @@ RSpec.describe "enrichment fairness under a flood", type: :integration do
       expect(first_borrow).to be > last_actor
     end
 
-    it "spends the window exactly once, with the two shares summing to the class counter" do
+    it "records all 40 debits with the two shares summing to the class counter" do
       budget = current_budget
 
       expect(budget.enrichment_used).to eq(40)
@@ -136,7 +136,7 @@ RSpec.describe "enrichment fairness under a flood", type: :integration do
       drain!
     end
 
-    it "still enriches every repository candidate" do
+    it "serves all three repository candidates in this finite contention setup" do
       expect(sequence.count { |(key, _)| key == :repository }).to eq(3)
     end
 
@@ -155,7 +155,7 @@ RSpec.describe "enrichment fairness under a flood", type: :integration do
       expect(borrowed).to eq(40 - 20 - 3)
     end
 
-    it "spends the window exactly once, mirrored" do
+    it "records all 40 debits with the mirrored share split" do
       budget = current_budget
 
       expect(budget.enrichment_used).to eq(40)
