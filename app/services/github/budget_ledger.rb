@@ -102,6 +102,13 @@ module Github
     # to the reset that has now passed, while preserving a secondary-limit block that
     # extends beyond it — the two conditions §10 distinguishes.
     #
+    # consecutive_secondary_limits is deliberately absent, and its absence is the
+    # behaviour rather than an omission. §10 calls secondary limits IP-scoped, which is a
+    # different scope from the primary window this statement resets: a streak that happens
+    # to span a window boundary is still a streak, and zeroing it here would hand a
+    # persistently throttled IP a fresh 60-second block every hour. Only a live request
+    # that completes without a secondary limit ends it — see #clear_secondary_limit_streak!.
+    #
     # The four counters are parameters rather than literal zeros so a rollover
     # discovered *during* reconciliation can carry the request that produced the
     # response into the window GitHub says it belongs to. See #reconcile!.
@@ -152,6 +159,12 @@ module Github
     # COALESCE on window_status keeps the label's fate in the policy's hands without a
     # boolean bind: nil leaves it alone.
     #
+    # The increment on consecutive_secondary_limits is a bind of 1 or 0 for the same
+    # reason — one statement whose behaviour the caller selects, rather than a second
+    # statement that could interleave with this one between the SELECT ... FOR UPDATE and
+    # the commit. §10's exponential backoff needs the count, and the count has to be taken
+    # under the same row lock that writes the block it feeds.
+    #
     # lock_version is bumped by hand for the reason DEBIT_SQL gives — this is not an
     # Active Record save, and a stale in-memory row must still raise StaleObjectError
     # rather than clobber the counters.
@@ -159,8 +172,24 @@ module Github
       UPDATE github_api_budget
          SET global_blocked_until = GREATEST(global_blocked_until, ?),
              window_status = COALESCE(?, window_status),
+             consecutive_secondary_limits = consecutive_secondary_limits + ?,
              lock_version = lock_version + 1, updated_at = ?
        WHERE id = ?
+    SQL
+
+    # The other half of §10's exponential backoff: what ends a streak.
+    #
+    # Guarded in the WHERE rather than by a read-then-write, so the common case — every
+    # successful poll and every successful enrichment, on a service that has never seen a
+    # secondary limit — costs one statement that matches no row and takes no lock. Zero
+    # affected rows is the expected outcome here, not the LedgerInvariantViolation that
+    # #debit! raises on the same condition — a debit that matches no row means capacity was
+    # granted and then not taken, and this statement makes no such promise.
+    CLEAR_SECONDARY_STREAK_SQL = <<~SQL.squish
+      UPDATE github_api_budget
+         SET consecutive_secondary_limits = 0,
+             lock_version = lock_version + 1, updated_at = ?
+       WHERE id = ? AND consecutive_secondary_limits > 0
     SQL
 
     def initialize(configuration: Github.configuration, allocation: SourceAllocation.new(configuration: configuration))
@@ -315,20 +344,61 @@ module Github
       end
     end
 
+    # Ends the consecutive-secondary-limit streak that Github::RateLimitPolicy escalates
+    # from. Called for any live request that completed without a secondary limit — §10's
+    # backoff is exponential in *consecutive* limits, so one clean response is what breaks
+    # the run.
+    #
+    # A 304 counts as clean. It is a completed conditional request that GitHub answered
+    # and charged for, which is exactly the evidence that the IP is no longer being
+    # throttled.
+    #
+    # No row lock and no rollover check: this only ever writes a zero, so the worst a
+    # concurrent block can do is win and leave the streak at 1, which is the value that
+    # block just observed anyway.
+    #
+    # @return [Symbol] :cleared when a streak was ended, :unchanged when there was none
+    def clear_secondary_limit_streak!(now: Time.current)
+      assert_committable!
+
+      updated = GithubApiBudget.connection.exec_update(
+        ActiveRecord::Base.sanitize_sql_array([ CLEAR_SECONDARY_STREAK_SQL, now, SINGLETON_ID ]),
+        "Github::BudgetLedger ClearSecondaryStreak"
+      )
+
+      return :unchanged if updated.zero?
+
+      # §11 puts budget state transitions at INFO, and this one closes a story the
+      # budget.global_block_set lines opened: an operator reading a run of escalating
+      # blocks needs the line that says the escalation stopped.
+      Rails.logger.info(event: "budget.secondary_limit_streak_cleared")
+      :cleared
+    end
+
     private
 
     def apply_block!(budget, until_at:, reason:, window_status:, now:)
+      # Only a secondary limit advances the streak. A primary exhaustion and a reserve
+      # breach are conditions of the budget window, not of GitHub throttling this IP, and
+      # counting them would escalate a secondary block on evidence that has nothing to do
+      # with secondary limits.
+      increment = reason == :secondary_rate_limit ? 1 : 0
+
       GithubApiBudget.connection.exec_update(
-        ActiveRecord::Base.sanitize_sql_array([ BLOCK_SQL, until_at, window_status, now, SINGLETON_ID ]),
+        ActiveRecord::Base.sanitize_sql_array([ BLOCK_SQL, until_at, window_status, increment, now, SINGLETON_ID ]),
         "Github::BudgetLedger BlockGlobally"
       )
 
       # §11 lists "global_blocked_until set/cleared" among the budget state transitions
       # that belong at INFO. The instant is the field an operator greps for when nothing
       # is happening and nothing looks wrong.
+      #
+      # consecutive_secondary_limits is reported post-increment, because the number that
+      # explains the length of *this* block is the one that produced it.
       Rails.logger.info(event: "budget.global_block_set", reason: reason,
                         blocked_until: until_at.utc.iso8601,
                         previous_blocked_until: budget.global_blocked_until&.utc&.iso8601,
+                        consecutive_secondary_limits: budget.consecutive_secondary_limits + increment,
                         window_status: window_status || budget.window_status)
       :blocked
     end

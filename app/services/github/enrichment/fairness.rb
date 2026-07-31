@@ -27,7 +27,7 @@ module Github
       # happened rather than only that nothing did.
       class Choice < Data.define(:entity_type, :pool, :borrow, :reason)
         REASONS = %w[
-          pending borrowed_pending refresh
+          pending borrowed_pending refresh borrowed_refresh
           class_exhausted globally_blocked window_uninitialized no_candidate
         ].freeze
 
@@ -116,17 +116,35 @@ module Github
       # eligible". Read over every class, not only the requested one, so --class actor
       # cannot promote an actor refresh above a repository still waiting to be enriched
       # for the first time.
+      #
+      # Then §10:898's second constraint on the same line — refreshes run "within each
+      # class's share" — which makes this the same two-step #pending_choice performs, over
+      # a different pool: prefer a class that still has room, and only borrow when the
+      # other class genuinely has nothing to do. Picking the first refreshable class
+      # outright instead would hand actor every borrowed request in the window while
+      # repository's untouched guarantee and eligible stale rows were never selected, which
+      # is the class starvation the split exists to prevent, reproduced one pool down.
+      #
+      # The eligibility map is rebuilt over the *refresh* pool rather than reusing
+      # `eligible`. CandidateSelector#pending_available? is deliberately pending-only —
+      # counting refreshes there would let a refresh outrank a never-enriched candidate and
+      # invert §10's ladder — but that hazard cannot arise here: this method is only
+      # reached when no class has a pending candidate at all, so there is nothing left for
+      # a refresh to outrank.
       def refresh_choice(budget, requested, eligible, now:)
         return nil if eligible.values.any?
 
-        type = requested.find { |candidate| selector.refresh_available?(candidate, now: now) }
-        return nil if type.nil?
+        refreshable = EntityType.all.index_with { |type| selector.refresh_available?(type, now: now) }
+        available = requested.select { |type| refreshable.fetch(type) }
+        return nil if available.empty?
 
-        borrow = !room_within_guarantee?(budget, type)
-        # With no pending candidate anywhere, "the other class has no currently eligible
-        # candidate" is true by definition, so a refresh past the guarantee is a legal
-        # borrow rather than a starve.
-        Choice.new(entity_type: type, pool: :refresh, borrow: borrow, reason: "refresh")
+        within = available.find { |type| room_within_guarantee?(budget, type) }
+        return Choice.new(entity_type: within, pool: :refresh, borrow: false, reason: "refresh") if within
+
+        borrower = available.find { |type| other_classes_quiet?(type, refreshable) }
+        return nil if borrower.nil?
+
+        Choice.new(entity_type: borrower, pool: :refresh, borrow: true, reason: "borrowed_refresh")
       end
 
       # Derived from the *stored* enrichment_allowance, exactly as
@@ -142,6 +160,10 @@ module Github
 
       # §10's borrowing condition, verbatim: the other class has no CURRENTLY ELIGIBLE
       # candidate, not merely no rows.
+      #
+      # Generic over whichever eligibility map it is handed, because the condition is the
+      # same question asked of whichever pool is being allocated: #pending_choice passes
+      # the pending map, #refresh_choice the refresh one.
       def other_classes_quiet?(entity_type, eligible)
         eligible.except(entity_type).values.none?
       end

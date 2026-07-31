@@ -92,6 +92,31 @@ RSpec.describe GithubApiBudget do
     end
   end
 
+  # Not one of COUNTERS: nothing reserves against it and no allowance derives from it. It
+  # records how many secondary limits arrived in a row, which is what §10's exponential
+  # backoff escalates from.
+  describe "the consecutive-secondary-limit streak" do
+    it "starts at zero" do
+      expect(create_budget.consecutive_secondary_limits).to eq(0)
+    end
+
+    it "rejects a negative count at the database level" do
+      budget = create_budget
+
+      expect_violation(ActiveRecord::CheckViolation) do
+        described_class.where(id: budget.id).update_all(consecutive_secondary_limits: -1)
+      end
+    end
+
+    # Its own named constraint rather than a clause folded into the reservation counters',
+    # so a violation names the column that is actually wrong.
+    it "carries its own named check constraint" do
+      names = ActiveRecord::Base.connection.check_constraints("github_api_budget").map(&:name)
+
+      expect(names).to include("github_api_budget_secondary_limits_nonnegative")
+    end
+  end
+
   describe "optimistic locking" do
     it "refuses a stale write so concurrent reservations cannot be lost" do
       create_budget

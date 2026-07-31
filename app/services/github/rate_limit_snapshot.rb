@@ -24,11 +24,13 @@ module Github
           used: integer(headers["x-ratelimit-used"]),
           reset_at: epoch(headers["x-ratelimit-reset"]),
           poll_interval_seconds: integer(headers["x-poll-interval"]),
-          # Seconds only. GitHub documents a delta, and the HTTP-date form is left
-          # unparsed on purpose: §10 already defines the fallback for a missing
-          # Retry-After (at least a minute, with exponential backoff), so nil is a
-          # handled outcome rather than a gap.
-          retry_after_seconds: integer(headers["retry-after"]),
+          # Both RFC 9110 forms, normalized to a delta. GitHub documents delta-seconds and
+          # is the only server this application talks to, but Retry-After is one of §10's
+          # "headers to process" and an unread HTTP-date silently collapses a
+          # server-supplied "wait 45 minutes" into the 60-second fallback — obeying an
+          # instruction far shorter than the one that was given is the response most likely
+          # to provoke further throttling.
+          retry_after_seconds: retry_after(headers["retry-after"], observed_at: observed_at),
           etag: presence(headers["etag"]),
           observed_at: observed_at
         )
@@ -49,6 +51,29 @@ module Github
       def epoch(value)
         seconds = integer(value)
         seconds && Time.zone.at(seconds)
+      end
+
+      # Delta-seconds first, since that is what GitHub sends and what the majority of
+      # responses carry. The date form is resolved against observed_at rather than
+      # Time.current so the snapshot stays a pure function of its inputs — the same headers
+      # and the same observed_at always yield the same delta, which is what lets a spec
+      # assert an instant without freezing the clock.
+      #
+      # A date already in the past yields a non-positive delta. That is deliberately not
+      # normalized to nil here: this class reads and never decides, and
+      # Github::RateLimitPolicy#fallback_instant already treats non-positive exactly as it
+      # treats absent.
+      def retry_after(value, observed_at:)
+        integer(value) || http_date_delta(value, observed_at: observed_at)
+      end
+
+      def http_date_delta(value, observed_at:)
+        text = presence(value)
+        return nil if text.nil? || observed_at.nil?
+
+        (Time.httpdate(text) - observed_at).round
+      rescue ArgumentError
+        nil
       end
     end
 

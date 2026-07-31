@@ -110,18 +110,38 @@ RSpec.describe Github::RateLimitPolicy do
       expect(current_budget.global_blocked_until).to eq(now + described_class::MAX_BLOCK_SECONDS)
     end
 
-    # RateLimitSnapshot parses only the delta-seconds form and deliberately leaves the
-    # HTTP-date form nil. Absent, zero, negative and unparseable all mean the same thing:
-    # no usable instruction. `now + nil` raises and `now + nil.to_i` is no block at all,
-    # which is the response most likely to escalate GitHub's throttling.
-    it "backs off on its own terms when Retry-After is absent, zero, or an HTTP-date" do
-      [ nil, "0", "-5", "Wed, 21 Oct 2026 07:28:00 GMT" ].each do |value|
-        current_budget.update!(global_blocked_until: nil)
+    # Absent, zero, negative and unparseable all mean the same thing: no usable
+    # instruction. `now + nil` raises and `now + nil.to_i` is no block at all, which is the
+    # response most likely to escalate GitHub's throttling.
+    #
+    # The streak is reset between iterations so each case is measured against the same
+    # first-failure delay; the escalation across a genuine run is asserted separately below.
+    it "backs off on its own terms when Retry-After is absent, zero, negative, or unparseable" do
+      [ nil, "0", "-5", "immediately" ].each do |value|
+        current_budget.update!(global_blocked_until: nil, consecutive_secondary_limits: 0)
         headers = value.nil? ? {} : { "retry-after" => value }
 
         expect { policy.apply!(rate_limited(remaining: "42", **headers), now: now) }.not_to raise_error
         expect(current_budget.global_blocked_until).to eq(now + described_class::MIN_BLOCK_SECONDS)
       end
+    end
+
+    # RFC 9110 permits both Retry-After forms and §10 lists the header among the ones to
+    # process without qualifying which. Leaving the date form unread would collapse a
+    # server-supplied "wait 45 minutes" into the 60-second fallback — obeying an
+    # instruction far shorter than the one given.
+    it "honours an HTTP-date Retry-After, resolved against the observation instant" do
+      policy.apply!(rate_limited(remaining: "42", "retry-after" => (now + 900).httpdate), now: now)
+
+      expect(current_budget.global_blocked_until).to eq(now + 900)
+    end
+
+    # A date already in the past carries no usable instruction, so it falls through to the
+    # same backoff as an absent header rather than producing a block in the past.
+    it "falls back when the HTTP-date has already passed" do
+      policy.apply!(rate_limited(remaining: "42", "retry-after" => (now - 300).httpdate), now: now)
+
+      expect(current_budget.global_blocked_until).to eq(now + described_class::MIN_BLOCK_SECONDS)
     end
 
     # A secondary limit expires on a Retry-After unrelated to the window boundary, and
@@ -131,6 +151,108 @@ RSpec.describe Github::RateLimitPolicy do
       policy.apply!(rate_limited(remaining: "42", "retry-after" => "300"), now: now)
 
       expect(current_budget).to be_active
+    end
+
+    # §10: "set global_blocked_until from Retry-After (or >= 1 minute with exponential
+    # backoff when the header is absent)". Without the streak the second half of that
+    # sentence does not exist: a hardcoded first attempt makes every block in a run the
+    # same ~60 seconds, so an IP GitHub is actively throttling is re-probed at a constant
+    # rate for as long as the throttling lasts.
+    describe "a run of secondary limits with no Retry-After" do
+      def block_delays(count)
+        (1..count).map do
+          current_budget.update!(global_blocked_until: nil)
+          policy.apply!(rate_limited(remaining: "42"), now: now)
+          (current_budget.global_blocked_until - now).to_i
+        end
+      end
+
+      it "escalates exponentially from the minimum block" do
+        expect(block_delays(4)).to eq([ 60, 120, 240, 480 ])
+      end
+
+      it "counts each limit once, on the row every process reads" do
+        block_delays(3)
+
+        expect(current_budget.consecutive_secondary_limits).to eq(3)
+      end
+
+      # Waiting longer than a window buys nothing — the quota has refreshed by then — and
+      # an unbounded ladder would defer a recovered IP into next week.
+      it "caps at one rate-limit window" do
+        current_budget.update!(consecutive_secondary_limits: 20)
+
+        expect(block_delays(1)).to eq([ described_class::MAX_BLOCK_SECONDS ])
+      end
+
+      # The escalation is in *consecutive* limits, so one live request that GitHub answers
+      # without throttling ends the run and the next block starts from the floor again.
+      it "starts over after a request completes without a secondary limit" do
+        block_delays(3)
+
+        policy.apply!(fetched(status: 200, headers: { "x-ratelimit-resource" => "core" }), now: now)
+
+        expect(current_budget.consecutive_secondary_limits).to eq(0)
+        expect(block_delays(1)).to eq([ 60 ])
+      end
+
+      # A 304 is a completed conditional request that GitHub answered and charged for,
+      # which is the same evidence a 200 carries: this IP is not being throttled.
+      it "treats a 304 as evidence the throttling ended" do
+        block_delays(2)
+
+        policy.apply!(fetched(status: 304, headers: { "x-ratelimit-resource" => "core" }), now: now)
+
+        expect(current_budget.consecutive_secondary_limits).to eq(0)
+      end
+
+      # A timeout or a 5xx is GitHub failing to answer, not GitHub declining to throttle.
+      # Neither escalating nor clearing on it is what keeps the count a record of verdicts.
+      it "leaves the streak alone when the request never got a verdict" do
+        block_delays(2)
+
+        policy.apply!(fetched(status: nil, error: Github::Errors::RequestTimeout.new("boom"),
+                              classification: :timeout), now: now)
+
+        expect(current_budget.consecutive_secondary_limits).to eq(2)
+      end
+
+      # The two conditions are unrelated: a primary exhaustion is relieved by the window
+      # rolling, and deferring it on an unrelated secondary run would strand the poller
+      # past its own reset.
+      it "does not escalate a primary-limit fallback on the secondary streak" do
+        current_budget.update!(consecutive_secondary_limits: 5, global_blocked_until: nil)
+
+        # remaining "0" with no parseable reset is the primary branch's fallback path.
+        policy.apply!(fetched(status: 403, headers: {
+                                "x-ratelimit-remaining" => "0", "x-ratelimit-limit" => "60",
+                                "x-ratelimit-resource" => "core"
+                              }), now: now)
+
+        expect(current_budget.global_blocked_until).to eq(now + described_class::MIN_BLOCK_SECONDS)
+      end
+    end
+
+    # Every other example here injects rand: 0.0, which makes the assertions exact and
+    # would equally pass if jitter had been dropped from the production path. These two
+    # pin that a real Random reaches global_blocked_until, without making the suite
+    # depend on a draw.
+    describe "jitter on the fallback block" do
+      let(:band) { (now + described_class::MIN_BLOCK_SECONDS)..(now + (described_class::MIN_BLOCK_SECONDS * 1.25)) }
+
+      it "reaches the persisted block through a seeded Random" do
+        seeded = described_class.new(backoff: Github::PollBackoff.new(random: Random.new(20_260_731)))
+
+        seeded.apply!(rate_limited(remaining: "42"), now: now)
+
+        expect(current_budget.global_blocked_until).to be_between(band.first, band.last).exclusive
+      end
+
+      it "reaches it through the production default too" do
+        described_class.new.apply!(rate_limited(remaining: "42"), now: now)
+
+        expect(current_budget.global_blocked_until).to be_between(band.first, band.last)
+      end
     end
   end
 

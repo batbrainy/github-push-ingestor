@@ -22,6 +22,7 @@ RSpec.describe "Core data model schema" do
         window_status window_initialized_at
         poll_allowance poll_used enrichment_allowance enrichment_used
         actor_share_used repository_share_used reserve
+        consecutive_secondary_limits
         observed_at lock_version created_at updated_at
       ])
     end

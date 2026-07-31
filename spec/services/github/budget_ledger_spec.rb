@@ -502,6 +502,93 @@ RSpec.describe Github::BudgetLedger do
     end
   end
 
+  # The count §10's exponential backoff escalates from. It is written here, under the same
+  # row lock that writes the block it feeds, and read by Github::RateLimitPolicy.
+  describe "the consecutive-secondary-limit streak" do
+    def block(reason, until_at: frozen_time + 60)
+      ledger.block_globally!(until_at: until_at, reason: reason, now: frozen_time)
+    end
+
+    it "counts a secondary limit" do
+      active_window
+
+      3.times { block(:secondary_rate_limit) }
+
+      expect(current_budget.consecutive_secondary_limits).to eq(3)
+    end
+
+    # A primary exhaustion and a reserve breach are conditions of the budget window, not
+    # evidence that GitHub is throttling this IP. Counting them would escalate a secondary
+    # block from a run that contained no secondary limits.
+    it "ignores the two block reasons that are not secondary limits" do
+      active_window
+
+      block(:primary_rate_limit, until_at: frozen_time + 3600)
+      block(:reserve_reached, until_at: frozen_time + 3600)
+
+      expect(current_budget.consecutive_secondary_limits).to eq(0)
+    end
+
+    describe "#clear_secondary_limit_streak!" do
+      it "ends a run and reports that it did" do
+        active_window
+        2.times { block(:secondary_rate_limit) }
+
+        expect(ledger.clear_secondary_limit_streak!(now: frozen_time)).to eq(:cleared)
+        expect(current_budget.consecutive_secondary_limits).to eq(0)
+      end
+
+      # The common case by an enormous margin: every successful request on a service that
+      # has never been throttled. It must cost one statement that matches nothing rather
+      # than a read, a lock, and a write.
+      it "is a silent no-op when there is no run" do
+        before_version = active_window.lock_version
+
+        expect(ledger.clear_secondary_limit_streak!(now: frozen_time)).to eq(:unchanged)
+        expect(current_budget.lock_version).to eq(before_version)
+      end
+
+      it "does nothing when no row exists" do
+        expect(ledger.clear_secondary_limit_streak!(now: frozen_time)).to eq(:unchanged)
+        expect(GithubApiBudget.count).to eq(0)
+      end
+
+      it "refuses to run inside an application transaction" do
+        active_window
+
+        expect do
+          ActiveRecord::Base.transaction(joinable: true) { ledger.clear_secondary_limit_streak!(now: frozen_time) }
+        end.to raise_error(Github::Errors::NestedTransaction)
+      end
+    end
+
+    # §10 calls secondary limits IP-scoped, which is a different scope from the primary
+    # window ROLL_WINDOW_SQL resets. Zeroing the streak at the boundary would hand a
+    # persistently throttled IP a fresh 60-second block every hour.
+    it "survives a window rollover" do
+      active_window
+      2.times { block(:secondary_rate_limit) }
+
+      ledger.reserve!(:poll, now: frozen_time + 3601)
+
+      expect(current_budget).to have_attributes(consecutive_secondary_limits: 2,
+                                                window_status: "uninitialized")
+    end
+
+    # The counters the ledger reserves against are untouched by either write, which is why
+    # neither can return capacity a request already spent.
+    it "leaves the reservation counters alone" do
+      active_window
+      ledger.reserve!(:poll, now: frozen_time)
+
+      block(:secondary_rate_limit)
+      ledger.clear_secondary_limit_streak!(now: frozen_time)
+
+      expect(current_budget).to have_attributes(poll_used: 1, enrichment_used: 0,
+                                                actor_share_used: 0, repository_share_used: 0)
+    end
+  end
+
   # Both guards used to key on the window_status string. That was safe while the column
   # held two values in practice; it stopped being safe once a global block could write a
   # third, so each now keys on the fact it actually means.
@@ -531,9 +618,15 @@ RSpec.describe Github::BudgetLedger do
 
   describe "failures stay spent (plan §7)" do
     # The guarantee is structural: there is no code path that gives a request back.
+    #
+    # #clear_secondary_limit_streak! writes one column, consecutive_secondary_limits, which
+    # no reservation reads and no counter derives from. It cannot return capacity for the
+    # same reason #block_globally! cannot: neither touches poll_used, enrichment_used, or
+    # either share counter.
     it "exposes no way to credit a reservation back" do
       expect(described_class.instance_methods(false)).to contain_exactly(
-        :reserve!, :reconcile!, :bootstrap!, :block_globally!, :configuration, :allocation
+        :reserve!, :reconcile!, :bootstrap!, :block_globally!, :clear_secondary_limit_streak!,
+        :configuration, :allocation
       )
     end
 
