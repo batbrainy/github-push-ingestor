@@ -160,16 +160,17 @@ compose() {
   GITHUB_MODE=fixture GITHUB_FIXTURE_SCENARIO="$RECOVERY_FIXTURE_SCENARIO" docker compose "$@"
 }
 
-# If an unexpected command fails after test isolation stops the worker, the EXIT trap is the
-# last line of defence against leaving the reviewer's stack disabled. The phase also performs
-# and verifies an explicit restart on its normal path; this is only emergency cleanup.
+# If an unexpected command fails after a phase stops the worker — test isolation and the
+# fixture scenarios both do — the EXIT trap is the last line of defence against leaving the
+# reviewer's stack disabled. Each phase also performs an explicit restart on its normal path;
+# this is only emergency cleanup.
 TEST_WORKER_RESTART_PENDING=0
 restore_test_worker_on_exit() {
   if [ "$TEST_WORKER_RESTART_PENDING" = "1" ]; then
     if compose start worker >/dev/null 2>&1; then
       TEST_WORKER_RESTART_PENDING=0
     else
-      echo "warning: could not restore the worker stopped for test isolation" >&2
+      echo "warning: could not restore the worker this verification stopped" >&2
     fi
   fi
 }
@@ -874,7 +875,25 @@ phase_scenarios() {
   # matching id, which RepositoryDocument.parse checks), and the worker is stopped for the
   # duration so nothing else can move last_seen_at underneath the selection.
   echo "\$ docker compose stop worker    # so nothing re-orders the candidate set mid-scenario"
-  compose stop worker >/dev/null 2>&1
+  # Armed before the attempt, not after: an interrupted stop can leave the worker down
+  # while reporting a nonzero status, and the trap must cover that window too. Starting a
+  # worker that never stopped is harmless.
+  TEST_WORKER_RESTART_PENDING=1
+  if compose stop worker >/dev/null 2>&1; then
+    scenario_stop_status=0
+  else
+    scenario_stop_status=$?
+  fi
+  check "the worker stopped for the scenario phase" "0" "$scenario_stop_status"
+
+  if [ "$scenario_stop_status" -ne 0 ]; then
+    echo
+    echo "The worker could not be stopped, so the scenarios are skipped rather than run"
+    echo "against a candidate set a concurrent poll can re-order. The final verdict"
+    echo "remains failed."
+    return 0
+  fi
+
   sleep 3
   echo
 
@@ -884,7 +903,14 @@ phase_scenarios() {
     "an off-host redirect is refused by the URL policy"
 
   echo "\$ docker compose start worker"
-  compose start worker >/dev/null 2>&1
+  if compose start worker >/dev/null 2>&1 && \
+    wait_for "the worker stopped for the scenario phase to be running again" 60 running worker; then
+    scenario_worker_start_status=0
+    TEST_WORKER_RESTART_PENDING=0
+  else
+    scenario_worker_start_status=$?
+  fi
+  check "the worker restarted after the scenario phase" "0" "$scenario_worker_start_status"
   echo
 
   count_header

@@ -152,8 +152,8 @@ module Github
       #
       # §11 puts "reactivated" at INFO, and it belongs there rather than at DEBUG: an
       # entity coming back from skipped_budget is the observable half of §10's bounded
-      # backlog, and reviewer verification step 7 asks for exactly this to be absent on a
-      # replay.
+      # backlog, and the README's Phase B replay check greps for exactly this event to be
+      # absent on a replay.
       def reactivate(outcome, run_id:, received_at:)
         [ [ GithubActor, outcome.actor_attributes, :github_actor_id ],
           [ GithubRepository, outcome.repository_attributes, :github_repository_id ] ].each do |model, attributes, log_key|

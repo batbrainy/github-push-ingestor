@@ -26,6 +26,25 @@ jobs:
           # missing.
           test -f docs/DESIGN_BRIEF.md
 
+  # The same three gates config/ci.rb declares for the local bin/ci pipeline, so the
+  # declared tooling has a CI execution record and cannot silently rot. None of the
+  # three needs a database: RuboCop and Brakeman are static, and bundler-audit reads
+  # the lockfile against the freshly cloned advisory database.
+  analysis:
+    name: Style and security analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+      - name: Ruby style (RuboCop)
+        run: bin/rubocop
+      - name: Gem vulnerability audit (bundler-audit)
+        run: bin/bundler-audit
+      - name: Static security analysis (Brakeman)
+        run: bin/brakeman --quiet --no-pager --exit-on-warn --exit-on-error
+
   # The real suite runs from PR 3 onward (IMPLEMENTATION_PLAN.md §13). Ruby is pinned
   # from .ruby-version — the same pin the Dockerfile uses — so CI and the image can
   # never drift.
