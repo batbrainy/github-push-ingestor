@@ -1305,7 +1305,8 @@ Sections 1–17 and Appendices A–D preserve the frozen architecture from 2026-
 claim without changing behavior or architecture. This appendix records that clarification
 and the implementation deltas required by Section 14.
 
-The plan held. Every P0 story and extension shipped, no descope rung was used, and the
+The plan held. Every P0 story and every attempted extension (A, B, D) shipped — C stayed
+the declared non-goal it always was — no descope rung was used, and the
 executor chain, lock-order invariant, class-aware ledger, event uniqueness constraint, and
 distinct-event activity gate are what was frozen. What follows is the delta, and most of it
 is the plan meeting a fact it could not have known in advance.

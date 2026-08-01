@@ -153,6 +153,12 @@ docker compose run --rm test
 docker compose logs -f
 ```
 
+**How long before results appear:** the fixture phases below produce rows immediately.
+In live mode the worker's first poll attempt can land within about a minute of startup
+and repeats on the default 5-minute cadence, but the public feed itself delivers a push
+with a documented latency of 30 seconds to 6 hours — see
+[Expected time before records appear](#expected-time-before-records-appear).
+
 For a reproducible review, run the phases below **in order** from a fresh clone. Compose fixes
 the project name to `github-push-ingestor`, so every clone on a Docker host refers to the same
 `github-push-ingestor_pgdata` volume. Do not assume a fresh clone means a fresh database.
@@ -528,9 +534,9 @@ bypass, so allow a minute between successive ingestion scenarios.
 | `rate_limited` | `GITHUB_FIXTURE_SCENARIO=rate_limited … ingest` | primary exhaustion → `global_blocked_until` | **a real one-hour global block** |
 
 The last two leave durable state behind on purpose — that is the behaviour being demonstrated.
-`script/verify_recovery.sh --phase=cleanup` runs the SQL under
+`script/verify_recovery.sh --confirm --phase=cleanup` runs the SQL under
 [Recovering from a fixture rate-limit run](#recovering-from-a-fixture-rate-limit-run), and
-`--phase=rate-limit` plays the rate-limit scenario and cleans up immediately after.
+`--confirm --phase=rate-limit` plays the rate-limit scenario and cleans up immediately after.
 
 ## Inspecting the data
 
@@ -1422,6 +1428,7 @@ state can be reconstructed.
 | `ingest` exits `2` | Unknown option, a refused configuration, or a fixture-corpus gap | `docker compose run --rm ingest --help` |
 | Worker logs nothing | `setup` did not complete, so `worker` never started | `docker compose logs setup` |
 | `/health/ready` fails while `/health/live` is fine | Database unreachable or schema not loaded. `web`'s healthcheck curls `/health/live`, so `web` stays green through a `db` outage | `docker compose ps`, `docker compose logs db` |
+| `up` fails with `Bind for 0.0.0.0:3000 failed: port is already allocated` | Another process owns host port 3000 | Free port 3000, or edit `web`'s `ports:` mapping in `docker-compose.yml` |
 | Enrichment stuck at `pending` | The allowance is spent for this window, or the window is not `active` yet | `curl -s localhost:3000/status \| jq .ledger` |
 
 ### When a source goes out of service
@@ -1476,7 +1483,7 @@ Three levels, least destructive first.
 once:
 
 ```bash
-script/verify_recovery.sh --phase=cleanup
+script/verify_recovery.sh --confirm --phase=cleanup
 ```
 
 **Level 2 — drop the business data, keep the volume.**
@@ -1521,8 +1528,9 @@ The feed retains 30 days. At `MAX_PAGES_PER_POLL=1` each poll sees at most the
 newest ~100 events, and the feed moves considerably faster than that. **This service
 samples the public feed rather than mirroring it.**
 
-The eight limitations that follow are consequences of that, and of the 60-request hourly
-ceiling. None is a gap to be closed later; each is a stated boundary.
+The nine limitations that follow are consequences of that, of the 60-request hourly
+ceiling, and of deliberate scope decisions. None is a gap to be closed later; each is a
+stated boundary.
 
 **1. Enrichment is sampled, not exhaustive.** One observed live page held ~92–95
 `PushEvent` records with ~89 distinct actors and ~92 distinct repositories — 181 cold
@@ -1561,7 +1569,22 @@ no never-enriched candidate is eligible anywhere.
 
 **8. Extension C (object storage) was deliberately not attempted.** A decision with a
 stated reason, not an omission — the remaining budget went to rate-limit correctness,
-durability, and reviewer experience.
+durability, and reviewer experience. The other optional extensions are implemented:
+Extension A (rate limiting and fan-out control) is the class-aware ledger, request gate,
+and background processing under [Rate limits and the request
+budget](#rate-limits-and-the-request-budget) and [Continuous
+ingestion](#continuous-ingestion); Extension B (idempotency and restart safety) is
+[Processing guarantees](#processing-guarantees) and [Crash recovery
+verification](#crash-recovery-verification); Extension D (testing strategy) is
+[Deterministic fixture verification](#deterministic-fixture-verification) and the suite
+described there.
+
+**9. Business tables grow without bound, by design.** `push_events`, `ingestion_runs`,
+and `quarantined_events` are append-only — this service is the system of record, and
+retention, pruning, and archival were deliberately not built. The 60-request hourly
+ceiling keeps the worst case modest (twelve poll attempts and at most ~100 events per
+hour); the only shipped pruning is Solid Queue's finished-job cleanup in the queue
+database, which holds no business data.
 
 ## Development
 

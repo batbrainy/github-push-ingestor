@@ -23,3 +23,6 @@
 /coverage/
 /spec/reports/
 /spec/examples.txt
+
+# AI tooling local state — never part of the submission
+/.claude/

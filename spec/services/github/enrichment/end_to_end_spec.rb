@@ -150,8 +150,8 @@ RSpec.describe "enrichment end to end", type: :integration do
       expect(actor.reload).to have_attributes(enrichment_status: "pending", skipped_at: nil)
     end
 
-    # §7 rule 4, and reviewer verification step 7: "confirm … that no skipped entity was
-    # reactivated by the replay".
+    # §7 rule 4, and the README's Phase B replay check: a duplicate replay must emit no
+    # enrichment.reactivated event.
     it "never reactivates a skipped entity on a duplicate replay" do
       GithubActor.where(github_id: 583_231)
                  .update_all(enrichment_status: "skipped_budget", skipped_at: now)

@@ -160,16 +160,17 @@ compose() {
   GITHUB_MODE=fixture GITHUB_FIXTURE_SCENARIO="$RECOVERY_FIXTURE_SCENARIO" docker compose "$@"
 }
 
-# If an unexpected command fails after test isolation stops the worker, the EXIT trap is the
-# last line of defence against leaving the reviewer's stack disabled. The phase also performs
-# and verifies an explicit restart on its normal path; this is only emergency cleanup.
+# If an unexpected command fails after a phase stops the worker — test isolation and the
+# fixture scenarios both do — the EXIT trap is the last line of defence against leaving the
+# reviewer's stack disabled. Each phase also performs an explicit restart on its normal path;
+# this is only emergency cleanup.
 TEST_WORKER_RESTART_PENDING=0
 restore_test_worker_on_exit() {
   if [ "$TEST_WORKER_RESTART_PENDING" = "1" ]; then
     if compose start worker >/dev/null 2>&1; then
       TEST_WORKER_RESTART_PENDING=0
     else
-      echo "warning: could not restore the worker stopped for test isolation" >&2
+      echo "warning: could not restore the worker this verification stopped" >&2
     fi
   fi
 }
@@ -874,7 +875,9 @@ phase_scenarios() {
   # matching id, which RepositoryDocument.parse checks), and the worker is stopped for the
   # duration so nothing else can move last_seen_at underneath the selection.
   echo "\$ docker compose stop worker    # so nothing re-orders the candidate set mid-scenario"
-  compose stop worker >/dev/null 2>&1
+  if compose stop worker >/dev/null 2>&1; then
+    TEST_WORKER_RESTART_PENDING=1
+  fi
   sleep 3
   echo
 
@@ -884,7 +887,9 @@ phase_scenarios() {
     "an off-host redirect is refused by the URL policy"
 
   echo "\$ docker compose start worker"
-  compose start worker >/dev/null 2>&1
+  if compose start worker >/dev/null 2>&1; then
+    TEST_WORKER_RESTART_PENDING=0
+  fi
   echo
 
   count_header
