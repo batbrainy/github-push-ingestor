@@ -12,7 +12,9 @@ Status: Historical first-party observation; superseded for submission gating
 > recreation. A recreated worker could therefore default to live mode and spend GitHub
 > budget. The transcript is preserved verbatim below as a historical observation. Re-run the
 > corrected script against the final default-branch SHA and record that result in the
-> external findings report.
+> external findings report. That re-run is now recorded:
+> [`2026-08-01-post-merge-verification.md`](2026-08-01-post-merge-verification.md) gate 1.18
+> ran the corrected script against `88e2260c` — 45 checks passed, 0 failed.
 
 ## Why this verification exists
 

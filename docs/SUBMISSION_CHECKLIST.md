@@ -3,9 +3,11 @@
 Repository: https://github.com/batbrainy/github-push-ingestor
 
 This is a reusable runbook, not a record of one run. Keep the boxes unchecked in the
-repository. The external findings report records the default-branch SHA, UTC date, command,
-exit code, salient output, duration, and one classification for every gate: pass, repository
-defect, environment issue, or documentation mismatch.
+repository. The external findings report — most recently
+[`docs/evidence/2026-08-01-post-merge-verification.md`](evidence/2026-08-01-post-merge-verification.md)
+— records the default-branch SHA, UTC date, command, exit code, salient output, duration,
+and one classification for every gate: pass, repository defect, environment issue, or
+documentation mismatch.
 
 Run every gate against the default branch after the final hardening change merges, from a
 fresh clone — never against a working tree. A working tree can hide an untracked `.env` or
