@@ -875,9 +875,25 @@ phase_scenarios() {
   # matching id, which RepositoryDocument.parse checks), and the worker is stopped for the
   # duration so nothing else can move last_seen_at underneath the selection.
   echo "\$ docker compose stop worker    # so nothing re-orders the candidate set mid-scenario"
+  # Armed before the attempt, not after: an interrupted stop can leave the worker down
+  # while reporting a nonzero status, and the trap must cover that window too. Starting a
+  # worker that never stopped is harmless.
+  TEST_WORKER_RESTART_PENDING=1
   if compose stop worker >/dev/null 2>&1; then
-    TEST_WORKER_RESTART_PENDING=1
+    scenario_stop_status=0
+  else
+    scenario_stop_status=$?
   fi
+  check "the worker stopped for the scenario phase" "0" "$scenario_stop_status"
+
+  if [ "$scenario_stop_status" -ne 0 ]; then
+    echo
+    echo "The worker could not be stopped, so the scenarios are skipped rather than run"
+    echo "against a candidate set a concurrent poll can re-order. The final verdict"
+    echo "remains failed."
+    return 0
+  fi
+
   sleep 3
   echo
 
@@ -887,9 +903,14 @@ phase_scenarios() {
     "an off-host redirect is refused by the URL policy"
 
   echo "\$ docker compose start worker"
-  if compose start worker >/dev/null 2>&1; then
+  if compose start worker >/dev/null 2>&1 && \
+    wait_for "the worker stopped for the scenario phase to be running again" 60 running worker; then
+    scenario_worker_start_status=0
     TEST_WORKER_RESTART_PENDING=0
+  else
+    scenario_worker_start_status=$?
   fi
+  check "the worker restarted after the scenario phase" "0" "$scenario_worker_start_status"
   echo
 
   count_header

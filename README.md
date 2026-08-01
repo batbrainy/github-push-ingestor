@@ -1582,9 +1582,10 @@ described there.
 **9. Business tables grow without bound, by design.** `push_events`, `ingestion_runs`,
 and `quarantined_events` are append-only — this service is the system of record, and
 retention, pruning, and archival were deliberately not built. The 60-request hourly
-ceiling keeps the worst case modest (twelve poll attempts and at most ~100 events per
-hour); the only shipped pruning is Solid Queue's finished-job cleanup in the queue
-database, which holds no business data.
+ceiling bounds the worst case: twelve poll attempts an hour at up to ~100 events each
+is at most ~1,200 rows an hour, fewer after duplicate skips. The only shipped pruning
+is Solid Queue's finished-job cleanup in the queue database, which holds no business
+data.
 
 ## Development
 
