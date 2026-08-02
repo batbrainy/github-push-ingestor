@@ -28,6 +28,13 @@ RSpec.describe Github::Enrichment::CandidateSelector do
       expect(next_pending).to eq(oldest)
     end
 
+    it "applies the same oldest-created FIFO to repositories" do
+      oldest = create_repository(github_id: 1, created_at: now - 600)
+      create_repository(github_id: 2, created_at: now - 10)
+
+      expect(next_pending(repository_type)).to eq(oldest)
+    end
+
     # PageWriter creates many stubs in one page with one timestamp. The ascending id tie
     # break preserves insertion order rather than letting PostgreSQL choose a plan-dependent
     # winner on every reconciliation tick.
