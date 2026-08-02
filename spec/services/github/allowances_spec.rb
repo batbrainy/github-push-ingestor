@@ -161,7 +161,7 @@ RSpec.describe Github::Allowances do
     end
 
     # The single strongest argument for deriving the guarantees rather than storing them:
-    # members computed at .derive would have frozen the pre-clamp 2/2 into the clamped
+    # members computed at .derive would have frozen the pre-clamp 20/20 into the clamped
     # copy, and the ledger would enforce guarantees the clamped allowance cannot fund.
     it "recomputes the guarantees from the clamped allowance rather than from the derived one" do
       derived = described_class.derive(configuration: configuration, limit: 15)

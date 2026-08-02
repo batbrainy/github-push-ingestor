@@ -76,7 +76,7 @@ feasible ⇔ poll_allowance + RATE_LIMIT_RESERVE
            + CORE_DETAIL_FALLBACK_ALLOWANCE ≤ rate_limit
 ```
 
-With defaults: 12 poll attempts, 4 detail-fallback attempts split 2/2 by
+With defaults: 12 poll attempts, 40 detail-fallback attempts split 20/20 by
 `ACTOR_ENRICHMENT_SHARE`, and a reserve of 8 — the three lanes fill the limit exactly.
 Normal-path enrichment spends the **search** resource instead — a separate singleton
 ledger over GitHub's per-minute Search window (ceiling 10, reserve 2, 6-second pacing),

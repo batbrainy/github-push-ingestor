@@ -871,7 +871,7 @@ With defaults:
 
 ```text
 ceil(3600 / 300) × 1 × 1 = 12 poll attempts/hour
-12 poll + 4 detail fallback + 8 reserve = 24 ≤ 60
+12 poll + 40 detail fallback + 8 reserve = 60
 ```
 
 | Allocation | Default |
@@ -929,7 +929,7 @@ poll_class_blocked_until       = poll_used >= poll_allowance ? reset_at : nil
 enrichment_class_blocked_until = enrichment_used >= enrichment_allowance ? reset_at : nil
 ```
 
-So the detail-fallback lane exhausting its 4 attempts never stops polling, and polling exhausting its 12 never stops enrichment — batch enrichment does not even spend core. Actor/repository share exhaustion lives inside `BudgetLedger.reserve!(:actor | :repository)` and never touches the global block; search-window exhaustion lives in the search ledger and blocks only search. A routine future `X-RateLimit-Reset` on a successful response never defers anything.
+So the detail-fallback lane exhausting its 40 attempts never stops polling, and polling exhausting its 12 never stops enrichment — batch enrichment does not even spend core. Actor/repository share exhaustion lives inside `BudgetLedger.reserve!(:actor | :repository)` and never touches the global block; search-window exhaustion lives in the search ledger and blocks only search. A routine future `X-RateLimit-Reset` on a successful response never defers anything.
 
 **Secondary rate limits are global.** They are IP-scoped, and they can arise on *any* live request — including enrichment, which has no source row. On any secondary-limit response: set `global_blocked_until` from `Retry-After` (or ≥ 1 minute with exponential backoff when the header is absent), also update the request-specific source or entity retry state, and stop all live requests until the block expires.
 
@@ -1652,8 +1652,8 @@ with a limit of 10; and joining exact qualifiers with `OR` produced HTTP 422.
   payload-provided `api_url` through the core ledger's
   `CORE_DETAIL_FALLBACK_ALLOWANCE` (40/hour). The fallback never constructs a URL from an
   identifier and never touches the polling allocation.
-- **Dual ledgers.** `github_api_budget` (core: 12 poll + 4 detail fallback + 8 reserve
-  ≤ 60, remainder deliberately unspent) and `github_search_budget` (per-minute search)
+- **Dual ledgers.** `github_api_budget` (core: 12 poll + 40 detail fallback + 8 reserve
+  = 60) and `github_search_budget` (per-minute search)
   are reconciled independently against their own `x-ratelimit-resource` headers. The
   global request gate still serializes all outbound requests.
 - **A useful-data completion contract per entity.** Completion is an explicit, queryable
@@ -1747,6 +1747,6 @@ What supersedes what: Appendix F's durable-backlog invariants (rows survive quot
 windows; denial defers; FIFO by `created_at, id`; no quota terminal state) carry forward
 unchanged. Its one-request-per-entity service model, its "40 backlog-enrichment requests"
 core split, its refresh-suppression phrasing, and its refusal to publish any service rate
-are superseded by the staged batch path, the 12 + 4 + 8 core formula with the search
+are superseded by the staged batch path, the 12 + 40 + 8 core formula with the search
 budget beside it, the refresh composition rule, and the measured catch-up block. ADR 0013
 records the decision and its rejected alternatives.

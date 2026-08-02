@@ -17,7 +17,8 @@ CI.run do
   # that step has already initialized the rate-limit window and persisted the corpus's
   # stub entities, so this one exercises the whole §12 chain — poll, persist, stub,
   # enrich — across two real processes, offline and deterministically.
-  step "Tests: One-shot enrichment smoke", "env RAILS_ENV=test GITHUB_MODE=fixture bin/enrich"
+  step "Tests: One-shot enrichment smoke",
+       "env RAILS_ENV=test GITHUB_MODE=fixture SEARCH_PACING_SECONDS=0 bin/enrich --limit 6"
 
   # Solid Queue's own validator over config/queue.yml and config/recurring.yml. Starts no
   # process; catches an unparseable schedule or a task naming a class that does not exist.

@@ -1,9 +1,8 @@
 # Ledger rows in the state most reservations actually happen in.
 #
 # Shared between the ledgers' own specs and the executors', so "what an active window
-# looks like" is defined once. Core values match the plan's Appendix G defaults:
-# 12 poll + 4 detail fallback + 8 reserve on the hourly core resource; the search
-# window is the per-minute 10-ceiling / 2-reserve pair.
+# looks like" is defined once. The deliberately small core detail allowance keeps boundary
+# examples concise; the search window uses the default per-minute 10-ceiling / 2-reserve pair.
 module BudgetHelpers
   def active_budget_window(now: frozen_time, **overrides)
     Github::BudgetLedger.new.bootstrap!(now: now)

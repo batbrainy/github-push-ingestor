@@ -36,7 +36,7 @@ module Github
       # lane has nothing claimable. For search batches the borrow is purely a
       # scheduling fact — the search ledger has no per-lane caps and its actor_used /
       # repository_used counters exist for observability. For detail requests the flag
-      # travels to the core ledger, which enforces the 2/2 share split under its row
+      # travels to the core ledger, which enforces the 20/20 share split under its row
       # lock exactly as before.
       class LaneSchedule
         def initialize(actor_weight:, repository_weight:)
