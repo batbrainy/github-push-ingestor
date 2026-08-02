@@ -21,8 +21,8 @@ This probe answers three separate questions:
    actionable rather than becoming a terminal budget-skip outcome?
 3. Is the default unauthenticated capacity large enough to catch up with the live backlog?
 
-The first two answers are **yes**. The third answer is **no under the traffic observed in
-this short sample**.
+The first two answers are yes. The third answer is no under the traffic observed in
+this short sample.
 
 ## Method and safety boundary
 
@@ -72,7 +72,7 @@ actor pending=99
 repository pending=99
 ```
 
-One live page therefore created **198 cold entity rows** in this sample.
+One live page therefore created 198 cold entity rows in this sample.
 
 ## A live request exhausted the scaled allowance
 
@@ -163,7 +163,7 @@ id=2  status=complete  fetched_at=2026-08-02T16:28:27.667939Z
 enrichment_used=1 of 1  remaining=54  reserve=54
 ```
 
-This is a **controlled rollover/capacity-boundary test**, not evidence that a natural GitHub
+This is a controlled rollover/capacity-boundary test, not evidence that a natural GitHub
 hour elapsed. It shows that an old row survives denial and is selected again when the
 production ledger makes capacity available. The automated test described below covers a
 clock-driven later window deterministically.
@@ -186,11 +186,11 @@ allowance of 40 request attempts per window, that page alone requires:
 
 In other words, it needs capacity from five quota windows. That is not a 4.95-hour wall-clock
 lower bound: work may arrive near a reset and each window's capacity can be spent in a
-burst. It is also the optimistic request count—no new events, no retries, no redirects, and
+burst. It is also the optimistic request count: no new events, no retries, no redirects, and
 every request settling one entity.
 
 The controlled second poll ran about 193 seconds later and added another 94 actors and 96
-repositories: **190 new cold entity rows**. This is a short pressure sample, not a sustained
+repositories: 190 new cold entity rows. This is a short pressure sample, not a sustained
 arrival-rate measurement. It nevertheless confirms the order of magnitude behind the
 documented limitation. If default five-minute polls continue to receive pages with roughly
 190 cold entities, twelve polls add about 2,280 entity lookups per hour while at most 40
@@ -245,7 +245,7 @@ Automated tests intentionally block all external network access; a deterministic
 not depend on today's public event feed. The live transport proof above is therefore kept
 as dated evidence, while the state-machine guarantee is exercised offline.
 
-The correction adds an integration scenario with 23 actors and 23 repositories—46 durable
+The correction adds an integration scenario with 23 actors and 23 repositories, 46 durable
 rows, larger than the default 40-request enrichment allowance. It uses the real runner,
 fairness selector, request gate, budget ledger, claim, parser, and entity-state writer, with
 Faraday intercepted by WebMock:

@@ -15,7 +15,7 @@ Cited by:      README.md; docs/adr/0004-class-aware-budget-ledger.md;
 GitHub's events documentation states generally that `304` responses do not count against
 the rate limit. Its REST best-practices documentation scopes that exemption to requests
 "correctly authorized with an `Authorization` header". This service sends no token, so the
-two statements disagree about exactly the population of requests it makes — and the
+two statements disagree about exactly the population of requests it makes, and the
 difference decides whether an ETag is a quota saver or only a bandwidth saver.
 
 `IMPLEMENTATION_PLAN.md` §10 records two dated unauthenticated probes from 2026-07-28
@@ -28,8 +28,8 @@ review artifact.
 | # | Request | Status | `x-ratelimit-used` | `x-ratelimit-remaining` | `ETag` |
 |---|---|---|---:|---:|---|
 | R1 | `GET`, no `If-None-Match` | `200` | 4 | 56 | `W/"ce6813…abfd2"` |
-| R2 | `GET`, `If-None-Match: <R1 ETag>` | `304` | **5** | 55 | same |
-| R3 | `GET`, `If-None-Match: <R1 ETag>` | `304` | **6** | 54 | same |
+| R2 | `GET`, `If-None-Match: <R1 ETag>` | `304` | 5 | 55 | same |
+| R3 | `GET`, `If-None-Match: <R1 ETag>` | `304` | 6 | 54 | same |
 
 ```text
 x-ratelimit-limit:     60
@@ -40,15 +40,15 @@ x-poll-interval:       60          (corroborates §9's "observed 60")
 
 Local clock at each request: `18:44:09Z`, `18:44:12Z`, `18:44:14Z`.
 
-**On timestamps.** All three responses carry the *same* `Date: Thu, 30 Jul 2026 18:44:10
+On timestamps. All three responses carry the *same* `Date: Thu, 30 Jul 2026 18:44:10
 GMT`, alongside `cache-control: public, max-age=300` and an unchanged
 `last-modified: 18:39:08`. The `304`s echo the metadata of the cached representation rather
-than stamping a fresh instant, so `Date` fixes the hour but **cannot order the three
-requests** — the local clock above does that. That is not a weakness in the finding; it
+than stamping a fresh instant, so `Date` fixes the hour but cannot order the three
+requests. The local clock above does that. That is not a weakness in the finding; it
 sharpens it. The two `304`s were served from cache against an unchanged representation,
 doing no origin work at all, and each still cost a request.
 
-**`used` was already 4 after R1**, so three unauthenticated requests had been made from
+`used` was already 4 after R1, so three unauthenticated requests had been made from
 this IP earlier in the same window by something other than this probe. The shared-IP
 caveat below is therefore concrete rather than hypothetical.
 
@@ -59,12 +59,12 @@ Three requests, roughly two seconds apart:
 | # | Request | What it establishes |
 |---|---|---|
 | R1 | `GET`, no `If-None-Match` | The baseline `used`, and the ETag to replay |
-| R2 | Same URL, `If-None-Match: <R1 ETag>` | **The finding** — a `304` whose `used` is one higher |
-| R3 | Same URL, `If-None-Match: <R1 ETag>` | The control — the increment is per-`304`, not a one-off |
+| R2 | Same URL, `If-None-Match: <R1 ETag>` | The finding: a `304` whose `used` is one higher |
+| R3 | Same URL, `If-None-Match: <R1 ETag>` | The control: the increment is per-`304`, not a one-off |
 
 Two requests would be the theoretical minimum. R3 costs one more of sixty and answers the
 first question a skeptical reader asks: could another client behind the same IP have made
-a request between R1 and R2? R3 does not eliminate that — nothing can, from one IP — but a
+a request between R1 and R2? R3 does not eliminate that, since nothing can from one IP, but a
 coincidental co-tenant increment on *both* intervals is implausible.
 
 Headers sent on all three, and on nothing else:
@@ -77,15 +77,15 @@ User-Agent: github-push-ingestor
 
 The `User-Agent` is byte-identical to `Github::Request::PROTOCOL_HEADERS`, so this is
 evidence about the requests this application actually makes rather than about a
-differently-identified client. **No `Authorization` header is sent** — that is the entire
+differently-identified client. No `Authorization` header is sent. That is the entire
 point, since the documented exemption is scoped to requests that carry one. A normal `GET`
 is used rather than `curl -I`, which would send `HEAD`.
 
-**Redaction rule.** `x-github-request-id`, `set-cookie` and `x-runtime-rid` are replaced
+Redaction rule. `x-github-request-id`, `set-cookie` and `x-runtime-rid` are replaced
 in place with `<redacted>`, keeping the header name so this dump cannot be mistaken for a
 complete one that happened to contain nothing. Every `x-ratelimit-*` header, `date`,
-`etag`, `x-poll-interval` and `x-github-api-version-selected` is verbatim. **No response
-body was captured**: `/events?per_page=100` returns roughly ninety real events with real
+`etag`, `x-poll-interval` and `x-github-api-version-selected` is verbatim. No response
+body was captured: `/events?per_page=100` returns roughly ninety real events with real
 logins, avatar URLs embedding numeric user IDs, and repository names, and the finding does
 not need any of it. The probing IP address is deliberately not recorded.
 
@@ -94,7 +94,7 @@ not need any of it. The probing IP address is deliberately not recorded.
 Redacted in place, name kept: `x-github-request-id`, `set-cookie`, `x-runtime-rid`.
 No response body was captured. No `Authorization` header was sent.
 
-### R1 — unconditional GET
+### R1: unconditional GET
 
 Local clock (UTC): 2026-07-30T18:44:09Z
 
@@ -134,7 +134,7 @@ x-ratelimit-reset: 1785437524
 x-github-request-id: <redacted>
 ```
 
-### R2 — conditional GET (the finding)
+### R2: conditional GET (the finding)
 
 Local clock (UTC): 2026-07-30T18:44:12Z
 
@@ -175,7 +175,7 @@ x-ratelimit-reset: 1785437524
 x-github-request-id: <redacted>
 ```
 
-### R3 — conditional GET again (the control)
+### R3: conditional GET again (the control)
 
 Local clock (UTC): 2026-07-30T18:44:14Z
 
@@ -219,8 +219,8 @@ x-github-request-id: <redacted>
 ## Finding
 
 Under `X-GitHub-Api-Version: 2022-11-28`, on 2026-07-30, from a single unauthenticated
-client, `x-ratelimit-used` increased by one across **each** `304 Not Modified` returned for
-a conditional request to `/events` — 4 → 5 → 6, with `x-ratelimit-remaining` falling 56 →
+client, `x-ratelimit-used` increased by one across each `304 Not Modified` returned for
+a conditional request to `/events`: 4 → 5 → 6, with `x-ratelimit-remaining` falling 56 →
 55 → 54 and `x-ratelimit-resource` reading `core` throughout.
 
 This re-run confirms what `IMPLEMENTATION_PLAN.md` §10 recorded from the 2026-07-28 review
@@ -229,20 +229,20 @@ to the plan's accounting decision was required.
 
 ## What this does not show
 
-- **n = 3 requests, one IP, one date, one API version (`2022-11-28`), one endpoint
-  (`/events`).** This is an observation of behaviour on a date, not a statement about
+- n = 3 requests, one IP, one date, one API version (`2022-11-28`), one endpoint
+  (`/events`). This is an observation of behaviour on a date, not a statement about
   GitHub's contract.
-- **Unauthenticated only.** It does not contradict GitHub's statement that correctly
+- Unauthenticated only. It does not contradict GitHub's statement that correctly
   authorized `304`s are exempt: the two statements describe different populations of
   request. This project holds no token and therefore cannot test the authenticated case.
-- **The IP is shared, demonstrably so** — `used` stood at 3 before this probe began. Any
+- The IP is shared, demonstrably so: `used` stood at 3 before this probe began. Any
   request another client behind the same address made between R1 and R2 would also
   increment `used`. R3 makes a coincidence landing on *both* intervals implausible; it
   does not eliminate it.
-- **The probe did not observe the 60-second `X-Poll-Interval` floor** between its own three
+- The probe did not observe the 60-second `X-Poll-Interval` floor between its own three
   requests, once, under a bounded three-request budget. The running application does obey
   it (`event_sources.poll_floor_until`, §9).
-- **`Date` is identical across all three responses**, so nothing here proves the three
+- `Date` is identical across all three responses, so nothing here proves the three
   requests were separated in time except the probing machine's own clock.
 
 The implementation's response is conservative in the safe direction. Budgeting a `304` that

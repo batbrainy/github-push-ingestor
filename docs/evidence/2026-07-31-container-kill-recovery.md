@@ -5,7 +5,7 @@ Date: 2026-07-31
 Status: Historical first-party observation; superseded for submission gating
 
 > [!CAUTION]
-> **Erratum — do not use the green verdict in this file as the submission gate.** The script
+> Erratum: do not use the green verdict in this file as the submission gate. The script
 > revision that produced the raw transcript suppressed non-zero fixture ingestion and
 > enrichment exits with `|| true`, printed `push_events` counts without asserting equality
 > after every recovery, and did not carry `GITHUB_MODE=fixture` into every Compose
@@ -14,7 +14,7 @@ Status: Historical first-party observation; superseded for submission gating
 > corrected script against the final default-branch SHA and record that result in the
 > external findings report. That re-run is now recorded:
 > [`2026-08-01-post-merge-verification.md`](2026-08-01-post-merge-verification.md) gate 1.18
-> ran the corrected script against `88e2260c` — 45 checks passed, 0 failed.
+> ran the corrected script against `88e2260c`: 45 checks passed, 0 failed.
 
 > [!IMPORTANT]
 > The raw transcript also predates the 2026-08-02 durable-backlog correction. Its
@@ -30,25 +30,25 @@ and §16 turns that declaration into a durability gate whose wording is delibera
 **(verified by container kills)**". §15 step 8 gives the reviewer the commands.
 
 Until something kills a container, all of that is a line of YAML.
-`spec/docker_compose_spec.rb` asserts the *declarations* — that `db` keeps a named volume,
+`spec/docker_compose_spec.rb` asserts the *declarations* (that `db` keeps a named volume,
 that `web` runs puma directly so no pid file can survive an ungraceful kill, that no service
-leaves `restart` implicit — and `spec/recovery/` asserts the crash-window *state machine*.
+leaves `restart` implicit), and `spec/recovery/` asserts the crash-window *state machine*.
 Neither can observe Docker's restart policy, because no RSpec example can kill the process it
 is running inside. This is the observation that closes that gap.
 
 ## The finding
 
-**§15 step 8's own command does not exercise the restart policy, and never could.**
+§15 step 8's own command does not exercise the restart policy, and never could.
 
 `docker kill` is an API stop. The daemon records the container as manually stopped, and
-`restart: unless-stopped` is defined to skip exactly that case — that is what "unless stopped"
+`restart: unless-stopped` is defined to skip exactly that case: that is what "unless stopped"
 means. Measured below, each of the three services stayed down after `docker kill` with
 `RestartCount` unchanged at 0. A reviewer following the plan literally would watch three
 containers die, see none of them come back, and conclude the durability gate is unmet.
 
 The policy itself is sound. When the container's main process is killed the way a real crash
-kills it — SIGKILL delivered from outside the container's PID namespace, which the daemon does
-not attribute to an operator — every service came back on its own, with `RestartCount`
+kills it (SIGKILL delivered from outside the container's PID namespace, which the daemon does
+not attribute to an operator), every service came back on its own, with `RestartCount`
 incrementing and no operator step.
 
 So the two facts are separate and both belong in the record:
@@ -70,25 +70,25 @@ application image declares a non-root user which cannot signal postgres.
 
 ## What else was measured
 
-- **Records survived.** `push_events` read 9,293 before the worker kill and 9,293 after every
+- Records survived. `push_events` read 9,293 before the worker kill and 9,293 after every
   kill, restart and recovery in this run. PostgreSQL replayed its WAL onto the same volume.
-- **The volume is the same volume.** `github-push-ingestor_pgdata`'s `CreatedAt` is identical at
+- The volume is the same volume. `github-push-ingestor_pgdata`'s `CreatedAt` is identical at
   preflight and at the end, so the counts above are survival rather than recreation.
-- **§16's test-isolation gate holds at runtime.** `docker compose run --rm test` left both
+- §16's test-isolation gate holds at runtime. `docker compose run --rm test` left both
   development databases byte-identical (`push_events` 9,293 and `solid_queue_jobs` 1,703 on
   both sides) and did not trigger the development `setup` service. The worker is stopped for
   the duration of that measurement and restarted after: it is the only other writer to those
   tables, and a fixture poll landing mid-suite would otherwise move both counters and make the
   comparison meaningless. An earlier revision of this script did not stop it, recorded
-  `push_events` climbing 263 → 353, and still printed that the gate held — the check now fails
+  `push_events` climbing 263 → 353, and still printed that the gate held. The check now fails
   the run instead.
-- **Fixture mode failed closed in the running stack.** This development database holds entities
+- Fixture mode failed closed in the running stack. This development database holds entities
   from earlier live polls, whose `api_url`s are absent from the corpus. The fixture-mode
   enrichment cycle refused with a corpus gap and exit 2 rather than reaching `api.github.com`.
   That is §6's rule observed in a container, which no unit test can show.
-- **Both redirect corpus scenarios ran end to end, with a verdict.** `redirecting_repository`
+- Both redirect corpus scenarios ran end to end, with a verdict. `redirecting_repository`
   left the corpus repository `complete` across a validated hop; `hostile_redirect` left it
-  `permanent_failure` with the second hop never sent. Selection is forced first — §10 picks the
+  `permanent_failure` with the second hop never sent. Selection is forced first: §10 picks the
   newest eligible candidate, and on a database that has polled live GitHub that is a real
   repository the corpus has never heard of, so an earlier revision of this script watched both
   scenarios die on a corpus gap while `|| true` swallowed the exit code.
@@ -98,14 +98,14 @@ application image declares a non-root user which cannot signal postgres.
 - One host, one operating system, one Docker version, one date. Docker's treatment of
   `docker kill` is a daemon behaviour and could differ on another version; the commands to
   re-measure it are below.
-- `unless-stopped` is **not** exercised here across a Docker daemon restart or a host reboot,
+- `unless-stopped` is *not* exercised here across a Docker daemon restart or a host reboot,
   which is the other half of what the policy promises.
 - A SIGKILL to postgres exercises WAL crash recovery, not disk corruption, not a failing
   volume, and not a full disk.
 - The worker ran in fixture mode, whose sticky-tail `304` is what makes "the count is
   unchanged" a stable expectation. A live stack's count would legitimately grow between the two
   measurements, and this transcript says nothing about that case.
-- **No kill here was deliberately timed inside an in-flight `push_events` insert.** That
+- No kill here was deliberately timed inside an in-flight `push_events` insert. That
   guarantee is not observable from outside the process and is asserted instead by
   `spec/recovery/crash_window_spec.rb`, which composes a held source lock, an abandoned
   enrichment lease and a lost enqueue into one restart.
@@ -119,7 +119,7 @@ application image declares a non-root user which cannot signal postgres.
 
 ## Every check reported by this historical run
 
-This run reported **19 checks, all passing**. That is what the preserved transcript says, not
+This run reported 19 checks, all passing. That is what the preserved transcript says, not
 a current submission verdict: the erratum above identifies failures that were outside those
 19 checks or whose exit statuses were suppressed.
 
@@ -143,15 +143,15 @@ container, so it is a negative control and `restart: unless-stopped` leaves the 
 down. The host-PID-namespace kill terminates the main process without recording an operator
 stop; that process-crash path must restart automatically.
 
-Nothing in the suite, in `config/ci.rb`, in `bin/ci` or in the workflows executes it —
+Nothing in the suite, in `config/ci.rb`, in `bin/ci` or in the workflows executes it.
 `spec/docker_compose_spec.rb` asserts that, so "CI never runs the verification" is a red test
 rather than a promise.
 
-## Raw historical transcript — preserved verbatim
+## Raw historical transcript, preserved verbatim
 
 Captured by `script/verify_recovery.sh` on the date above. `login`, `display_login`,
-`full_name`, `api_url`, `avatar_url` and the corpus-miss payload are redacted in place — names
-kept, values removed — because a development database that has polled live GitHub holds real
+`full_name`, `api_url`, `avatar_url` and the corpus-miss payload are redacted in place, names
+kept and values removed, because a development database that has polled live GitHub holds real
 third-party account and repository names that no finding here needs.
 
 <!-- Generated by script/verify_recovery.sh on 2026-07-31T11:58:08Z -->

@@ -1,4 +1,4 @@
-# Design brief — github-push-ingestor
+# Design brief: github-push-ingestor
 
 This Rails 8.1 API service polls GitHub's public Events API, stores `PushEvent`
 records and their raw payloads in PostgreSQL, and enriches referenced actors and
@@ -10,7 +10,7 @@ execution history.
 
 The assignment asks for durable ingestion, enrichment, and restart safety. The difficult
 constraint is the source: `/events` is a sliding window with documented delivery latency,
-and unauthenticated callers share 60 requests per hour per outbound IP — an event can
+and unauthenticated callers share 60 requests per hour per outbound IP. An event can
 leave the window unobserved, and enrichment demand can exceed the remaining budget by
 orders of magnitude. Event capture is therefore an observable, bounded sample rather than
 a mirror. Enrichment is different: every never-enriched entity remains durable work, even
@@ -46,7 +46,7 @@ PostgreSQL is the system of record. Ten business tables hold source/run state,
 `push_events`, shared actor and repository projections, append-only enrichment
 observations, per-request batch envelopes, quarantined payloads, and the two budget
 ledgers (hourly core, per-minute search); Solid Queue uses a second database in the same
-server. Raw payloads are `jsonb` — JSON meaning, not byte layout — and quarantine
+server. Raw payloads are `jsonb` (JSON meaning, not byte layout), and quarantine
 identity is a canonical-payload SHA-256, since malformed data may lack a usable event ID.
 
 Acceptance occurs when a `push_events` row commits. Inserts use
@@ -58,7 +58,7 @@ debits, and logs can repeat.
 
 Work committed before a crash remains durable. Advisory locks disappear with their
 sessions, entity leases expire by timestamp, and a reconciler rebuilds missing enrichment
-work from committed entity rows — the cross-database enqueue is a hint, not the durability
+work from committed entity rows. The cross-database enqueue is a hint, not the durability
 boundary. Work lost before commit is recoverable only while the event remains in a later
 feed response; leaving the window is an acknowledged loss mode. This is not
 exactly-once execution ([ADR 0005](adr/0005-at-least-once-with-idempotent-writes.md),
@@ -66,7 +66,7 @@ exactly-once execution ([ADR 0005](adr/0005-at-least-once-with-idempotent-writes
 
 ## Request budget and the `304` finding
 
-Two rate-limit resources, two persisted ledgers. The **core** allocation is derived
+Two rate-limit resources, two persisted ledgers. The core allocation is derived
 rather than guessed:
 
 ```text
@@ -77,8 +77,8 @@ feasible ⇔ poll_allowance + RATE_LIMIT_RESERVE
 ```
 
 With defaults: 12 poll attempts, 40 detail-fallback attempts split 20/20 by
-`ACTOR_ENRICHMENT_SHARE`, and a reserve of 8 — the three lanes fill the limit exactly.
-Normal-path enrichment spends the **search** resource instead — a separate singleton
+`ACTOR_ENRICHMENT_SHARE`, and a reserve of 8. The three lanes fill the limit exactly.
+Normal-path enrichment spends the search resource instead, on a separate singleton
 ledger over GitHub's per-minute Search window (ceiling 10, reserve 2, 6-second pacing),
 reconciled against its own `x-ratelimit-resource: search` headers. Startup rejects
 infeasible core configurations, and the live source count is read from in-service rows at
@@ -87,31 +87,32 @@ window initialization ([ADR 0004](adr/0004-class-aware-budget-ledger.md),
 [ADR 0013](adr/0013-derivation-first-staged-batch-enrichment.md)).
 
 GitHub's endpoint documentation broadly describes `304` responses as free, but its REST
-best-practices guidance scopes that to correctly authorized requests — and a dated
+best-practices guidance scopes that to correctly authorized requests, and a dated
 unauthenticated [probe](evidence/2026-07-30-unauthenticated-304-quota-probe.md) observed
 `x-ratelimit-used` increase across a `304`. This system therefore debits every conditional
-request: ETags save bandwidth, not budget. The asymmetry decides it — a wrongly-free `304`
+request: ETags save bandwidth, not budget. The asymmetry decides it. A wrongly-free `304`
 can exhaust the shared window, while a wrongly-charged one costs only local opportunity.
 
 ## Durable, staged, and safe enrichment
 
-One observed page held roughly 180 distinct entities — a cold-demand pressure scenario,
-not a measured unique arrival rate, because identities deduplicate into shared rows.
-Enrichment is derivation-first and staged: ingestion persists event-native identity,
+One observed page held roughly 180 distinct entities. That is a cold-demand pressure
+scenario, not a measured unique arrival rate, because identities deduplicate into shared
+rows. Enrichment is derivation-first and staged: ingestion persists event-native identity,
 derives locally computable fields, and coalesces demand by stable GitHub ID; the normal
 path then batches up to ten repeated exact `user:`/`repo:` Search qualifiers per request
-(never `OR`-joined) on the search budget, validating every returned item against its
+(never `OR`-joined) on the search budget and validates every returned item against its
 immutable ID before applying it. Only missing, renamed, mismatched, or contract-invalid
 items fall back to their stored payload-provided detail URLs inside the bounded core
-allowance. Completion is an explicit useful-data contract per entity — queryable fields
-plus the retained raw item, nullable values valid as nulls — not every field GitHub can
-return. Quota, pacing, and reserve denials only defer; no entity is ever terminal because
-budget ran out. Refreshes ride the same batch path only after both backlogs are exhausted.
+allowance. Completion is an explicit useful-data contract per entity: queryable fields
+plus the retained raw item, with nullable values valid as nulls. It is not every field
+GitHub can return. Quota, pacing, and reserve denials only defer; no entity is ever
+terminal because budget ran out. Refreshes ride the same batch path only after both
+backlogs are exhausted.
 
 Evidence and convenience are split: every raw item lands in an append-only observation
 table with fingerprint, provenance, and validation outcome, and every request attempt in
 a batch envelope with counts and observed headers, while entity rows stay the latest
-projection pointing at their latest observation — a refresh repoints, never overwrites.
+projection pointing at their latest observation. A refresh repoints and never overwrites.
 `/status` publishes per-stage backlog, batch fill ratios, measured arrival and completion
 rates, and a tri-state catch-up verdict; when completions do not exceed arrivals it says
 `not_keeping_up` rather than promising eventual catch-up, and it still publishes no ETA
@@ -119,11 +120,11 @@ rates, and a tri-state catch-up verdict; when completions do not exceed arrivals
 [ADR 0013](adr/0013-derivation-first-staged-batch-enrichment.md)).
 
 Enrichment URLs have two origins: Search URLs are application-built constants over stored
-identifiers, while detail URLs are payload-supplied and attacker-influenceable — so the
-SSRF boundary allows only HTTPS URLs whose host is exactly `api.github.com` — no
-userinfo, non-default port, or IP literal; redirects are bounded, revalidated, and
-separately debited; a Search miss never constructs a detail URL from an identifier; and
-fixture mode fails closed rather than falling back to the network
+identifiers, while detail URLs are payload-supplied and attacker-influenceable. The
+SSRF boundary therefore allows only HTTPS URLs whose host is exactly `api.github.com`,
+with no userinfo, no non-default port, and no IP literal; redirects are bounded,
+revalidated, and separately debited; a Search miss never constructs a detail URL from an
+identifier; and fixture mode fails closed rather than falling back to the network
 ([ADR 0003](adr/0003-event-source-and-transport-seams.md)).
 
 ## Tradeoffs, omissions, and scaling

@@ -3,14 +3,14 @@
 Repository: https://github.com/batbrainy/github-push-ingestor
 
 This is a reusable runbook, not a record of one run. Keep the boxes unchecked in the
-repository. The external findings report — most recently
-[`docs/evidence/2026-08-01-post-merge-verification.md`](evidence/2026-08-01-post-merge-verification.md)
-— records the verified refs, UTC date, command/assertion synopses, salient output, duration,
+repository. The external findings report, most recently
+[`docs/evidence/2026-08-01-post-merge-verification.md`](evidence/2026-08-01-post-merge-verification.md),
+records the verified refs, UTC date, command/assertion synopses, salient output, duration,
 and one classification for each reported gate or gate group: pass, repository defect,
 environment issue, or documentation mismatch. The exact commands remain in this checklist.
 
 Run every application, runtime, and repository-history gate against the default branch
-after the final hardening change merges, from a fresh clone — never against a modified
+after the final hardening change merges, from a fresh clone, never against a modified
 working tree. A documentation-only gate for content not yet merged may use the final PR
 blob when the report records that blob separately and does not attribute it to the runtime
 checkout. A modified runtime tree can hide an untracked `.env` or `config/master.key`,
@@ -97,7 +97,7 @@ globally named `github-push-ingestor_pgdata` volume.
 
 - [ ] `GITHUB_MODE=fixture docker compose run --rm -e SEARCH_PACING_SECONDS=0 enrich
       --limit 6` exits 0 and leaves `complete 2 / permanent_failure 1` in each entity
-      class — two Search batches, then two detail-fallback `404` terminals (the pacing
+      class: two Search batches, then two detail-fallback `404` terminals (the pacing
       override lets the second batch run immediately instead of reporting a pacing
       deferral).
 - [ ] SQL state is exactly 4 events, 3 actors, 3 repositories, 3 quarantine rows, and 3 total
@@ -187,85 +187,85 @@ particular, read the erratum atop
 
 ---
 
-## 2. Functional gates — §16
+## 2. Functional gates (§16)
 
-- [ ] Public GitHub Events API works without a token — *live half of the clean-checkout run*
-- [ ] Only `PushEvent` records are processed — `Github::Events::ProcessorRegistry`; the
-      corpus `WatchEvent` is ignored **and counted**
+- [ ] Public GitHub Events API works without a token: *live half of the clean-checkout run*
+- [ ] Only `PushEvent` records are processed: `Github::Events::ProcessorRegistry`; the
+      corpus `WatchEvent` is ignored and counted
 - [ ] Required fields are structured, typed, and `NOT NULL`; unknown payload fields
-      tolerated; 40- and 64-char SHAs accepted — `spec/db/schema_spec.rb`,
+      tolerated; 40- and 64-char SHAs accepted: `spec/db/schema_spec.rb`,
       `spec/services/github/events/push_event_processor_spec.rb`
-- [ ] Raw payload is retained (semantic retention, documented) —
+- [ ] Raw payload is retained (semantic retention, documented):
       [ADR 0001](adr/0001-jsonb-semantic-retention.md), `GET /api/push_events/:id`
-- [ ] **Both** actor and repository enrichment demonstrably occur within their fairness
-      guarantees — `spec/services/github/enrichment/end_to_end_spec.rb`; fixture run gives
+- [ ] Both actor and repository enrichment demonstrably occur within their fairness
+      guarantees: `spec/services/github/enrichment/end_to_end_spec.rb`; fixture run gives
       `complete 2 / permanent_failure 1` per class
 - [ ] A duplicate event ID cannot add another `push_events` row or register new entity
-      activity — fixture replay: 4 duplicates absorbed, activity hash unchanged
-- [ ] `Link`-header pagination is handled; every fetched page fully processed —
+      activity. Fixture replay: 4 duplicates absorbed, activity hash unchanged
+- [ ] `Link`-header pagination is handled; every fetched page fully processed:
       `spec/services/github/ingestion/page_loop_spec.rb`; `paginated` scenario
 - [ ] Rate-limit behavior demonstrated: `304` quota accounting, class-aware ledger
-      enforcement, global-vs-class blocking, per-window bootstrap, scheduling rules —
+      enforcement, global-vs-class blocking, per-window bootstrap, scheduling rules.
       `docs/evidence/2026-07-30-unauthenticated-304-quota-probe.md`,
       `spec/stress/budget_ledger_spec.rb`
 - [ ] Malformed data quarantined durably per the taxonomy (canonical fingerprints,
-      occurrence-counted) and does not terminate the batch — 3 rows, occurrences 3 → 6 on
+      occurrence-counted) and does not terminate the batch: 3 rows, occurrences 3 → 6 on
       replay, and 4 events persisted beside them
-- [ ] **Both staged batch paths demonstrably run** (plan Appendix G): the fixture
+- [ ] Both staged batch paths demonstrably run (plan Appendix G): the fixture
       `default` walkthrough completes one actor and one repository Search batch, then two
-      payload-URL detail fallbacks that meet `404`s and go terminal — two `complete` plus
+      payload-URL detail fallbacks that meet `404`s and go terminal, two `complete` plus
       one `permanent_failure` per class from exactly 2 search + 2 detail requests
       (`fixtures/github/README.md`, the enrichment end-to-end specs)
-- [ ] Batch results apply only on a **stable-ID match** — the `search_renamed_repository`
+- [ ] Batch results apply only on a stable-ID match: the `search_renamed_repository`
       and `search_unrequested_result` scenarios show a renamed and an unrequested item
       observed but never applied, routed to fallback or recorded as `unrequested_result`
-- [ ] **No quota-based terminal state exists** — `git grep -n skipped_budget -- app lib
+- [ ] No quota-based terminal state exists: `git grep -n skipped_budget -- app lib
       db/schema.rb` returns nothing, and every search/core denial reason
       (`ceiling`, `reserve`, `pacing`, `blocked`, class/share exhaustion) defers rather
       than terminates
 
 ---
 
-## 3. Durability gates — §16
+## 3. Durability gates (§16)
 
-- [ ] PostgreSQL uses a named volume — `docker-compose.yml`, `spec/docker_compose_spec.rb`
+- [ ] PostgreSQL uses a named volume: `docker-compose.yml`, `spec/docker_compose_spec.rb`
 - [ ] Docker restart policies recover process crashes in `db`/`web`/`worker` automatically.
       `docker kill` is retained separately as an API-stop negative control and must leave an
-      `unless-stopped` container down — `script/verify_recovery.sh`
-- [ ] Application restart preserves events — runtime comparisons in §1
-- [ ] Worker restart preserves pending work — `spec/recovery/worker_crash_lease_spec.rb`
+      `unless-stopped` container down: `script/verify_recovery.sh`
+- [ ] Application restart preserves events: runtime comparisons in §1
+- [ ] Worker restart preserves pending work: `spec/recovery/worker_crash_lease_spec.rb`
 - [ ] An event that did not commit before a crash can be observed again only if it remains in
       a later feed window; an event that did commit remains durable and its derived pending
-      work is reconciled — `spec/recovery/crash_window_spec.rb`
-- [ ] Advisory locks provably release on session death (tested) —
+      work is reconciled: `spec/recovery/crash_window_spec.rb`
+- [ ] Advisory locks provably release on session death (tested):
       `spec/recovery/advisory_lock_session_death_spec.rb`, real `pg_terminate_backend`
-- [ ] The covered actor-job redelivery leaves an already-complete actor row unchanged —
+- [ ] The covered actor-job redelivery leaves an already-complete actor row unchanged:
       `spec/recovery/duplicate_job_execution_spec.rb`; this does not imply universal
       idempotency of persisted state
-- [ ] Reconciliation recovers missing enrichment scheduling —
+- [ ] Reconciliation recovers missing enrichment scheduling:
       `spec/recovery/pending_enrichment_recovery_spec.rb`
 - [ ] Never-enriched actor and repository rows remain durable backlog work across quota
-      exhaustion and window rollover; candidates are selected FIFO oldest-first —
+      exhaustion and window rollover; candidates are selected FIFO oldest-first:
       `spec/services/github/enrichment/candidate_selector_spec.rb`,
       `spec/recovery/pending_enrichment_recovery_spec.rb`
 - [ ] A selection that observes either entity class has never-enriched backlog work does
       not choose a refresh; the documented concurrent-insert window is bounded to one
-      runner request — `spec/services/github/enrichment/fairness_spec.rb`
+      runner request: `spec/services/github/enrichment/fairness_spec.rb`
 
 ---
 
-## 4. Operability gates — §16
+## 4. Operability gates (§16)
 
-- [ ] Logs readable through `docker compose logs -f` at the default level —
+- [ ] Logs readable through `docker compose logs -f` at the default level:
       README [Logs](../README.md#logs)
-- [ ] Correlation fields (`run_id`, job ID) present — `app/jobs/application_job.rb`; the
+- [ ] Correlation fields (`run_id`, job ID) present: `app/jobs/application_job.rb`; the
       trace is one hop
-- [ ] `/health/live` and `/health/ready` are meaningful and never consume budget —
+- [ ] `/health/live` and `/health/ready` are meaningful and never consume budget:
       `spec/requests/health_spec.rb`
 - [ ] `/status` reports window status, poll state, per-class ledger state, backlog size,
       oldest pending timestamp/age, reserved allowance usage, and coverage percentages by
-      the defined formulas — without initiating GitHub requests or fabricating a drain ETA
-      — `spec/requests/status_spec.rb`, `Github::Enrichment::Coverage`
+      the defined formulas, without initiating GitHub requests or fabricating a drain ETA:
+      `spec/requests/status_spec.rb`, `Github::Enrichment::Coverage`
 - [ ] `/status` carries the Appendix G blocks with their exact keys: `ledger` uses
       `detail_fallback` (renamed from `enrichment`); `search_ledger` publishes
       ceiling/reserve/spendable/used/per-lane usage/`blocked_until`/
@@ -299,23 +299,23 @@ particular, read the erratum atop
         -d github_push_ingestor_development -Atc \
         'SELECT poll_used, enrichment_used, actor_share_used, repository_share_used FROM github_api_budget;'
       ```
-- [ ] Retry behavior is visible — `github.retry_scheduled` / `github.retry_exhausted` at
+- [ ] Retry behavior is visible: `github.retry_scheduled` / `github.retry_exhausted` at
       the default level
-- [ ] Failures contain actionable context — every failure line carries classification,
+- [ ] Failures contain actionable context: every failure line carries classification,
       status, URL, attempt, and its `run_id` or entity id
 
 ---
 
-## 5. Reviewer-experience gates — §16
+## 5. Reviewer-experience gates (§16)
 
-- [ ] Clean checkout works — §1 above
+- [ ] Clean checkout works: §1 above
 - [ ] No local Ruby or PostgreSQL installation is required
 - [ ] Commands match the assignment
-- [ ] Plain `docker compose up --build` starts exactly `db`, `setup`, `web`, `worker` —
+- [ ] Plain `docker compose up --build` starts exactly `db`, `setup`, `web`, `worker`:
       `profiles: ["tools"]` on the other three
 - [ ] `docker compose run --rm test` rebuilds through `pull_policy: build`, never touches the
       development databases (app or queue), and never triggers the development `setup`
-      service — runtime comparison in §1 and `spec/docker_compose_spec.rb`
+      service: runtime comparison in §1 and `spec/docker_compose_spec.rb`
 - [ ] Documentation is accurate; the README points to the plan and its appendix revision
       record
 - [ ] Every repository-local Markdown target and heading anchor resolves; verify the final
@@ -325,16 +325,16 @@ particular, read the erratum atop
       `pdfinfo` reports at most two pages, and visual inspection finds no clipping, overlap,
       malformed table, or awkward page break. The QA PDF is not committed
 - [ ] No secrets or token are required
-- [ ] Tests are deterministic — WebMock denies net connect; no VCR; fixture rate-limit
+- [ ] Tests are deterministic: WebMock denies net connect; no VCR; fixture rate-limit
       resets are relative, so the corpus does not rot
 - [ ] GitHub Project and issues show organized execution
-- [ ] Pull requests are focused and linked to issues — every merged PR carries `Closes #`
+- [ ] Pull requests are focused and linked to issues: every merged PR carries `Closes #`
 
 ---
 
-## 6. Final repository review — §16
+## 6. Final repository review (§16)
 
-- [ ] **No secrets**
+- [ ] No secrets
 
       ```bash
       docker compose run --rm test bin/brakeman --quiet --no-pager --exit-on-warn --exit-on-error
@@ -351,20 +351,20 @@ particular, read the erratum atop
       Every search must print nothing; the `grep` searches exiting 1 means no match and
       passes. Any output is a stop-ship finding, not something to redact in place.
 
-- [ ] **No personal access token** — `git grep -n "Authorization" -- app lib config` returns only
+- [ ] No personal access token: `git grep -n "Authorization" -- app lib config` returns only
       the SSRF-policy and header code
-- [ ] **No stale documentation**
+- [ ] No stale documentation
 
       ```bash
       git grep -nEI '[l]ands with PR|[a]vailable now|[P]lanned contents|after PR [0-9]+ merges|PR 12 [(]design brief[)]' -- README.md docs
       ```
 
       returns nothing.
-- [ ] **No dead or speculative infrastructure**
-- [ ] **No misleading guarantee of complete upstream event capture** — see §7
-- [ ] **No claim of exactly-once execution** — see §7
-- [ ] **No claim that enrichment coverage is complete** — see §7
-- [ ] **No failing or flaky tests** — the suite run three times consecutively green,
+- [ ] No dead or speculative infrastructure
+- [ ] No misleading guarantee of complete upstream event capture: see §7
+- [ ] No claim of exactly-once execution: see §7
+- [ ] No claim that enrichment coverage is complete: see §7
+- [ ] No failing or flaky tests: the suite run three times consecutively green,
       including a fixed-seed repeat
 
 ---
@@ -376,11 +376,11 @@ claim_pattern='exactly[ -]?once|effectively[ -]?once|once-only[[:space:]]+(execu
 git grep -nI -i -E "$claim_pattern" -- .
 ```
 
-**The rule: every prose hit must explicitly reject the guarantee.** The regex assignment
+The rule: every prose hit must explicitly reject the guarantee. The regex assignment
 itself is scan vocabulary, not a claim. Any affirmative system-level promise of singular
 execution, exhaustive upstream capture, exhaustive enrichment, or guaranteed catch-up
 fails the gate; do not approve it merely because it avoids one exact phrase. Catch-up may
-be described only as a dated, measured comparison of completion and arrival rates —
+be described only as a dated, measured comparison of completion and arrival rates:
 `/status` says `not_keeping_up` when the comparison fails, and no document promises the
 backlog drains.
 

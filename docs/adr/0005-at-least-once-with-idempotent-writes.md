@@ -60,7 +60,7 @@ What this buys:
 
 What it does not buy:
 
-- **This is not exactly-once execution.** A job, HTTP request, run record, quarantine
+- This is not exactly-once execution. A job, HTTP request, run record, quarantine
   observation, budget debit, or log entry may occur more than once.
 - An event lost before commit is not guaranteed to reappear; recovery depends on GitHub
   retaining it in a later sliding-feed response.

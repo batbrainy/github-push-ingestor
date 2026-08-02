@@ -10,7 +10,7 @@
 
 ## Scope
 
-<!-- What is included — and deliberately not included — in this PR -->
+<!-- What is included, and deliberately not included, in this PR -->
 
 ## Technical decisions
 

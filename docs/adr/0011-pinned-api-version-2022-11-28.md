@@ -20,14 +20,14 @@ The pin is not inertia. Every quantitative claim this design rests on was measur
 - The unauthenticated `304` quota finding
   ([`docs/evidence/2026-07-30-unauthenticated-304-quota-probe.md`](../evidence/2026-07-30-unauthenticated-304-quota-probe.md)),
   which is why the budget ledger debits conditional requests (ADR 0004).
-- The observed page composition — roughly 92–95 `PushEvent` records in one 100-event page —
+- The observed page composition, roughly 92 to 95 `PushEvent` records in one 100-event page,
   which produces §10's enrichment-demand arithmetic and therefore the fairness shares
   (ADR 0007).
 - The payload field set the tolerant parser accepts, including 40- and 64-character object
   names in `payload.head` and `payload.before`.
 
 Sending a newer version header would invalidate the evidence behind all three at once,
-silently, with no failing test to catch it — the fixture corpus is a recording of
+silently, with no failing test to catch it: the fixture corpus is a recording of
 `2022-11-28` responses, so the offline suite would stay green while live behaviour drifted.
 
 ## Decision
@@ -40,20 +40,20 @@ The version is not configurable for the same reason the API host is not
 deployment knob. An operator who could set it to `2026-03-10` from `.env` could invalidate
 the budget arithmetic without changing a line of code or failing a test.
 
-**Upgrading to `2026-03-10` is a deliberate follow-up, gated on re-verification rather than
-on availability.** The gate, in order:
+Upgrading to `2026-03-10` is a deliberate follow-up, gated on re-verification rather than
+on availability. The gate, in order:
 
 1. Re-run `script/probe_304.sh` under the new version and commit a dated transcript. If
    `x-ratelimit-used` no longer increments across an unauthenticated `304`, ADR 0004's
    debit rule changes and the allowance formula changes with it.
-2. Re-capture a live `/events` page and diff its shape against the fixture corpus —
+2. Re-capture a live `/events` page and diff its shape against the fixture corpus,
    specifically that `PushEvent` still carries `payload.push_id`, `payload.ref`,
    `payload.head`, `payload.before`, and that `actor`/`repo` still carry the `id`s the
    foreign keys target.
-3. Re-measure the `PushEvent` fraction of a page. §10's arithmetic assumes ~92–95 of 100.
+3. Re-measure the `PushEvent` fraction of a page. §10's arithmetic assumes ~92 to 95 of 100.
 4. Re-record the corpus under the new version, then change the constant.
 
-Only step 4 is a code change. Steps 1–3 are why the pin exists.
+Only step 4 is a code change. Steps 1 to 3 are why the pin exists.
 
 ## Consequences
 
@@ -74,11 +74,11 @@ What it costs, stated plainly:
   upgrade is forced rather than chosen, and the four-step gate above has to run under time
   pressure instead of at leisure.
 - Because the version lives in a frozen constant, upgrading requires a code change, a
-  release, and a re-recorded corpus — deliberately more friction than editing `.env`.
+  release, and a re-recorded corpus, deliberately more friction than editing `.env`.
 
 The suite asserts the header rather than the version's effects, which is the honest
 boundary: `spec/services/github/request_spec.rb:64` and
 `spec/services/github/transports/faraday_spec.rb:36` prove every outbound request carries
 `2022-11-28`, and `spec/support/shared_examples/github_transport.rb:55` holds both
-transports to it. No offline test can prove GitHub's behaviour under any version — that is
+transports to it. No offline test can prove GitHub's behaviour under any version. That is
 what the dated probe transcripts are for.

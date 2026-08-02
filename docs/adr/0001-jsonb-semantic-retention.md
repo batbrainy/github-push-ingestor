@@ -25,7 +25,7 @@ The alternative is a `text` or `json` column holding the response body verbatim.
 
 ## Decision
 
-Retain the payload as `jsonb` and treat retention as **semantic**: the stored document
+Retain the payload as `jsonb` and treat retention as semantic: the stored document
 is content-equivalent to what GitHub sent, not byte-identical to it.
 
 ## Consequences
@@ -36,14 +36,14 @@ What this buys:
   it, a GIN index can be added without a data migration (§7 gates that index on a
   real query rather than adding it speculatively).
 - Malformed-payload comparison works on structure rather than formatting, which is
-  what the quarantine fingerprint already relies on — the canonical fingerprint is
+  what the quarantine fingerprint already relies on. The canonical fingerprint is
   computed over compact JSON with recursively sorted keys, so it is deliberately
   insensitive to exactly the things `jsonb` discards.
 - Storage is smaller and reads need no parse step.
 
 What it costs, stated plainly:
 
-- **This is not a byte-exact audit trail.** A reviewer comparing stored bytes against
+- This is not a byte-exact audit trail. A reviewer comparing stored bytes against
   a captured HTTP response will see differences in whitespace and key order.
 - A payload containing duplicate keys is retained with only the last occurrence. No
   observed GitHub payload does this, but the loss would be silent.
@@ -51,7 +51,7 @@ What it costs, stated plainly:
 Byte-exact retention would require a second `text` column holding the raw body, which
 doubles payload storage to serve an audit requirement this project does not have. It
 is deliberately not built. If a future requirement demands provable byte fidelity, add
-the `text` column beside the `jsonb` one rather than converting — the query surface
+the `text` column beside the `jsonb` one rather than converting: the query surface
 depends on `jsonb`.
 
 Tests assert content equivalence rather than byte equality, and one test asserts the

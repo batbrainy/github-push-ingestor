@@ -8,7 +8,7 @@ plan wins.
 
 1. Read `IMPLEMENTATION_PLAN.md` (repository root). It is the frozen execution
    plan; its pre-implementation revision history lives in Git and in its
-   Appendices A–D, Appendix E records how the build diverged from it, Appendix F
+   Appendices A to D, Appendix E records how the build diverged from it, Appendix F
    supersedes the enrichment load-shedding policy with a durable backlog, and
    Appendix G supersedes Appendix F's per-entity service model with derivation-first
    staged batch enrichment.
@@ -16,10 +16,10 @@ plan wins.
 3. Do not change architectural direction, add infrastructure, or add dependencies
    without first updating the plan and stating the tradeoff.
 
-## Stack (pinned — plan §2A)
+## Stack (pinned, plan §2A)
 
 - Rails 8.1 API-only, Ruby 3.4.10 (exact pin in `.ruby-version`, Dockerfile, CI)
-- PostgreSQL 16 — the system of record
+- PostgreSQL 16, the system of record
 - Solid Queue in its own `queue` database inside the same Postgres container
 - Faraday for HTTP; RSpec + WebMock + hand-authored static JSON fixtures (no VCR)
 - GitHub REST API version header `X-GitHub-Api-Version: 2022-11-28`
@@ -38,21 +38,21 @@ accepted only after its `push_events` row commits (plan §8).
 
 ### GitHub requests
 
-Every live GitHub request — polling and enrichment, from poller, worker, or
-one-shot — goes through `Github::RequestExecutor`:
+Every live GitHub request (polling and enrichment, from poller, worker, or
+one-shot) goes through `Github::RequestExecutor`:
 
 ```
 request gate → budget ledger reservation → URL policy → transport
 ```
 
 Never call GitHub directly from models, jobs, controllers, or anything outside
-that chain (plan §5, §10). The budget ledger debits every outbound attempt —
-including `304`s and retries — before execution; failures stay spent.
+that chain (plan §5, §10). The budget ledger debits every outbound attempt,
+including `304`s and retries, before execution; failures stay spent.
 
 ### Lock ordering (plan §2A, §5)
 
 Allowed: `SourceLock` → `RequestGate`. Never the reverse. Enrichment jobs never
-acquire `SourceLock` — they take only the request gate.
+acquire `SourceLock`; they take only the request gate.
 
 ### Processing semantics (plan §8)
 
@@ -77,17 +77,17 @@ idempotency of persisted state.
 
 Enrichment fetches only validated URLs: HTTPS, host exactly `api.github.com`, no
 userinfo, no non-default port, no IP literals, bounded re-validated redirects.
-Fixture mode fails closed — never a live fallback.
+Fixture mode fails closed, never a live fallback.
 
-### Durable staged enrichment backlog (plan §10, Appendices F–G)
+### Durable staged enrichment backlog (plan §10, Appendices F and G)
 
 Entity rows are durable work, coalesced by stable GitHub ID, selected FIFO by
 `created_at ASC, id ASC`. The normal path is GitHub Search batches of up to
-`SEARCH_BATCH_SIZE` repeated exact `user:`/`repo:` qualifiers — never joined with `OR` —
+`SEARCH_BATCH_SIZE` repeated exact `user:`/`repo:` qualifiers, never joined with `OR`,
 on the minute-scoped search ledger (ceiling 10, reserve 2, 6-second pacing). The
 payload-URL detail fallback serves only missing/renamed/mismatched/contract-invalid batch
 items and is bounded by `CORE_DETAIL_FALLBACK_ALLOWANCE` (40/hour); it never takes the
-polling allocation. Quota, pacing, reserve, and fairness denials defer work — they never
+polling allocation. Quota, pacing, reserve, and fairness denials defer work; they never
 terminate an entity. Batch results apply only on a stable-ID match. Observations are
 append-only; a refresh repoints the projection and never overwrites retained evidence.
 Refresh composition: a batch fills from its own class's never-enriched backlog first,
@@ -104,7 +104,7 @@ correctness depends on them, and tests for uniqueness and replay behavior (plan 
 
 - Deterministic only: WebMock plus the static fixture corpus. No live GitHub
   calls in tests, ever.
-- The `test` compose service touches only the isolated test databases — never
+- The `test` compose service touches only the isolated test databases, never
   the development databases.
 - Test failure paths (quota exhaustion, `304`s, retries, quarantine, crashes),
   not only happy paths.
@@ -127,7 +127,7 @@ When making changes:
 - Keep changes aligned with the current PR's scope in the plan's ladder (§13).
 - Do not create separate AI planning documents, AI transcripts, or AI-generated
   notes unless explicitly requested. Engineering decisions are preserved through
-  code, tests, PR descriptions, and ADRs under `docs/adr/` — nowhere else.
+  code, tests, PR descriptions, and ADRs under `docs/adr/`, nowhere else.
 
 For each pull request:
 
@@ -135,7 +135,7 @@ For each pull request:
 - Include important tradeoffs and rejected alternatives when applicable.
 - Link the related GitHub issue with a `Closes #<issue>` line in the PR
   description, so the merge closes the issue automatically.
-- Ensure generated code has been reviewed and validated — verify behavior
+- Ensure generated code has been reviewed and validated: verify behavior
   through tests before accepting it.
 - Run the relevant tests before proposing merge.
 
@@ -155,7 +155,7 @@ Keep the PR reviewable.
 Discipline that makes AI assistance safe here:
 
 - Confirm external API claims against official documentation or dated live
-  probes — this project's `304`-quota finding (plan §10) exists because a
+  probes. This project's `304`-quota finding (plan §10) exists because a
   documented claim did not survive an unauthenticated probe.
 - Prefer small, incremental, reviewable commits.
 - Never let generated text overstate guarantees: no "exactly-once", no "complete

@@ -9,24 +9,24 @@ Status: Accepted; durable-backlog refresh priority amended 2026-08-02; staged-ba
 `IMPLEMENTATION_PLAN.md` §4's Extension A lists ten child capabilities. Nine shipped
 across PRs 4, 6, 7 and 9. Reading the merged code against the plan's own wording, rather
 than against the issue checklists, found two of them incomplete in ways their tests did not
-catch — both because the test set up a single-class world in which the defect is invisible.
+catch, both because the test set up a single-class world in which the defect is invisible.
 
-**Item 8 — "Handle secondary rate limits globally (`Retry-After` →
-`global_blocked_until`); add exponential backoff with jitter."** §10 words the fallback as
+Item 8: "Handle secondary rate limits globally (`Retry-After` →
+`global_blocked_until`); add exponential backoff with jitter." §10 words the fallback as
 "set `global_blocked_until` from `Retry-After` (or ≥ 1 minute with exponential backoff when
 the header is absent)". `Github::RateLimitPolicy#fallback_instant` called
 `@backoff.retry_at(1, now:)` with a literal `1`. `Github::PollBackoff#delay_for` computes
 `exponent = [attempt, 1].max - 1`, so attempt `1` fixes `exponent = 0` and `base = 60` on
 every call. The ≥ 1 minute floor and the jitter were both real; the exponential was not.
-Nothing else compensated — `Github::Ingestion::PollState` routes a `:secondary_limited`
+Nothing else compensated: `Github::Ingestion::PollState` routes a `:secondary_limited`
 outcome to `secondary_retry`, which deliberately does not increment `consecutive_failures`,
 so the source-scoped ladder never advanced either. An IP GitHub was actively throttling was
-re-probed every ~60–75 seconds for as long as the throttling lasted.
+re-probed every ~60 to 75 seconds for as long as the throttling lasted.
 
-**Item 9 — "Implement enrichment fairness shares (floor/remainder rounding) with
-eligibility-aware borrowing."** §10:898 scopes refreshes "within each class's share".
+Item 9: "Implement enrichment fairness shares (floor/remainder rounding) with
+eligibility-aware borrowing." §10:898 scopes refreshes "within each class's share".
 `Github::Enrichment::Fairness#refresh_choice` selected
-`requested.find { refresh_available? }` — first in `EntityType.all` order, always actor —
+`requested.find { refresh_available? }`, first in `EntityType.all` order, always actor,
 with no preference for a class still inside its guarantee, unlike `#pending_choice`, which
 looks for `room_within_guarantee?` before it considers borrowing. Its borrow condition also
 read the *pending* eligibility map, so the other class's stale refresh candidates were
@@ -49,22 +49,22 @@ still additive-only, so the floor §10 states numerically is never undercut.
 
 Four boundaries make this the smallest correct change:
 
-- **It escalates only the header-absent path.** A server-supplied `Retry-After` is still
+- It escalates only the header-absent path. A server-supplied `Retry-After` is still
   obeyed as given within `honoured`'s clamp, which is exactly how §10 words the alternative.
-- **Only `:secondary_rate_limit` advances it.** A primary exhaustion and a reserve breach
+- Only `:secondary_rate_limit` advances it. A primary exhaustion and a reserve breach
   are conditions of the budget window, not evidence that GitHub is throttling this IP.
-  `#primary_limit` passes a literal attempt of `1` for the same reason — a quota provably at
+  `#primary_limit` passes a literal attempt of `1` for the same reason: a quota provably at
   zero is relieved by the window rolling, not by waiting longer each time.
-- **It survives window rollover.** §10 calls secondary limits IP-scoped, which is a
+- It survives window rollover. §10 calls secondary limits IP-scoped, which is a
   different scope from the primary window `ROLL_WINDOW_SQL` resets. Zeroing the streak at
   the boundary would hand a persistently throttled IP a fresh 60-second block every hour.
-- **One clean response ends it.** `#apply!` calls
-  `BudgetLedger#clear_secondary_limit_streak!` for any live request that completed —
+- One clean response ends it. `#apply!` calls
+  `BudgetLedger#clear_secondary_limit_streak!` for any live request that completed,
   including a `304`, which is a request GitHub answered and charged for and therefore the
   same evidence a `200` carries. A timeout or a 5xx produced no verdict about throttling, so
   it neither escalates nor clears.
 
-**The policy reads the count; the ledger writes it.** The increment is a bind on `BLOCK_SQL`
+The policy reads the count; the ledger writes it. The increment is a bind on `BLOCK_SQL`
 rather than a second statement, so it happens under the same `SELECT … FOR UPDATE` that
 writes the block it feeds. The read in the policy is therefore stale by construction:
 `#apply!` runs after the request gate is released, so two responses can read the same count.
@@ -74,8 +74,8 @@ shorten the winner's, and computing the instant inside the ledger would collapse
 [ADR 0004](0004-class-aware-budget-ledger.md) draws between deciding and recording.
 
 `#clear_secondary_limit_streak!` guards in its `WHERE` (`AND consecutive_secondary_limits
-> 0`) rather than reading first, so the overwhelmingly common case — every successful
-request on a service that has never been throttled — is one statement that matches no row
+> 0`) rather than reading first, so the overwhelmingly common case, every successful
+request on a service that has never been throttled, is one statement that matches no row
 and takes no lock. Zero affected rows is the expected outcome, so it deliberately does not
 go through the `LedgerInvariantViolation` check `#debit!` applies to the same condition.
 
@@ -105,7 +105,7 @@ ledger cap remains authoritative and the durable row is never discarded.
   throttling further.
 - One additional row read per secondary-limit response, and one guarded `UPDATE` per
   successful live request that matches no row in the normal case.
-- The refresh pool can no longer starve a class. Total enrichment spend is unchanged — the
+- The refresh pool can no longer starve a class. Total enrichment spend is unchanged: the
   ledger's cap was always the bound, and this is a fairness fix rather than an overspend fix.
 - A refresh TTL is an earliest eligible time rather than a completion deadline. Sustained
   never-enriched backlog can postpone refresh indefinitely, which is preferable to spending
@@ -115,12 +115,12 @@ ledger cap remains authoritative and the durable row is never discarded.
 
 ## Rejected alternatives
 
-**Escalate by multiplying an in-force block instead of counting.** No migration, but it can
-only escalate while a block is still in the future — and the case §10 legislates for is the
+Escalate by multiplying an in-force block instead of counting. No migration, but it can
+only escalate while a block is still in the future, and the case §10 legislates for is the
 repeat limit that arrives *after* the previous block expired, which is precisely when this
 approach does nothing.
 
-**Read `Retry-After`'s HTTP-date form as unparseable, as before.** RFC 9110 permits both
+Read `Retry-After`'s HTTP-date form as unparseable, as before. RFC 9110 permits both
 forms and §10 lists the header among those to process without qualifying which.
 `Github::RateLimitSnapshot` now normalizes both to a delta against its own `observed_at`;
 leaving the date form unread silently collapsed a server-supplied "wait 45 minutes" into the
@@ -128,10 +128,10 @@ leaving the date form unread silently collapsed a server-supplied "wait 45 minut
 response most likely to provoke further throttling. A date already in the past yields a
 non-positive delta, which `#fallback_instant` already treats exactly as an absent header.
 
-**Forbid borrowing in the refresh pool outright**, on the strictest reading of §10:898's
+Forbid borrowing in the refresh pool outright, on the strictest reading of §10:898's
 "within each class's share". Rejected: a class whose guarantee rounds to zero
 (`ACTOR_ENRICHMENT_SHARE` at `0.0` or `1.0`) could then never refresh at all, and it would
-leave capacity idle whenever the other class has no stale rows — while §10:812's borrowing
+leave capacity idle whenever the other class has no stale rows, while §10:812's borrowing
 rule is stated generally rather than scoped to the pending pool. Borrowing remains valid
 after the durable never-enriched backlog is empty.
 
@@ -141,7 +141,7 @@ Plan Appendix G ([ADR 0013](0013-derivation-first-staged-batch-enrichment.md)) d
 per-entity refresh pool this ADR's second half repaired: there is no separate refresh
 request shape any more, so `#refresh_choice` and its `borrowed_refresh` reason are gone
 with `Enrichment::Fairness`. Refresh now rides the same Search batch path under the
-composition rule — a batch fills from its own class's never-enriched backlog first, tops
+composition rule: a batch fills from its own class's never-enriched backlog first, tops
 up spare slots with TTL-stale, recently active (`REFRESH_ACTIVE_WITHIN_SECONDS`) complete
 rows only when neither class has claimable backlog, and refresh-only batches run only
 when neither class has backlog at all. The property this ADR fought for survives in

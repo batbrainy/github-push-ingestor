@@ -28,15 +28,15 @@ Isolation:        two fresh Compose projects, each with a fresh PostgreSQL volum
 5. Under a sustained run at the shipped defaults, does the measured completion rate
    exceed the measured arrival rate, with a negative backlog slope while draining?
 
-Questions 1–4 are answered **yes** below. Question 5's answer is recorded in
-[Phase B](#phase-b--sustained-catch-up-measurement) from the measurement itself, not
+Questions 1 to 4 are answered yes below. Question 5's answer is recorded in
+[Phase B](#phase-b-sustained-catch-up-measurement) from the measurement itself, not
 from the capacity arithmetic.
 
 ## Method and safety boundary
 
 Both phases used the current working-tree image and explicitly named Compose projects
 (`gpi-live-a`, `gpi-live-b`), each created and destroyed with its own volume. Phase A ran
-`db` plus one-shot commands only — no `web`, no `worker` — so every outbound request was
+`db` plus one-shot commands only, with no `web` and no `worker`, so every outbound request was
 one this transcript names. Phase B ran the full topology at the shipped defaults.
 
 Sanitization: aggregate counts, stable GitHub ids, classifications, stage names, and
@@ -50,7 +50,7 @@ construction (12 poll and the detail-fallback allowance per hour on `core`, 8 sp
 per minute on `search`).
 Neither phase approached the 60/hour core limit.
 
-## Phase A — staged path, boundaries, and durability
+## Phase A: staged path, boundaries, and durability
 
 ### One poll, 176 cold entities, zero enrichment requests
 
@@ -69,7 +69,7 @@ sample_repo={"github_id":1320389400,"full_name":"reddupney66/gfkapf",
 
 `owner_login` is derived locally from the event's `repo.name`; 184 event-source
 observations committed with the events. No enrichment request had been issued at this
-point — the derivation-first stage costs no quota.
+point: the derivation-first stage costs no quota.
 
 ### One Search request settles nine actors; one settles ten repositories
 
@@ -94,7 +94,7 @@ batch=2 kind=search/repository status=succeeded req=10 ret=10 valid=10 miss=0
 core_ledger=poll_used=1 enrichment_used=0
 ```
 
-`x-ratelimit-resource: search` with a limit of **10**, reconciled onto the search ledger
+`x-ratelimit-resource: search` with a limit of 10, reconciled onto the search ledger
 while the core ledger's enrichment counter stayed at zero. Nineteen entities reached the
 useful-data contract for two requests, and the contract fields are populated from the
 search items themselves:
@@ -126,10 +126,10 @@ search_ledger={"limit":10,"remaining":2,"request_ceiling":10,"reserve":2,"used":
                "available":0,"blocked_until":"2026-08-02T20:26:21Z"}
 ```
 
-**74 requested, 74 valid — a fill ratio of 1.00** across eight paced requests, stopping
+74 requested, 74 valid, a fill ratio of 1.00 across eight paced requests, stopping
 cleanly when the observed `remaining` reached the configured reserve rather than by
 running the limit to zero. This is the capacity hypothesis measured rather than assumed:
-8 spendable requests per minute at a batch size of 10 is an **80/minute ceiling**, and the
+8 spendable requests per minute at a batch size of 10 is an 80/minute ceiling, and the
 sample reached it.
 
 ### Two defects this phase found
@@ -137,7 +137,7 @@ sample reached it.
 Both were invisible to design review and to the offline corpus, and both are fixed and
 covered by regression tests in the same change.
 
-**1. An unparsable payload URL was treated as retryable.** The actor `github-actions[bot]`
+1. An unparsable payload URL was treated as retryable. The actor `github-actions[bot]`
 carries a login with brackets, so the URL its own event supplies is not a valid URI and
 `Github::UrlPolicy` refuses it before the request gate:
 
@@ -151,8 +151,8 @@ permanent, and the ladder would have spent three of the four hourly core detail 
 re-refusing the same stored string. `DetailRunner` now terminates on
 `not_found`, `client_error`, and `permanent_error` alike.
 
-**2. A batch of entirely unsearchable identifiers answered 422, not an empty result.**
-Seeding `facebook/react` — which redirects to `react/react` — as the only pending
+2. A batch of entirely unsearchable identifiers answered 422, not an empty result.
+Seeding `facebook/react`, which redirects to `react/react`, as the only pending
 repository produced:
 
 ```text
@@ -165,7 +165,7 @@ body={"message":"Validation Failed","errors":[{"message":"The listed users and
 
 The exploratory probe never saw this because a batch of ten simply omits its unsearchable
 members. Treating it as a generic client error left the rename retrying on the Search lane
-forever — the one path that can never resolve it. A 422 carrying that signature is now
+forever, the one path that can never resolve it. A 422 carrying that signature is now
 read as "every requested identifier is missing", and the members are admitted to the
 fallback exactly as an omitted item is:
 
@@ -182,7 +182,7 @@ react={"github_id":10270250,"full_name":"facebook/react","enrichment_status":"co
 ```
 
 The fallback followed the stored payload URL through GitHub's redirect and validated the
-result against the stable id — the rename resolved without ever constructing a URL from a
+result against the stable id. The rename resolved without ever constructing a URL from a
 mutable name.
 
 ### Quota boundary and restart durability
@@ -204,7 +204,7 @@ Identical fingerprint, identical ledger state, and every batch envelope and obse
 retained. Quota exhaustion deferred work; it did not terminate any of it.
 
 A forced poll during the same window was refused by the poll class's own allowance
-(`deferral_reason=poll_class_blocked_until`) — enrichment pressure never borrows from
+(`deferral_reason=poll_class_blocked_until`): enrichment pressure never borrows from
 polling, and neither does an operator's `--force`.
 
 ### A third defect, found by the topology rather than the API
@@ -212,7 +212,7 @@ polling, and neither does an operator's `--force`.
 Phase B initially made no progress at all: recurring jobs accumulated in
 `solid_queue_ready_executions` while both workers registered, heartbeated, and claimed
 nothing. `config/queue.yml` declared `queues: polling,control` as a bare string, and
-`SolidQueue::QueueSelector` wraps its input in `Array()` — so that worker was polling for
+`SolidQueue::QueueSelector` wraps its input in `Array()`, so that worker was polling for
 one queue literally named `"polling,control"`, which no job is ever enqueued into.
 
 This predates issue #45 (the file is untouched by this change), and it means the always-on
@@ -222,15 +222,15 @@ and so asserted the author's intent rather than the runtime's reading of it. The
 now declared as a YAML list, and both queue specs assert through
 `SolidQueue::QueueSelector` and `Array()` instead.
 
-## Phase B — sustained catch-up measurement
+## Phase B: sustained catch-up measurement
 
 Full topology (`db`, `web`, `worker`) at the shipped defaults, sampling `GET /status`
 every 60 seconds. `/status` performs no writes and issues no GitHub request, so sampling
 cannot perturb the run.
 
-Configuration: the shipped defaults **at the time of the run**, which included
+Configuration: the shipped defaults at the time of the run, which included
 `CORE_DETAIL_FALLBACK_ALLOWANCE=4`. That value is what this measurement put under
-pressure, and the result is why the default is now 40 — see "What the measurement
+pressure, and the result is why the default is now 40. See "What the measurement
 changed" below.
 
 ```text
@@ -259,12 +259,12 @@ Observations:      1,797 rows
 Core ledger:       poll_used 2 of 12, detail_fallback used 4 of 4
 ```
 
-**Verdict across the 24 mature samples: 8 `keeping_up`, 16 `not_keeping_up`.** The
+Verdict across the 24 mature samples: 8 `keeping_up`, 16 `not_keeping_up`. The
 verdict oscillates, and the reason is visible in the numbers rather than a mystery: the
 Search lane requested 872 items across 92 requests and had 858 of them returned and
 applied directly, sending the other 14 to the fallback, and it drained each five-minute
 arrival burst within roughly two minutes. The pipeline as a whole produced 870 exits,
-leaving two entities outstanding at the final sample — a residue that Search does not
+leaving two entities outstanding at the final sample, a residue that Search does not
 return, waiting on the detail lane. With that lane capped at 4 requests an hour,
 the residue outlives the window it arrived in, and any sample taken while it is
 outstanding reports a positive backlog delta.
@@ -274,17 +274,17 @@ At the final sample the outstanding work was exactly two repositories, both
 used. Nothing was stuck: everything was deferred, durably, by a budget doing what it was
 configured to do.
 
-**Question 5 answered honestly: the Search lane keeps up; the service as configured
-during this run did not, and it said so.** `/status` reported `not_keeping_up` in exactly
-the samples where the backlog had not returned to zero — no eventual-catch-up claim was
+Question 5 answered honestly: the Search lane keeps up; the service as configured
+during this run did not, and it said so. `/status` reported `not_keeping_up` in exactly
+the samples where the backlog had not returned to zero. No eventual-catch-up claim was
 made, and none is made here.
 
 ### What the measurement changed
 
-At a 1.6–1.9% miss rate and roughly 2,000 arrivals an hour, the fallback lane needs on the
+At a 1.6% to 1.9% miss rate and roughly 2,000 arrivals an hour, the fallback lane needs on the
 order of 40 requests an hour. It had 4. The core budget leaves exactly 40 after polling
-(12) and the reserve (8) — the same allocation the pre-staged design spent on *every*
-entity, which the staged path needs only for the residue — so
+(12) and the reserve (8). That is the same allocation the pre-staged design spent on *every*
+entity, which the staged path needs only for the residue, so
 `CORE_DETAIL_FALLBACK_ALLOWANCE` now defaults to 40.
 
 This is arithmetic from a measured miss rate, not a measured outcome: the sustained run
