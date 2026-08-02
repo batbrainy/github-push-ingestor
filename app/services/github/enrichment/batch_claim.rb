@@ -103,9 +103,15 @@ module Github
         lease
       end
 
+      # A deferral must put the row back where it was claimed from, not where a new row
+      # starts. Restoring a retry_scheduled/retryable_failure row to batch_pending would
+      # leave a status/stage pair Enrichable does not list as legal and would read as
+      # work that had never been attempted. previous_stage is the claimed value;
+      # batch_in_flight is excluded because that is what an expired lease was reclaimed
+      # from, and returning a row to it would re-orphan it.
       def release!(lease, stage: nil, now: Time.current)
         lease.items.each do |item|
-          restored = stage || (item.enrichment_status == "complete" ? "contract_complete" : "batch_pending")
+          restored = stage || restored_stage(item)
           lease.entity_type.model.where(id: item.id, lease_token: lease.token,
                                         current_enrichment_batch_id: lease.batch.id).update_all(
             enrichment_stage: restored, lease_token: nil, leased_until: nil,
@@ -115,6 +121,13 @@ module Github
       end
 
       private
+
+      def restored_stage(item)
+        return item.previous_stage if item.previous_stage.present? &&
+                                      item.previous_stage != "batch_in_flight"
+
+        item.enrichment_status == "complete" ? "contract_complete" : "batch_pending"
+      end
 
       # The single due predicate: a live lease or a scheduled retry excludes a row
       # from every claim; expiry re-admits it.

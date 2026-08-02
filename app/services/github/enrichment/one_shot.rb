@@ -166,7 +166,13 @@ module Github
           })
           return if choice.nil?
 
-          lane, borrowed = choice
+          lane = choice.first
+          # Recomputed against the *unfiltered* pool, never taken from the schedule:
+          # --class narrows what this command will work on, and a borrow is a claim
+          # about what the other class has to do. Letting the CLI filter answer it would
+          # tell the ledger a lane was idle when the operator had merely excluded it.
+          other = lane == :actor ? :repository : :actor
+          borrowed = !@detail_claim.claimable?(EntityType.fetch(other))
           result = @detail_runner.call(entity_class: lane, borrow: borrowed)
           @tally = @tally.record_detail(result)
           case result.status

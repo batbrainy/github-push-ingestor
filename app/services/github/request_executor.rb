@@ -26,6 +26,7 @@ module Github
                    retry_policy: RetryPolicy.new,
                    mode: Github.configuration.mode,
                    max_redirects: Github.configuration.max_redirects,
+                   search_pacing_seconds: Github.configuration.search_pacing_seconds,
                    request_gate_wait: RequestGate::WAIT_SECONDS,
                    sleeper: ->(seconds) { Kernel.sleep(seconds) },
                    clock: -> { Time.current })
@@ -35,6 +36,7 @@ module Github
       @retry_policy = retry_policy
       @mode = mode.to_sym
       @max_redirects = max_redirects
+      @search_pacing_seconds = search_pacing_seconds
       @request_gate_wait = request_gate_wait
       @sleeper = sleeper
       @clock = clock
@@ -53,7 +55,7 @@ module Github
 
         # Computed once and both slept and logged, never recomputed: RetryPolicy jitters, so
         # asking twice would report a delay this process never took.
-        backoff_seconds = @retry_policy.backoff_seconds(attempt)
+        backoff_seconds = retry_delay_for(request, attempt)
         log_retry_scheduled(result, backoff_seconds: backoff_seconds)
 
         # The backoff happens with no lock held and no reservation outstanding: the
@@ -64,6 +66,18 @@ module Github
     end
 
     private
+
+    # A Search retry must outwait that ledger's pacing, or MAX_HTTP_RETRIES is inert on
+    # this resource: the default backoff is around a second, pacing is six, so every
+    # retry would be refused as :search_pacing and the transport failure it was meant to
+    # retry would be replaced by a budget denial. Taking the larger of the two keeps one
+    # meaning for "retry" across both resources.
+    def retry_delay_for(request, attempt)
+      backoff = @retry_policy.backoff_seconds(attempt)
+      return backoff unless request.search?
+
+      [ backoff, @search_pacing_seconds ].max
+    end
 
     # A retryable failure at hop n restarts from the original request rather than from
     # the last hop, so MAX_HTTP_RETRIES keeps its plain meaning: this logical fetch was

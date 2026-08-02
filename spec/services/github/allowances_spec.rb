@@ -10,15 +10,16 @@ RSpec.describe Github::Allowances do
       expect(described_class.derive(configuration: configuration, limit: 60).poll_allowance).to eq(12)
     end
 
-    # Appendix F: the detail-fallback allowance is a configured cap, not the remainder
+    # Appendix G: the detail-fallback allowance is a configured cap, not the remainder
     # of the limit. Search batches carry the enrichment volume on their own per-minute
-    # ledger, so the core budget only funds the few per-entity fallback fetches.
+    # ledger, so the core budget funds only the per-entity fallback fetches — the whole
+    # remainder after polling and the reserve, spent on the Search-miss residue.
     it "takes the configured detail-fallback allowance rather than deriving it from the limit" do
-      expect(described_class.derive(configuration: configuration, limit: 60).enrichment_allowance).to eq(4)
+      expect(described_class.derive(configuration: configuration, limit: 60).enrichment_allowance).to eq(40)
     end
 
     it "keeps that allowance fixed whatever limit GitHub reports" do
-      expect(described_class.derive(configuration: configuration, limit: 5000).enrichment_allowance).to eq(4)
+      expect(described_class.derive(configuration: configuration, limit: 5000).enrichment_allowance).to eq(40)
     end
 
     it "reads CORE_DETAIL_FALLBACK_ALLOWANCE, so the cap is an operator's number" do
@@ -55,13 +56,13 @@ RSpec.describe Github::Allowances do
     it "keeps the configured allowance under an over-committed cadence, leaving #feasible? the verdict" do
       derived = described_class.derive(configuration: configuration(POLL_INTERVAL_SECONDS: "60"), limit: 60)
 
-      expect(derived.enrichment_allowance).to eq(4)
+      expect(derived.enrichment_allowance).to eq(40)
       expect(derived).not_to be_feasible
     end
   end
 
   describe "#feasible?" do
-    it "accepts the pinned defaults, which commit twenty-four of sixty attempts" do
+    it "accepts the pinned defaults, which commit the whole limit" do
       expect(described_class.derive(configuration: configuration, limit: 60)).to be_feasible
     end
 
@@ -69,15 +70,20 @@ RSpec.describe Github::Allowances do
     # number is a real commitment now, so a sum that lands exactly on the limit is a
     # fully-funded plan rather than a starved one.
     it "accepts the exact boundary, where the three commitments fill the limit precisely" do
-      derived = described_class.derive(configuration: configuration(RATE_LIMIT_RESERVE: "44"), limit: 60)
+      derived = described_class.derive(
+        configuration: configuration(RATE_LIMIT_RESERVE: "44", CORE_DETAIL_FALLBACK_ALLOWANCE: "4"),
+        limit: 60
+      )
 
       expect(derived.poll_allowance + derived.reserve + derived.enrichment_allowance).to eq(60)
       expect(derived).to be_feasible
     end
 
     it "rejects the first sum past the limit" do
-      expect(described_class.derive(configuration: configuration(RATE_LIMIT_RESERVE: "45"), limit: 60))
-        .not_to be_feasible
+      expect(described_class.derive(
+        configuration: configuration(RATE_LIMIT_RESERVE: "45", CORE_DETAIL_FALLBACK_ALLOWANCE: "4"),
+        limit: 60
+      )).not_to be_feasible
     end
 
     # Detail fallback is the exception path behind search batches, so an operator may
@@ -127,7 +133,7 @@ RSpec.describe Github::Allowances do
     it "never raises the allowance above its configured cap, however much headroom the limit leaves" do
       clamped = described_class.derive(configuration: configuration, limit: 5000).clamped
 
-      expect(clamped.enrichment_allowance).to eq(4)
+      expect(clamped.enrichment_allowance).to eq(40)
     end
 
     it "never derives a negative allowance, which the schema's CHECK would reject" do
@@ -160,7 +166,7 @@ RSpec.describe Github::Allowances do
     it "recomputes the guarantees from the clamped allowance rather than from the derived one" do
       derived = described_class.derive(configuration: configuration, limit: 15)
 
-      expect(derived).to have_attributes(actor_guarantee: 2, repository_guarantee: 2)
+      expect(derived).to have_attributes(actor_guarantee: 20, repository_guarantee: 20)
       expect(derived.clamped).to have_attributes(actor_guarantee: 0, repository_guarantee: 0)
     end
   end
@@ -168,10 +174,10 @@ RSpec.describe Github::Allowances do
   describe "the fairness split (plan §10)" do
     def split(allowance, share) = described_class.split(allowance, Rational(share))
 
-    it "splits the pinned defaults into two actor and two repository fallback attempts" do
+    it "splits the pinned defaults into twenty actor and twenty repository fallback attempts" do
       derived = described_class.derive(configuration: configuration, limit: 60)
 
-      expect(derived).to have_attributes(actor_guarantee: 2, repository_guarantee: 2)
+      expect(derived).to have_attributes(actor_guarantee: 20, repository_guarantee: 20)
     end
 
     # §10 writes the formula as a floor and a subtraction, so the odd attempt goes to
@@ -231,7 +237,7 @@ RSpec.describe Github::Allowances do
     it "reports both guarantees in the line the ledger logs at window initialization" do
       derived = described_class.derive(configuration: configuration, limit: 60)
 
-      expect(derived.to_log).to include(actor_guarantee: 2, repository_guarantee: 2)
+      expect(derived.to_log).to include(actor_guarantee: 20, repository_guarantee: 20)
     end
   end
 end

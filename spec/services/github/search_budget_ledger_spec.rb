@@ -480,6 +480,72 @@ RSpec.describe Github::SearchBudgetLedger do
   # separate PostgreSQL sessions reserving at once must serialise on the row, with no
   # lost debit and no deadlock. Transactional tests are off for the reason
   # spec/support/concurrency_helpers.rb documents, paid for with explicit cleanup.
+  # §10: a secondary rate limit is IP-scoped, so it stops every live request rather
+  # than only the resource that provoked it. Two ledgers meter two resources, but they
+  # share one outbound address — a block written by either has to bind both.
+  describe "the global block both ledgers share" do
+    def search_request
+      Github::Request.new(url: "https://api.github.com/search/users?q=user%3Aoctocat&per_page=1",
+                          request_class: :actor_search)
+    end
+
+    it "refuses a Search reservation while the core ledger holds a global block" do
+      active_window
+      Github::BudgetLedger.new.bootstrap!(now: frozen_time)
+      Github::BudgetLedger.new.block_globally!(until_at: frozen_time + 300,
+                                               reason: "secondary_limit", now: frozen_time)
+
+      expect { ledger.reserve!(:actor_search, now: frozen_time) }
+        .to raise_error(Github::Errors::BudgetExhausted) { |error|
+          expect(error.reason).to eq(:globally_blocked)
+        }
+      expect(budget.used).to eq(0)
+    end
+
+    it "grants the reservation once that block has expired" do
+      active_window
+      Github::BudgetLedger.new.bootstrap!(now: frozen_time)
+      Github::BudgetLedger.new.block_globally!(until_at: frozen_time + 300,
+                                               reason: "secondary_limit", now: frozen_time)
+
+      expect { ledger.reserve!(:actor_search, now: frozen_time + 301) }.not_to raise_error
+    end
+
+    # The mirror image: a secondary limit provoked by Search stops polling too.
+    it "writes the core global block when a Search response is secondary-limited" do
+      active_window
+      Github::BudgetLedger.new.bootstrap!(now: frozen_time)
+      secondary = Github::FetchResult.from_response(
+        request: search_request, status: 403,
+        headers: { "x-ratelimit-remaining" => "5", "retry-after" => "60" },
+        body: "", duration_ms: 1.0
+      )
+
+      ledger.block_from!(secondary, now: frozen_time)
+
+      expect(current_budget.global_blocked_until).to eq(frozen_time + 60)
+      expect(budget.blocked_until).to eq(frozen_time + 60)
+    end
+
+    # A primary Search exhaustion bounds only this resource. Blocking polling on it
+    # would let the search lane starve event capture, which no quota rule permits.
+    it "leaves polling alone when Search merely exhausted its own limit" do
+      active_window
+      Github::BudgetLedger.new.bootstrap!(now: frozen_time)
+      exhausted = Github::FetchResult.from_response(
+        request: search_request, status: 403,
+        headers: { "x-ratelimit-remaining" => "0",
+                   "x-ratelimit-reset" => window_reset.to_i.to_s },
+        body: "", duration_ms: 1.0
+      )
+
+      ledger.block_from!(exhausted, now: frozen_time)
+
+      expect(current_budget.global_blocked_until).to be_nil
+      expect(budget.blocked_until).to eq(window_reset)
+    end
+  end
+
   describe "under concurrency" do
     self.use_transactional_tests = false
 

@@ -33,7 +33,7 @@ RSpec.describe Github::Configuration do
         enrichment_coverage_window_seconds: 86_400,
         # Appendix F's staged-enrichment block: the search lane's per-minute budget, the
         # core detail-fallback cap, and the cycle/retry/lease timings around them.
-        core_detail_fallback_allowance: 4,
+        core_detail_fallback_allowance: 40,
         search_request_ceiling: 10,
         search_safety_reserve: 2,
         search_batch_size: 10,
@@ -258,9 +258,9 @@ RSpec.describe Github::Configuration do
   end
 
   describe "startup validation of the allowance split (plan §10, Appendix F)" do
-    it "accepts the pinned defaults, which commit twelve poll and four fallback attempts" do
+    it "accepts the pinned defaults, which commit twelve poll and forty fallback attempts" do
       expect(configuration.validate!.allowances)
-        .to have_attributes(poll_allowance: 12, enrichment_allowance: 4)
+        .to have_attributes(poll_allowance: 12, enrichment_allowance: 40)
     end
 
     # Polling every 60 seconds is 60 attempts an hour — the entire unauthenticated
@@ -274,14 +274,15 @@ RSpec.describe Github::Configuration do
     # is a configured commitment now, so lowering it is a legitimate way out.
     it "names the offending numbers so an operator can fix it without reading the code" do
       expect { configuration(POLL_INTERVAL_SECONDS: "60").validate! }
-        .to raise_error(/poll_allowance \(60\).*CORE_DETAIL_FALLBACK_ALLOWANCE \(4\).*RATE_LIMIT_RESERVE \(8\)/m)
+        .to raise_error(/poll_allowance \(60\).*CORE_DETAIL_FALLBACK_ALLOWANCE \(40\).*RATE_LIMIT_RESERVE \(8\)/m)
     end
 
     # Appendix F's predicate is <= : the three commitments may fill the limit exactly,
     # because each is a real, funded plan — and the first request past it is rejected.
     it "accepts the sum landing exactly on the limit, and rejects one attempt more" do
-      expect { configuration(RATE_LIMIT_RESERVE: "44").validate! }.not_to raise_error
-      expect { configuration(RATE_LIMIT_RESERVE: "45").validate! }
+      # The pinned defaults already land exactly on it: 12 + 40 + 8 = 60.
+      expect { configuration.validate! }.not_to raise_error
+      expect { configuration(RATE_LIMIT_RESERVE: "9").validate! }
         .to raise_error(Github::Errors::ConfigurationError, /CORE_DETAIL_FALLBACK_ALLOWANCE/)
     end
 

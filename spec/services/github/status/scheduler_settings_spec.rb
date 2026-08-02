@@ -44,7 +44,7 @@ RSpec.describe Github::Status::SchedulerSettings do
           request_ceiling: 10, safety_reserve: 2, batch_size: 10,
           pacing_seconds: 6, worker_concurrency: 1
         },
-        core: { detail_fallback_allowance: 4, rate_limit_reserve: 8 },
+        core: { detail_fallback_allowance: 40, rate_limit_reserve: 8 },
         metrics: { window_seconds: 3600, catch_up_min_sample_seconds: 900 }
       )
     end

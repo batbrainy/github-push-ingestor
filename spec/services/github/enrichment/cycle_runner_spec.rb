@@ -226,6 +226,25 @@ RSpec.describe Github::Enrichment::CycleRunner do
       expect(detail_runner).to have_received(:call).with(entity_class: :actor, borrow: false)
     end
 
+    # The borrow states a fact about the *other* class, not about which slot was taken.
+    # A one-sided backlog is the case that separates the two readings: the actor lane is
+    # scheduled and claims its own slot, and repository work is provably absent, so the
+    # ledger is told it may spend past the actor guarantee. Reporting borrow: false here
+    # would strand a one-sided backlog at half the allowance with the rest idle.
+    it "borrows on its own scheduled turn when the other class has nothing claimable" do
+      quiet_batch_phase
+      allow(admission).to receive(:detail)
+        .and_return(granted, verdict(:class_exhausted, retry_in: 120.0))
+      allow(detail_claim).to receive(:claimable?) do |entity_type, now:|
+        entity_type.key == :actor
+      end
+      allow(detail_runner).to receive(:call).and_return(detail_result(status: "completed"))
+
+      cycle_runner.call
+
+      expect(detail_runner).to have_received(:call).with(entity_class: :actor, borrow: true)
+    end
+
     it "stops the phase when a detail request comes back deferred" do
       quiet_batch_phase
       allow(admission).to receive(:detail).and_return(granted)

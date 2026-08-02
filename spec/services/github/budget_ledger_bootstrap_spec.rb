@@ -180,7 +180,7 @@ RSpec.describe Github::BudgetLedger, "bootstrap edge cases" do
 
       ledger.reconcile!(snapshot, request_class: :poll, now: frozen_time)
 
-      expect(budget).to have_attributes(poll_allowance: 12, enrichment_allowance: 4)
+      expect(budget).to have_attributes(poll_allowance: 12, enrichment_allowance: 40)
     end
 
     # A block set before the window was ever initialized. denial_reason derives blocking

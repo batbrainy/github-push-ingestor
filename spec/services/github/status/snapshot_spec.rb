@@ -33,7 +33,7 @@ RSpec.describe Github::Status::Snapshot do
       expect(scheduler[:search]).to eq(request_ceiling: 10, safety_reserve: 2,
                                        batch_size: 10, pacing_seconds: 6,
                                        worker_concurrency: 1)
-      expect(scheduler[:core]).to eq(detail_fallback_allowance: 4, rate_limit_reserve: 8)
+      expect(scheduler[:core]).to eq(detail_fallback_allowance: 40, rate_limit_reserve: 8)
     end
   end
 

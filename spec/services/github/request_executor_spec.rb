@@ -305,6 +305,48 @@ RSpec.describe Github::RequestExecutor do
         .with(hash_including(event: "github.retry_scheduled", next_attempt: 2)).once
     end
 
+    # SEARCH_PACING_SECONDS is six and the retry backoff is around a second, so a
+    # Search retry that slept only the backoff would arrive before its own ledger would
+    # admit it: the reservation is refused as :search_pacing and the transport failure
+    # the retry existed to repeat is replaced by a budget denial. MAX_HTTP_RETRIES would
+    # be inert on this resource.
+    it "waits out Search pacing before retrying, so the retry is a retry" do
+      active_search_window(last_request_at: nil)
+      slept = []
+      # The clock advances with the sleep, as it does in production: pacing is measured
+      # against wall time, so a frozen clock would refuse the retry however long the
+      # process actually waited.
+      current = frozen_time
+      request = Github::Request.new(
+        url: "https://api.github.com/search/users?q=user%3Aoctocat&per_page=10",
+        request_class: :actor_search
+      )
+      headers = { "x-ratelimit-resource" => "search", "x-ratelimit-limit" => "10",
+                  "x-ratelimit-remaining" => "8",
+                  "x-ratelimit-reset" => (frozen_time + 3600).to_i.to_s }
+
+      result = executor(recording_transport { response(status: 500, headers: headers) },
+                        sleeper: ->(seconds) { slept << seconds; current += seconds },
+                        clock: -> { current },
+                        search_pacing_seconds: 6).call(request)
+
+      expect(slept).to all(be >= 6)
+      # Every attempt reached the transport, so the failure that survives is the
+      # server's rather than a pacing denial.
+      expect(result.classification).to eq(:server_error)
+      expect(current_search_budget.used).to eq(3)
+    end
+
+    it "leaves a core retry on its own backoff, which no pacing constrains" do
+      active_budget_window
+      slept = []
+
+      executor(always(500), sleeper: ->(seconds) { slept << seconds },
+               search_pacing_seconds: 6).call(poll_request)
+
+      expect(slept).to all(be < 6)
+    end
+
     # RetryPolicy jitters, so a line that recomputed the delay would report a number this
     # process never actually slept.
     it "reports the delay it actually slept, not a freshly jittered one" do

@@ -29,7 +29,7 @@ RSpec.describe Github::BudgetLedger do
       ledger.bootstrap!(now: frozen_time)
 
       expect(budget).to have_attributes(
-        window_status: "uninitialized", poll_allowance: 12, enrichment_allowance: 4,
+        window_status: "uninitialized", poll_allowance: 12, enrichment_allowance: 40,
         reserve: 8, poll_used: 0, enrichment_used: 0, limit: nil, remaining: nil, reset_at: nil
       )
     end
@@ -682,7 +682,7 @@ RSpec.describe Github::BudgetLedger do
       ledger.reserve!(:poll, now: frozen_time)
       ledger.reconcile!(snapshot, now: frozen_time)
 
-      expect(budget).to have_attributes(poll_allowance: 12, enrichment_allowance: 4, reserve: 8)
+      expect(budget).to have_attributes(poll_allowance: 12, enrichment_allowance: 40, reserve: 8)
     end
 
     # A limit lower than the configured default is GitHub's business, not an operator
@@ -709,7 +709,7 @@ RSpec.describe Github::BudgetLedger do
 
       expect(Rails.logger).to have_received(:warn).with(
         hash_including(event: "budget.allowances_clamped",
-                       requested_poll_allowance: 12, requested_enrichment_allowance: 4,
+                       requested_poll_allowance: 12, requested_enrichment_allowance: 40,
                        poll_allowance: 7, enrichment_allowance: 0)
       )
     end
@@ -742,7 +742,7 @@ RSpec.describe Github::BudgetLedger do
         observed_at: later
       ), now: later)
 
-      expect(budget).to have_attributes(poll_allowance: 12, enrichment_allowance: 4, limit: 60)
+      expect(budget).to have_attributes(poll_allowance: 12, enrichment_allowance: 40, limit: 60)
     end
   end
 
@@ -754,6 +754,9 @@ RSpec.describe Github::BudgetLedger do
       count.times { create_event_source(source_type: "github_public_events") }
     end
 
+    # Two sources double the poll commitment, and polling has priority: the configured
+    # detail-fallback allowance no longer fits beside it, so #clamped funds what is left
+    # (60 - 8 reserve - 24 poll) rather than over-committing the limit.
     it "derives the poll allowance from the rows that exist when a window opens" do
       live_sources(2)
       ledger.bootstrap!(now: frozen_time)
@@ -761,7 +764,7 @@ RSpec.describe Github::BudgetLedger do
 
       ledger.reconcile!(snapshot, now: frozen_time)
 
-      expect(budget).to have_attributes(poll_allowance: 24, enrichment_allowance: 4)
+      expect(budget).to have_attributes(poll_allowance: 24, enrichment_allowance: 28)
     end
 
     it "re-derives it at rollover, so an added source takes effect within the hour" do
@@ -770,7 +773,7 @@ RSpec.describe Github::BudgetLedger do
 
       ledger.reserve!(:poll, now: window_reset + 1)
 
-      expect(budget).to have_attributes(poll_allowance: 24, enrichment_allowance: 4)
+      expect(budget).to have_attributes(poll_allowance: 24, enrichment_allowance: 28)
     end
 
     # #bootstrap! runs ahead of every reservation, so asking event_sources there would put a
@@ -780,7 +783,7 @@ RSpec.describe Github::BudgetLedger do
 
       ledger.bootstrap!(now: frozen_time)
 
-      expect(budget).to have_attributes(poll_allowance: 12, enrichment_allowance: 4)
+      expect(budget).to have_attributes(poll_allowance: 12, enrichment_allowance: 40)
     end
 
     it "ignores a disabled or failed source, which will never spend a poll attempt" do
@@ -792,7 +795,7 @@ RSpec.describe Github::BudgetLedger do
       ledger.reserve!(:poll, now: frozen_time)
       ledger.reconcile!(snapshot, now: frozen_time)
 
-      expect(budget).to have_attributes(poll_allowance: 12, enrichment_allowance: 4)
+      expect(budget).to have_attributes(poll_allowance: 12, enrichment_allowance: 40)
     end
   end
 

@@ -354,11 +354,11 @@ RSpec.describe Github::Enrichment::BatchRunner do
       )
     end
 
-    it "fails the batch on a 422 and leaves the debited request spent" do
+    it "fails the batch on a server error and leaves the debited request spent" do
       create_pending_actor(github_id: 721, login: "alpha")
       allow(Rails.logger).to receive(:warn)
       executor = recording_executor do |request, _call|
-        failure_response(request, status: 422, body: "Validation Failed")
+        failure_response(request, status: 500, body: "Internal Server Error")
       end
 
       result = runner(executor).call(entity_class: GithubActor)
@@ -368,11 +368,36 @@ RSpec.describe Github::Enrichment::BatchRunner do
       # One attempt was made and there is no refund path: the executor saw exactly
       # one request, and the batch retains the failure evidence.
       expect(executor.requests.length).to eq(1)
-      expect(batch).to have_attributes(status: "failed", response_status: 422,
-                                       response_body: "Validation Failed")
+      expect(batch).to have_attributes(status: "failed", response_status: 500,
+                                       response_body: "Internal Server Error")
+      # A server error says nothing about the query, so the identical batch is worth
+      # sending again — unlike a 4xx, which is deterministic and takes the fallback.
       expect(GithubActor.find_by(github_id: 721).enrichment_stage).to eq("retry_scheduled")
       expect(Rails.logger).to have_received(:warn).with(
-        hash_including(event: "enrichment.batch_failed", response_status: 422)
+        hash_including(event: "enrichment.batch_failed", response_status: 500)
+      )
+    end
+
+    # A rejected query is a fact about these identifiers and this URL, and the ladder
+    # would resend both unchanged — the same 4xx, hourly, forever. Every deterministic
+    # client error therefore takes the bounded fallback, whatever GitHub's wording.
+    it "routes any rejected query to the detail lane rather than resending it" do
+      create_pending_actor(github_id: 751, login: "alpha")
+      allow(Rails.logger).to receive(:warn)
+      allow(Rails.logger).to receive(:info)
+      executor = recording_executor do |request, _call|
+        failure_response(request, status: 422, body: '{"message":"Validation Failed"}')
+      end
+
+      result = runner(executor).call(entity_class: GithubActor)
+
+      expect(result).to have_attributes(status: "completed", fallback_count: 1)
+      expect(GithubActor.find_by(github_id: 751))
+        .to have_attributes(enrichment_stage: "detail_pending",
+                            last_error: "search_query_rejected")
+      expect(Rails.logger).to have_received(:warn).with(
+        hash_including(event: "enrichment.batch_unsearchable",
+                       reason: "search_query_rejected", response_status: 422)
       )
     end
 
@@ -407,7 +432,7 @@ RSpec.describe Github::Enrichment::BatchRunner do
       # No member is left on the search lane, and the batch records why.
       expect(batch).to have_attributes(status: "failed", missing_count: 2,
                                        returned_count: 0,
-                                       last_error: "unsearchable_identifiers")
+                                       last_error: "unsearchable_identifier")
       expect(Rails.logger).to have_received(:warn).with(
         hash_including(event: "enrichment.batch_unsearchable", response_status: 422)
       )

@@ -18,8 +18,8 @@ RSpec.describe "the Github startup initializer" do
   it "logs the resolved allowances at boot" do
     expect(Rails.logger).to receive(:info).with(hash_including(
       event: "config.budget_resolved", mode: "live",
-      poll_allowance: 12, enrichment_allowance: 4, reserve: 8,
-      actor_guarantee: 2, repository_guarantee: 2
+      poll_allowance: 12, enrichment_allowance: 40, reserve: 8,
+      actor_guarantee: 20, repository_guarantee: 20
     ))
 
     boot
@@ -28,7 +28,7 @@ RSpec.describe "the Github startup initializer" do
   it "leaves Github.configuration validated and memoized for the process" do
     boot
 
-    expect(Github.configuration.allowances).to have_attributes(poll_allowance: 12, enrichment_allowance: 4)
+    expect(Github.configuration.allowances).to have_attributes(poll_allowance: 12, enrichment_allowance: 40)
   end
 
   # The over-commitment the allowance formula cannot see: it counts one attempt per page,

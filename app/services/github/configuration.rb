@@ -30,7 +30,14 @@ module Github
       "MAX_PAGES_PER_POLL" => "1",
       "ENABLED_LIVE_SOURCE_COUNT" => "1",
       "RATE_LIMIT_RESERVE" => "8",
-      "CORE_DETAIL_FALLBACK_ALLOWANCE" => "4",
+      # The whole core remainder after polling and the reserve (60 - 12 - 8), which is
+      # what the pre-staged design spent on every entity and this one spends only on the
+      # Search-miss residue. A live sample measured that residue at ~1.9% of arrivals —
+      # roughly 40 fallbacks an hour at the observed rate — so a smaller allowance
+      # leaves a subset that never completes. It still cannot cover a peak-rate residue
+      # unauthenticated, which is why /status publishes the measured verdict rather than
+      # a promise.
+      "CORE_DETAIL_FALLBACK_ALLOWANCE" => "40",
       "SEARCH_REQUEST_CEILING" => "10",
       "SEARCH_SAFETY_RESERVE" => "2",
       "SEARCH_BATCH_SIZE" => "10",

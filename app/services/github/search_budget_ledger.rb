@@ -32,6 +32,16 @@ module Github
       end
 
       bootstrap!(now: now)
+
+      # §10: a secondary rate limit is IP-scoped, so it stops *all* live requests, not
+      # only the resource that provoked it. The two ledgers meter separate resources but
+      # share one outbound address, so each honours the other's global block.
+      if (blocked_until = global_block(now: now))
+        Rails.logger.info(event: "search_budget.globally_blocked",
+                          blocked_until: blocked_until.utc.iso8601)
+        raise Errors::BudgetExhausted.new(request_class, :globally_blocked)
+      end
+
       reason = nil
 
       GithubSearchBudget.transaction do
@@ -98,7 +108,13 @@ module Github
       end
     end
 
-    def block_from!(fetched, now: Time.current)
+    # @param core_ledger [Github::BudgetLedger] the writer of global_blocked_until. A
+    #   secondary limit provoked by a Search request is IP-scoped like any other, so it
+    #   has to stop polling too — §10 is explicit that one timestamp covers every live
+    #   request. A primary Search exhaustion is *not* global: it bounds only this
+    #   resource, and blocking polling on it would hand the search lane the power to
+    #   starve event capture.
+    def block_from!(fetched, now: Time.current, core_ledger: BudgetLedger.new)
       return unless %i[rate_limited secondary_limited].include?(fetched.classification)
 
       snapshot = fetched.rate_limit(observed_at: now)
@@ -107,6 +123,11 @@ module Github
         now + retry_seconds
       else
         snapshot.reset_at || now + SEARCH_WINDOW_SECONDS
+      end
+
+      if fetched.classification == :secondary_limited
+        core_ledger.block_globally!(until_at: until_at, reason: "search_secondary_limit",
+                                    now: now)
       end
 
       # GREATEST ignores NULL, so a block only ever moves later — the core ledger's
@@ -137,6 +158,16 @@ module Github
     end
 
     private
+
+    # The core ledger owns global_blocked_until because a secondary limit can arise on
+    # any live request and Github::RateLimitPolicy already writes it there. Read with
+    # find_by, never through BudgetLedger: this path must not create that row.
+    def global_block(now:)
+      blocked_until = GithubApiBudget.find_by(id: GithubApiBudget::SINGLETON_ID)
+                                     &.global_blocked_until
+
+      blocked_until if blocked_until&.>(now)
+    end
 
     # The window has moved on when GitHub's own reset instant passed, or — when no
     # response ever told us one — when a full Search window elapsed since the last

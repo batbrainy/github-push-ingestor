@@ -10,6 +10,15 @@ module Github
     # (~4,800/hour theoretical) where a job-per-request design at the tick cadence
     # could never exceed ~1,200/hour. The pacing sleep happens here, on the dedicated
     # single-thread enrichment worker, never inside a gate hold or a ledger lock.
+    #
+    # The cycle budget bounds when a *new* request may start, not how long one already
+    # in flight may take: a single fetch can legitimately run to the gate wait plus its
+    # timeouts across every retry and redirect hop, which exceeds the budget. Nothing
+    # preempts it, and nothing should — the reservation is already spent. The overrun is
+    # bounded by Configuration#worst_case_fetch_seconds and is safe to overlap the next
+    # tick: the enrichment queue has one thread, so a cycle enqueued meanwhile waits
+    # rather than running beside this one, and it finds the pacing and ceiling state
+    # this cycle left behind.
     class CycleRunner
       # Two consecutive idle claims (a claimable? race that found nothing to lock)
       # end the phase rather than spinning on it.
@@ -36,16 +45,22 @@ module Github
         end
 
         # @param claimable [Proc] lane key -> Boolean
-        # @return [Array(Symbol, Boolean), nil] lane and whether the slot was borrowed
+        # @return [Array(Symbol, Boolean), nil] the lane to run, and whether the *other*
+        #   class has no claimable candidate — which is what a borrow asserts to
+        #   Github::BudgetLedger. It is deliberately not "this slot was borrowed": a
+        #   one-sided backlog would then stop at its own guarantee on every scheduled
+        #   turn, even though the capacity it needs is provably idle.
         def next_claimable(claimable)
           scheduled = @rotation[@cursor % @rotation.length]
           @cursor += 1
-          return [ scheduled, false ] if claimable.call(scheduled)
-
           other = scheduled == :actor ? :repository : :actor
-          return [ other, true ] if claimable.call(other)
 
-          nil
+          lane = if claimable.call(scheduled) then scheduled
+          elsif claimable.call(other) then other
+          end
+          return nil if lane.nil?
+
+          [ lane, !claimable.call(lane == :actor ? :repository : :actor) ]
         end
       end
 

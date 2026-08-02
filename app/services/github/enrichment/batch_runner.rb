@@ -251,28 +251,37 @@ module Github
       # batch of ten mixes them in and simply omits them, so this only occurs once the
       # remaining members are all in that state.
       #
-      # It is an authoritative per-item answer, so the members are admitted to the
-      # detail lane exactly as an omitted item would be. Retrying the search instead
-      # would reproduce the same 422 forever, and the stored payload URL is what
-      # actually resolves a rename.
-      UNSEARCHABLE_STATUS = 422
+      # Every deterministic client error is treated the same way, not just that one
+      # message. A rejected query is a fact about *this batch's* identifiers and URL,
+      # and the retry ladder would resend both unchanged: the same 4xx, hourly, with no
+      # terminal condition and no way to self-heal. Routing the members to the detail
+      # lane is bounded (its own allowance, its own attempt ladder, its own terminal
+      # outcome) and is the one path that can actually resolve them. Matching on the
+      # English phrase alone would also break the moment GitHub rewords it.
+      #
+      # Rate-limit responses are excluded by the caller: 403/429 classify as
+      # rate_limited or secondary_limited and defer rather than reaching here.
       UNSEARCHABLE_SIGNAL = "cannot be searched".freeze
 
       def unsearchable?(fetched)
-        fetched.status == UNSEARCHABLE_STATUS &&
-          fetched.body.to_s.include?(UNSEARCHABLE_SIGNAL)
+        fetched.classification == :client_error
+      end
+
+      def unsearchable_reason(fetched)
+        fetched.body.to_s.include?(UNSEARCHABLE_SIGNAL) ? "unsearchable_identifier" : "search_query_rejected"
       end
 
       def unsearchable_batch(lease, fetched)
         now = @clock.call
+        reason = unsearchable_reason(fetched)
         lease.items.each do |item|
-          admit_fallback(lease, item, "unsearchable_identifier", now: now)
+          admit_fallback(lease, item, reason, now: now)
         end
         lease.batch.update!(status: "failed", completed_at: now,
-                            last_error: "unsearchable_identifiers",
+                            last_error: reason,
                             returned_count: 0, missing_count: lease.items.length)
         Rails.logger.warn(event: "enrichment.batch_unsearchable", **lease.to_log,
-                          response_status: fetched.status)
+                          reason: reason, response_status: fetched.status)
         Result.new(status: "completed", entity_type: lease.entity_type.key,
                    batch_id: lease.batch.id, requested_count: lease.items.length,
                    returned_count: 0, valid_count: 0,
