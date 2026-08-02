@@ -2,15 +2,17 @@
 
 Date: 2026-07-30
 
-Status: Accepted
+Status: Accepted; durable-backlog policy amended 2026-08-02; staged-batch enrichment amended 2026-08-02
 
 ## Context
 
 §10's demand arithmetic settles the shape of enrichment before any code is written. One
 observed live page of `/events` held ~92–95 push events referencing ~89 distinct actors and
 ~92 distinct repositories: 181 cold entity requests per page, ~2,172 an hour at the default
-cadence, against 40 available. Enrichment is bounded best-effort sampling, and the only
-open question is *how* the 40 are allocated.
+cadence if every poll contained new identities, against 40 available. This is a pressure
+scenario rather than a measured deduplicated arrival rate. The 40 attempts are a reserved
+service budget for a durable backlog, and the allocation must make progress across both
+entity classes.
 
 Left to a simple queue it allocates badly. Repository candidates alone exceed the whole
 hourly allowance, so a repo-first policy — or any policy ordering purely by recency across
@@ -22,7 +24,7 @@ actor_guarantee      = floor(enrichment_allowance × ACTOR_ENRICHMENT_SHARE)
 repository_guarantee = enrichment_allowance − actor_guarantee
 
 Borrowing: a class may borrow the other's unused capacity only when the
-other class has no CURRENTLY ELIGIBLE candidate (not merely no rows).
+other class has no CURRENTLY CLAIMABLE backlog candidate (not merely no rows).
 ```
 
 Two facts make this awkward to place. The guarantee is arithmetic over
@@ -39,7 +41,7 @@ from inside the most contended row lock in the application would invert the lock
    outside the row lock would be advisory rather than enforcement.
 
 2. **The borrow is a parameter, not a query.** `reserve!(request_class, now:, borrow:)`
-   takes the caller's assertion that the other class has no currently eligible candidate.
+   takes the caller's assertion that the other class has no currently claimable backlog candidate.
    `Github::Enrichment::Fairness` establishes it; the ledger enforces the arithmetic that
    follows from it. It defaults to `false`, so every existing caller and every careless one
    gets enforcement.
@@ -70,7 +72,7 @@ from inside the most contended row lock in the application would invert the lock
    from `Github::EnrichmentSchedule`. §9's `effective_enrichment_time` names
    `enrichment_used >= enrichment_allowance`, the class cap, and admitting the share would
    have two consequences: there is no honest instant to name (a share is relieved either by
-   the window rolling *or* by the other class running out of eligible candidates, and the
+   the window rolling *or* by the other class running out of claimable backlog candidates, and the
    second has no timestamp), and it would make borrowing unreachable, because the schedule
    would answer "not due" before the runner ever computed a borrow.
 
@@ -89,7 +91,7 @@ from inside the most contended row lock in the application would invert the lock
 - Fairness is real rather than advisory: a repository flood is refused at 20 requests with
   the actor guarantee untouched, and the refusal costs no quota.
 - Both classes demonstrably enrich within their guarantees (§16), and `bin/enrich` prints
-  the per-class usage so an operator sees the sampling rate rather than a growing queue.
+  per-class usage and backlog progress so an operator can see whether the queue is draining.
 - **The borrow fact is stale by construction.** A poll can persist a new candidate between
   the eligibility query and the debit. The exposure is bounded to one request — the runner
   enriches at most one entity per invocation — it self-corrects on the next call, and it can
@@ -131,6 +133,9 @@ from inside the most contended row lock in the application would invert the lock
 
 ## Amendment (2026-07-31): the refresh pool follows the same two steps
 
+The 2026-08-02 amendment below further restricts *when* this pool may run; the allocation
+arithmetic here still applies after the durable never-enriched backlog is empty.
+
 This ADR decided how the pending pool allocates and left the refresh pool's *selection
 order* unstated, and the shipped `#refresh_choice` did not follow it: it took the first
 refreshable class in `EntityType.all` order — always actor — and set `borrow` from whether
@@ -149,3 +154,45 @@ about the *pending* borrow test and still holds.
 See [ADR 0010](0010-secondary-limit-escalation-and-refresh-pool-fairness.md) for the full
 context, the rejected "refreshes never borrow" reading of §10:898, and the
 `borrowed_refresh` choice reason.
+
+## Amendment (2026-08-02): pending work is durable FIFO backlog
+
+Quota scarcity delays enrichment; it does not make a never-enriched entity expendable.
+Entity rows remain the durable work record until enrichment reaches a success or a genuine
+entity-specific failure outcome. Exhausting the hourly allowance merely defers the row to a
+later rate-limit window. The pending pool is ordered by immutable, non-null
+`created_at ASC, id ASC`; `first_seen_at` can be null and is not a safe queue key. Sustained
+arrivals therefore cannot keep older work from being attempted.
+
+The default hourly ledger reserves 12 attempts for polling, 40 for the enrichment class,
+and 8 as a safety reserve. Within the 40, durable backlog has priority; actors and
+repositories receive 20-attempt guarantees and may borrow only when the other class has no
+currently claimable backlog candidate. Refresh work is lower priority than the entire
+never-enriched pool: a selection that observes either class has never-enriched work does not
+choose a refresh. Once that pool is observed empty, refreshes use the same guarantee and
+borrowing arithmetic described above.
+
+That observation and the later debit are not one database snapshot. Ingestion can commit a
+new candidate between them, so one already-selected refresh can cross the boundary. The
+exposure is at most one request because a runner invocation handles one entity, and the next
+selection self-corrects. This cannot erase backlog state or exceed the enrichment cap.
+
+This policy deliberately does not promise a bounded completion time. If unique entities
+arrive faster than 40 attempts per hour can serve them, backlog size and oldest pending age
+will grow. That pressure is reported directly; work is never converted into a terminal
+budget outcome merely because the quota window ended.
+
+## Amendment (2026-08-02): share fairness is now detail-lane only; search lanes use weights
+
+Plan Appendix G ([ADR 0013](0013-derivation-first-staged-batch-enrichment.md)) makes
+Search batches the normal enrichment path, so this ADR's share arithmetic —
+`floor(enrichment_allowance × ACTOR_ENRICHMENT_SHARE)`, borrowing on the caller's word,
+`:share_exhausted` as a denial — now governs only the bounded core **detail-fallback**
+lane, whose allowance is `CORE_DETAIL_FALLBACK_ALLOWANCE` (default 40, so the guarantees
+default to 2/2). The batch lanes are balanced differently: a weighted rotation
+(`ACTOR_ENRICHMENT_WEIGHT` / `REPOSITORY_ENRICHMENT_WEIGHT`, defaults 1/1) over whole
+Search requests, with a lane that has nothing claimable yielding its slot — batch
+capacity is per-request rather than per-entity, so a per-entity share would misdescribe
+it. The deleted `Enrichment::Fairness` class's decisions survive in `BatchClaim`
+(claimability), `CycleRunner`'s lane schedule (rotation and borrowed slots), and the
+ledger's unchanged share enforcement for detail requests.

@@ -66,6 +66,94 @@ RSpec.describe Github::Ingestion::PageWriter do
     end
   end
 
+  # §8 steps 6–8 as one durability boundary: the accepted event and both event-native
+  # identity fragments commit together. The entity row coalesces future demand by stable
+  # GitHub id; the observation rows preserve the distinct raw evidence each accepted event
+  # supplied.
+  describe "event-native observations" do
+    it "appends one observation per entity, carrying the raw fragment and its fingerprint" do
+      write(well_formed_envelope)
+
+      event = PushEvent.sole
+      actor_observation = EnrichmentObservation.find_by(entity_kind: "actor")
+      repository_observation = EnrichmentObservation.find_by(entity_kind: "repository")
+
+      expect(EnrichmentObservation.count).to eq(2)
+      expect(actor_observation).to have_attributes(
+        entity_github_id: 583_231, source: "event", validation_outcome: "event_native",
+        push_event_id: event.id, observed_at: received_at
+      )
+      expect(actor_observation.raw_payload).to eq(well_formed_envelope.fetch("actor"))
+      expect(actor_observation.payload_fingerprint)
+        .to eq(Github::Events::PayloadFingerprint.fingerprint(well_formed_envelope.fetch("actor")))
+      expect(repository_observation).to have_attributes(
+        entity_github_id: 1_296_269, source: "event", validation_outcome: "event_native",
+        push_event_id: event.id
+      )
+      expect(repository_observation.raw_payload).to eq(well_formed_envelope.fetch("repo"))
+    end
+
+    # Forcing the transaction's last insert to fail is the proof of the boundary: nothing
+    # about the envelope survives, not even the push_events row that had already inserted
+    # or the stubs upserted before it.
+    it "commits the observations with the event, or commits nothing at all" do
+      allow(EnrichmentObservation).to receive(:insert_all!)
+        .and_raise(ActiveRecord::StatementInvalid, "forced by the example")
+
+      tally = write(well_formed_envelope)
+
+      expect(tally.to_h).to include(events_created: 0, events_failed: 1)
+      expect(PushEvent.count).to eq(0)
+      expect(EnrichmentObservation.count).to eq(0)
+      expect(GithubActor.count).to eq(0)
+      expect(GithubRepository.count).to eq(0)
+    end
+
+    # §8's duplicate rule extended to evidence: a replay registered no activity, so it
+    # also supplies no new observation rows.
+    it "adds no observation for a duplicate replay" do
+      write(well_formed_envelope)
+      write(well_formed_envelope, at: frozen_time + 60)
+
+      expect(EnrichmentObservation.count).to eq(2)
+    end
+
+    it "stamps the pipeline entry instants when the entity is first observed" do
+      write(well_formed_envelope)
+
+      expect(GithubActor.sole).to have_attributes(
+        event_native_at: received_at, derived_at: received_at, batch_pending_at: received_at
+      )
+      expect(GithubRepository.sole).to have_attributes(
+        event_native_at: received_at, derived_at: received_at, batch_pending_at: received_at
+      )
+    end
+
+    # COALESCE keeps the first-ever instant: a repeat event for a known entity adds its
+    # evidence but does not restart the entity's pipeline clock, so the FIFO position a
+    # backlog row earned on first observation is never lost to later popularity.
+    it "keeps the first pipeline instants when a second event references the same entity" do
+      write(well_formed_envelope)
+      write(well_formed_envelope("id" => "58000000099",
+                                 "payload" => { "push_id" => 27_500_000_099 }),
+            at: frozen_time + 60)
+
+      expect(EnrichmentObservation.count).to eq(4)
+      expect(GithubActor.sole).to have_attributes(
+        event_native_at: frozen_time, derived_at: frozen_time, batch_pending_at: frozen_time
+      )
+    end
+
+    # Only accepted events supply evidence: a quarantined envelope wrote no entity rows to
+    # attach evidence to, and an ignored one wrote nothing at all.
+    it "writes no observation for a quarantined or ignored envelope" do
+      write([ well_formed_envelope("type" => "WatchEvent"),
+              well_formed_envelope("payload" => { "head" => nil }) ])
+
+      expect(EnrichmentObservation.count).to eq(0)
+    end
+  end
+
   # GitHub's clock and ours are different clocks, and the documented 30s–6h latency means
   # occurred_at can sit either side of the observation. Nothing may clamp it.
   it "lets latest_event_at exceed last_seen_at when GitHub's timestamp is later" do
@@ -84,8 +172,8 @@ RSpec.describe Github::Ingestion::PageWriter do
     expect(GithubActor.sole.latest_event_at).to eq(Time.utc(2026, 7, 29, 11, 59, 0))
   end
 
-  # §12: "Duplicate poll results (fixture replay) — duplicates skipped and no entity
-  # reactivation occurs." Appendix D item 5 is the reason the gate exists at all.
+  # Duplicate observations are absorbed at the event row while harmless identity fields may
+  # still be refreshed. Activity remains gated on INSERT ... RETURNING.
   describe "a duplicate replay" do
     let(:later) { frozen_time + 60 }
 
@@ -97,8 +185,9 @@ RSpec.describe Github::Ingestion::PageWriter do
       # a wall-clock touch here would block the refresh and the example would pass for the
       # wrong reason.
       GithubActor.where(github_id: 583_231)
-                 .update_all(login: "stale-login", enrichment_status: "skipped_budget",
-                             skipped_at: frozen_time, enrichment_attempts: 3,
+                 .update_all(login: "stale-login", enrichment_status: "retryable_failure",
+                             enrichment_attempts: 3, next_retry_at: later + 3600,
+                             last_error: "GitHub unavailable",
                              updated_at: frozen_time)
     end
 
@@ -133,91 +222,55 @@ RSpec.describe Github::Ingestion::PageWriter do
       expect(GithubActor.sole.first_seen_at).to eq(frozen_time)
     end
 
-    # §7 merge rule 4, and the whole reason for the gate: "a re-polled window would
-    # resurrect skipped entities with no new activity".
-    it "cannot reactivate an entity that a budget skip had terminated" do
+    it "does not clear retry state when no new event was persisted" do
       write(well_formed_envelope, at: later)
 
       expect(GithubActor.sole).to have_attributes(
-        enrichment_status: "skipped_budget", skipped_at: frozen_time, enrichment_attempts: 3
+        enrichment_status: "retryable_failure", enrichment_attempts: 3,
+        next_retry_at: later + 3600, last_error: "GitHub unavailable"
       )
     end
 
-    # The structural assertion, not just its side effects: the gate is the call site, and
-    # both halves of merge rule 3 sit behind it.
-    it "never calls the activity update or the reactivation at all" do
+    # The structural assertion, not just its side effects: the activity gate is the call
+    # site, so a duplicate cannot look like new demand.
+    it "never calls the activity update" do
       expect(GithubActor).not_to receive(:touch_activity!)
       expect(GithubRepository).not_to receive(:touch_activity!)
-      expect(GithubActor).not_to receive(:reactivate_skipped!)
-      expect(GithubRepository).not_to receive(:reactivate_skipped!)
 
       write(well_formed_envelope, at: later)
     end
   end
 
-  # The other side of the same gate, and the pair is the assertion: §7's reactivation rule
-  # says "a **newly persisted** push event referencing the entity … may transition it back
-  # to pending", while rule 4 says a replay never may. The two examples above and below
-  # differ only in whether the event is genuinely new.
-  describe "a genuinely new event referencing a skipped entity" do
+  describe "a genuinely new event referencing a retryable entity" do
     let(:later) { frozen_time + 60 }
 
     before do
       write(well_formed_envelope)
 
       GithubActor.where(github_id: 583_231)
-                 .update_all(enrichment_status: "skipped_budget", skipped_at: frozen_time,
-                             enrichment_attempts: 3, updated_at: frozen_time)
-      GithubRepository.where(github_id: 1_296_269)
-                      .update_all(enrichment_status: "skipped_budget", skipped_at: frozen_time,
-                                  updated_at: frozen_time)
+                 .update_all(enrichment_status: "retryable_failure",
+                             enrichment_attempts: 3, next_retry_at: later + 3600,
+                             last_error: "GitHub unavailable", updated_at: frozen_time)
     end
 
     def distinct_event(at:)
       write(well_formed_envelope("id" => "58000000099", "payload" => { "push_id" => 27_500_000_099 }), at: at)
     end
 
-    it "reactivates both entities, because a distinct event id proves new activity" do
+    it "moves activity timestamps while preserving the entity's FIFO position" do
+      created_at = GithubActor.sole.created_at
       distinct_event(at: later)
 
-      expect(GithubActor.sole).to have_attributes(enrichment_status: "pending", skipped_at: nil)
-      expect(GithubRepository.sole).to have_attributes(enrichment_status: "pending", skipped_at: nil)
+      expect(GithubActor.sole).to have_attributes(last_seen_at: later, created_at: created_at)
     end
 
-    # §7's reactivation rule covers delayed-but-new events explicitly: "even with an old
-    # created_at (documented 30s-6h latency), a distinct event ID proves new activity".
-    it "moves the activity timestamps that drive newest-first ordering" do
-      distinct_event(at: later)
-
-      expect(GithubActor.sole.last_seen_at).to eq(later)
-    end
-
-    # An inbound envelope performed no fetch, so writing last_error = NULL or resetting the
-    # attempt count would assert something that did not happen.
     it "keeps the failure history, because no fetch occurred" do
       distinct_event(at: later)
 
-      expect(GithubActor.sole.enrichment_attempts).to eq(3)
-    end
-
-    it "logs the reactivation at INFO, which §11 lists among the enrichment events" do
-      allow(Rails.logger).to receive(:info)
-
-      distinct_event(at: later)
-
-      expect(Rails.logger).to have_received(:info)
-        .with(hash_including(event: "enrichment.reactivated", github_actor_id: 583_231))
-    end
-
-    it "logs nothing when there was nothing to reactivate" do
-      GithubActor.update_all(enrichment_status: "pending", skipped_at: nil)
-      GithubRepository.update_all(enrichment_status: "pending", skipped_at: nil)
-      allow(Rails.logger).to receive(:info)
-
-      distinct_event(at: later)
-
-      expect(Rails.logger).not_to have_received(:info)
-        .with(hash_including(event: "enrichment.reactivated"))
+      expect(GithubActor.sole).to have_attributes(
+        enrichment_status: "retryable_failure", enrichment_attempts: 3,
+        next_retry_at: later + 3600, last_error: "GitHub unavailable"
+      )
     end
   end
 

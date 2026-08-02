@@ -16,6 +16,12 @@ Status: Historical first-party observation; superseded for submission gating
 > [`2026-08-01-post-merge-verification.md`](2026-08-01-post-merge-verification.md) gate 1.18
 > ran the corrected script against `88e2260c` — 45 checks passed, 0 failed.
 
+> [!IMPORTANT]
+> The raw transcript also predates the 2026-08-02 durable-backlog correction. Its
+> `enrichment.aged_out` and skipped-count lines describe the old binary, not current policy.
+> Current entity work is never terminally skipped for quota; see
+> [`IMPLEMENTATION_PLAN.md` Appendix F](../../IMPLEMENTATION_PLAN.md).
+
 ## Why this verification exists
 
 `IMPLEMENTATION_PLAN.md` §2A declares `restart: unless-stopped` on `db`, `web` and `worker`,

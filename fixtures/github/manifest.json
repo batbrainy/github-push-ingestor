@@ -92,6 +92,32 @@
               "x-ratelimit-used": "8"
             }
           }
+        ],
+        "/search/users?per_page=3&q=user%3Aoctocat+user%3Amonalisa+user%3Aghostuser": [
+          {
+            "status": 200,
+            "body": "search/users-partial.json",
+            "headers": {
+              "x-ratelimit-resource": "search",
+              "x-ratelimit-limit": "10",
+              "x-ratelimit-remaining": "9",
+              "x-ratelimit-used": "1",
+              "x-ratelimit-reset": "+60"
+            }
+          }
+        ],
+        "/search/repositories?per_page=3&q=repo%3Aoctocat%2FHello-World+repo%3Amonalisa%2FSpoon-Knife+repo%3Adeleted-org%2Fgone": [
+          {
+            "status": 200,
+            "body": "search/repositories-partial.json",
+            "headers": {
+              "x-ratelimit-resource": "search",
+              "x-ratelimit-limit": "10",
+              "x-ratelimit-remaining": "8",
+              "x-ratelimit-used": "2",
+              "x-ratelimit-reset": "+60"
+            }
+          }
         ]
       }
     },
@@ -238,9 +264,233 @@
         ]
       }
     },
+    "search_complete": {
+      "inherit": "default",
+      "responses": {
+        "/search/users?per_page=3&q=user%3Aoctocat+user%3Amonalisa+user%3Aghostuser": [
+          {
+            "status": 200,
+            "body": "search/users-complete.json",
+            "headers": {
+              "x-ratelimit-resource": "search",
+              "x-ratelimit-limit": "10",
+              "x-ratelimit-remaining": "9",
+              "x-ratelimit-used": "1",
+              "x-ratelimit-reset": "+60"
+            }
+          }
+        ],
+        "/search/repositories?per_page=3&q=repo%3Aoctocat%2FHello-World+repo%3Amonalisa%2FSpoon-Knife+repo%3Adeleted-org%2Fgone": [
+          {
+            "status": 200,
+            "body": "search/repositories-complete.json",
+            "headers": {
+              "x-ratelimit-resource": "search",
+              "x-ratelimit-limit": "10",
+              "x-ratelimit-remaining": "8",
+              "x-ratelimit-used": "2",
+              "x-ratelimit-reset": "+60"
+            }
+          }
+        ]
+      }
+    },
+    "search_renamed_repository": {
+      "inherit": "default",
+      "responses": {
+        "/search/repositories?per_page=3&q=repo%3Aoctocat%2FHello-World+repo%3Amonalisa%2FSpoon-Knife+repo%3Adeleted-org%2Fgone": [
+          {
+            "status": 200,
+            "body": "search/repositories-renamed.json",
+            "headers": {
+              "x-ratelimit-resource": "search",
+              "x-ratelimit-limit": "10",
+              "x-ratelimit-remaining": "9",
+              "x-ratelimit-used": "1",
+              "x-ratelimit-reset": "+60"
+            }
+          }
+        ]
+      }
+    },
+    "search_unrequested_result": {
+      "inherit": "default",
+      "responses": {
+        "/search/repositories?per_page=3&q=repo%3Aoctocat%2FHello-World+repo%3Amonalisa%2FSpoon-Knife+repo%3Adeleted-org%2Fgone": [
+          {
+            "status": 200,
+            "body": "search/repositories-unrequested.json",
+            "headers": {
+              "x-ratelimit-resource": "search",
+              "x-ratelimit-limit": "10",
+              "x-ratelimit-remaining": "9",
+              "x-ratelimit-used": "1",
+              "x-ratelimit-reset": "+60"
+            }
+          }
+        ]
+      }
+    },
+    "search_incomplete_results": {
+      "inherit": "default",
+      "responses": {
+        "/search/users?per_page=3&q=user%3Aoctocat+user%3Amonalisa+user%3Aghostuser": [
+          {
+            "status": 200,
+            "body": "search/users-incomplete.json",
+            "headers": {
+              "x-ratelimit-resource": "search",
+              "x-ratelimit-limit": "10",
+              "x-ratelimit-remaining": "9",
+              "x-ratelimit-used": "1",
+              "x-ratelimit-reset": "+60"
+            }
+          }
+        ]
+      }
+    },
+    "search_malformed": {
+      "inherit": "default",
+      "responses": {
+        "/search/users?per_page=3&q=user%3Aoctocat+user%3Amonalisa+user%3Aghostuser": [
+          {
+            "status": 200,
+            "body": "search/malformed-envelope.json",
+            "headers": {
+              "x-ratelimit-resource": "search",
+              "x-ratelimit-limit": "10",
+              "x-ratelimit-remaining": "9",
+              "x-ratelimit-used": "1",
+              "x-ratelimit-reset": "+60"
+            }
+          }
+        ],
+        "/search/repositories?per_page=3&q=repo%3Aoctocat%2FHello-World+repo%3Amonalisa%2FSpoon-Knife+repo%3Adeleted-org%2Fgone": [
+          {
+            "status": 200,
+            "body": "search/malformed-envelope.json",
+            "headers": {
+              "x-ratelimit-resource": "search",
+              "x-ratelimit-limit": "10",
+              "x-ratelimit-remaining": "8",
+              "x-ratelimit-used": "2",
+              "x-ratelimit-reset": "+60"
+            }
+          }
+        ]
+      }
+    },
+    "search_rejected": {
+      "inherit": "default",
+      "responses": {
+        "/search/users?per_page=3&q=user%3Aoctocat+user%3Amonalisa+user%3Aghostuser": [
+          {
+            "status": 422,
+            "body": "errors/validation-failed.json",
+            "headers": {
+              "x-ratelimit-resource": "search",
+              "x-ratelimit-limit": "10",
+              "x-ratelimit-remaining": "9",
+              "x-ratelimit-used": "1",
+              "x-ratelimit-reset": "+60"
+            }
+          }
+        ],
+        "/search/repositories?per_page=3&q=repo%3Aoctocat%2FHello-World+repo%3Amonalisa%2FSpoon-Knife+repo%3Adeleted-org%2Fgone": [
+          {
+            "status": 422,
+            "body": "errors/validation-failed.json",
+            "headers": {
+              "x-ratelimit-resource": "search",
+              "x-ratelimit-limit": "10",
+              "x-ratelimit-remaining": "8",
+              "x-ratelimit-used": "2",
+              "x-ratelimit-reset": "+60"
+            }
+          }
+        ]
+      }
+    },
+    "search_rate_limited": {
+      "inherit": "default",
+      "responses": {
+        "/search/users?per_page=3&q=user%3Aoctocat+user%3Amonalisa+user%3Aghostuser": [
+          {
+            "status": 403,
+            "body": "errors/rate-limit-exhausted.json",
+            "headers": {
+              "x-ratelimit-resource": "search",
+              "x-ratelimit-limit": "10",
+              "x-ratelimit-remaining": "0",
+              "x-ratelimit-used": "10",
+              "x-ratelimit-reset": "+60"
+            }
+          }
+        ],
+        "/search/repositories?per_page=3&q=repo%3Aoctocat%2FHello-World+repo%3Amonalisa%2FSpoon-Knife+repo%3Adeleted-org%2Fgone": [
+          {
+            "status": 403,
+            "body": "errors/rate-limit-exhausted.json",
+            "headers": {
+              "x-ratelimit-resource": "search",
+              "x-ratelimit-limit": "10",
+              "x-ratelimit-remaining": "0",
+              "x-ratelimit-used": "10",
+              "x-ratelimit-reset": "+60"
+            }
+          }
+        ]
+      }
+    },
+    "search_secondary_rate_limited": {
+      "inherit": "default",
+      "responses": {
+        "/search/users?per_page=3&q=user%3Aoctocat+user%3Amonalisa+user%3Aghostuser": [
+          {
+            "status": 429,
+            "body": "errors/secondary-rate-limit.json",
+            "headers": {
+              "retry-after": "60",
+              "x-ratelimit-resource": "search",
+              "x-ratelimit-limit": "10",
+              "x-ratelimit-remaining": "7",
+              "x-ratelimit-used": "3",
+              "x-ratelimit-reset": "+60"
+            }
+          }
+        ],
+        "/search/repositories?per_page=3&q=repo%3Aoctocat%2FHello-World+repo%3Amonalisa%2FSpoon-Knife+repo%3Adeleted-org%2Fgone": [
+          {
+            "status": 429,
+            "body": "errors/secondary-rate-limit.json",
+            "headers": {
+              "retry-after": "60",
+              "x-ratelimit-resource": "search",
+              "x-ratelimit-limit": "10",
+              "x-ratelimit-remaining": "7",
+              "x-ratelimit-used": "3",
+              "x-ratelimit-reset": "+60"
+            }
+          }
+        ]
+      }
+    },
     "redirecting_repository": {
       "inherit": "default",
       "responses": {
+        "/search/repositories?per_page=3&q=repo%3Aoctocat%2FHello-World+repo%3Amonalisa%2FSpoon-Knife+repo%3Adeleted-org%2Fgone": [
+          {
+            "status": 200,
+            "body": "search/repositories-missing-hello-world.json",
+            "headers": {
+              "x-ratelimit-resource": "search",
+              "x-ratelimit-limit": "10",
+              "x-ratelimit-remaining": "9",
+              "x-ratelimit-used": "1",
+              "x-ratelimit-reset": "+60"
+            }
+          }
+        ],
         "/repos/octocat/Hello-World": [
           {
             "status": 301,
@@ -266,6 +516,19 @@
     "hostile_redirect": {
       "inherit": "default",
       "responses": {
+        "/search/repositories?per_page=3&q=repo%3Aoctocat%2FHello-World+repo%3Amonalisa%2FSpoon-Knife+repo%3Adeleted-org%2Fgone": [
+          {
+            "status": 200,
+            "body": "search/repositories-missing-hello-world.json",
+            "headers": {
+              "x-ratelimit-resource": "search",
+              "x-ratelimit-limit": "10",
+              "x-ratelimit-remaining": "9",
+              "x-ratelimit-used": "1",
+              "x-ratelimit-reset": "+60"
+            }
+          }
+        ],
         "/repos/octocat/Hello-World": [
           {
             "status": 301,

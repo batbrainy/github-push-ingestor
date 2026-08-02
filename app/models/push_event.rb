@@ -29,8 +29,7 @@ class PushEvent < ApplicationRecord
 
   # The duplicate-event insert gate the accepted-row guarantee rests on (§7, §8). Returns
   # the new row's id, or nil when the event was already persisted — and the caller uses
-  # exactly that distinction to decide whether entity activity may be updated, so a
-  # re-polled window cannot resurrect skipped entities.
+  # exactly that distinction to decide whether entity activity may be updated.
   #
   # The explicit validate! is load-bearing: insert bypasses Active Record
   # validations, so without it SHA_FORMAT would never run on the real write path.

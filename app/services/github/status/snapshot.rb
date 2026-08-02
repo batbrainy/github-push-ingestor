@@ -1,26 +1,27 @@
 module Github
   module Status
-    # Everything IMPLEMENTATION_PLAN.md §11 asks GET /status to report, taken as one
-    # snapshot of persisted state.
+    # Everything IMPLEMENTATION_PLAN.md §11 (as amended by Appendix G) asks GET /status
+    # to report, taken as one snapshot of persisted state.
     #
     # **It never initiates a GitHub request**, and it is structural rather than a promise,
     # exactly as Github::Ingestion::StateSummary states it: this class holds no executor, no
     # transport and no ledger, and its only collaborators are Active Record models and pure
-    # value objects. Github::BudgetLedger is absent by construction — all four of its public
-    # methods write, and #bootstrap! would create from a read path the very row a
-    # reservation owns. Every ledger read here is find_by. Four specs pin it: a recording
-    # transport that must see nothing, an unchanged github_api_budget count, an unchanged
-    # event_sources count, and a SQL subscriber that must see no write statement.
+    # value objects. Github::BudgetLedger and Github::SearchBudgetLedger are absent by
+    # construction — their public methods write, and bootstrap! would create from a read
+    # path the very row a reservation owns. Every ledger read here is find_by. The specs
+    # pin it: a recording transport that must see nothing, unchanged singleton counts, and
+    # a SQL subscriber that must see no write statement.
     #
-    # ## Why one aggregate rather than StateSummary + Summary side by side
+    # ## Read inventory, and why each read happens once
     #
-    # Three parts of this response need github_api_budget: the poll schedule, §11's ledger
-    # block, and the enrichment block. Composing the two existing summaries would read the
-    # singleton three times, so a reservation committing mid-request could produce one body
-    # whose poll block contradicts its ledger block. This reads the row **once** and passes
-    # it down. StateSummary additionally runs an unbounded PushEvent.count that §11 does not
-    # ask for here, collapses PollSchedule to a single instant behind a private method when
-    # §11 wants the components, and exposes neither poll_used, poll_allowance nor reserve.
+    # - github_api_budget and github_search_budget: one find_by each, handed down to every
+    #   block that needs them — independent reads could straddle a committing reservation
+    #   and publish blocks that contradict each other.
+    # - one aggregate statement per entity table (Enrichment::BacklogMetrics), captured
+    #   once and shared by the enrichment and throughput blocks so they cannot disagree.
+    # - one grouped statement over enrichment_batches (Enrichment::BatchQuality).
+    # - one statement for coverage (unchanged §11 percentages).
+    # - zero reads: scheduler settings (pure configuration), both ledger projections.
     #
     # ## #payload, not #to_log
     #
@@ -28,10 +29,12 @@ module Github
     # CLI's column-aligned block and #to_log is the INFO stream's projection — and both
     # #to_log implementations call .compact, dropping nil keys. A JSON client needs a fixed
     # key set: a field that appears and disappears makes every consumer handle two shapes.
-    # Naming the three apart is what stops one being quietly changed to suit another.
-    class Snapshot < Data.define(:captured_at, :sources, :ledger, :enrichment, :coverage)
+    class Snapshot < Data.define(:captured_at, :sources, :ledger, :search_ledger,
+                                 :scheduler, :enrichment, :batches, :throughput, :coverage)
       def self.capture(now: Time.current, configuration: Github.configuration)
         budget = GithubApiBudget.find_by(id: GithubApiBudget::SINGLETON_ID)
+        search_budget = GithubSearchBudget.find_by(id: GithubSearchBudget::SINGLETON_ID)
+        backlog = Enrichment::BacklogMetrics.capture(now: now, configuration: configuration)
         runs = latest_runs
 
         new(
@@ -41,8 +44,16 @@ module Github
                                            last_run: runs[event_source.id], now: now)
           end,
           ledger: LedgerState.from(budget, configuration: configuration),
+          search_ledger: SearchLedgerState.from(search_budget, configuration: configuration,
+                                                now: now),
+          scheduler: SchedulerSettings.from(configuration),
           enrichment: Enrichment::Summary.capture(now: now, configuration: configuration,
-                                                  budget: budget),
+                                                  budget: budget,
+                                                  search_budget: search_budget,
+                                                  backlog: backlog),
+          batches: Enrichment::BatchQuality.capture(now: now, configuration: configuration),
+          throughput: Enrichment::Throughput.from(backlog, now: now,
+                                                  configuration: configuration),
           coverage: Enrichment::Coverage.capture(now: now, configuration: configuration)
         )
       end
@@ -75,57 +86,62 @@ module Github
       end
       private_class_method :latest_runs
 
-      # §11's key set, in §11's order: poll state, ledger state, then the enrichment
-      # counters and coverage percentages.
-      #
       # `null` throughout, never a sentinel string and never a missing key. §16's rule is
       # that an unknown must not read as a zero, and the way to honour that in JSON is not
       # to swap the type — a `remaining` that is sometimes an Integer and sometimes
       # "not yet initialized" forces every consumer to type-check. It is: a counted zero
       # prints 0, a number that does not exist prints null, and wherever null would carry
-      # two meanings the disambiguating fact gets its own field — ledger.present, due_now,
-      # claimable_now.
+      # two meanings the disambiguating fact gets its own field — ledger.present,
+      # search_ledger.present, due_now, claimable_now, catch_up.state.
       def payload
         { captured_at: Ingestion::Report.timestamp(captured_at),
           sources: sources.map(&:payload),
           ledger: ledger.payload,
+          search_ledger: search_ledger.payload,
+          scheduler: scheduler.payload,
           enrichment: enrichment_payload,
+          batches: batches.payload,
+          throughput: throughput.payload,
           coverage: coverage.payload }
       end
 
       private
 
-      # §11's "pending_actor_count / pending_repository_count / skipped_actor_count /
-      # skipped_repository_count", and the reason all five statuses are published rather
-      # than those two.
-      #
-      # §11 lists pending_* beside skipped_*, and skipped_budget is a value of
-      # Enrichable::ENRICHMENT_STATUSES — so its sibling is the status value too, and
-      # `pending` here means enrichment_status = 'pending' exactly.
-      # Github::Ingestion::StateSummary uses the same *name* for a different number: the
-      # enrichment_candidates scope, which is pending **plus** retryable_failure and is
-      # what "still to enrich" means when the question is how much work is left. Both are
-      # right for their own question, and publishing one of them under a name the other
-      # also uses is how two numbers silently become one. So this block names both:
-      # every status by its own name, and the scope as `candidates`.
+      # Each entity class exposes the durable backlog separately from its raw status
+      # counts, plus the staged-pipeline view: every stage with its count and oldest
+      # FIFO instant, and the contract backlog — rows not yet at the useful-data
+      # contract or a terminal outcome. A backlog row may be temporarily deferred by
+      # retry backoff, so these numbers intentionally differ from claimable_now. Queue
+      # depth is not published: jobs are bounded wake-up hints and entity rows are the
+      # source of truth.
       def enrichment_payload
-        { actors: entity_counts(enrichment.actor_counts),
-          repositories: entity_counts(enrichment.repository_counts),
+        { actors: entity_counts(enrichment.actor),
+          repositories: entity_counts(enrichment.repository),
           claimable_now: enrichment.claimable_now,
           next_enrichment_at: Ingestion::Report.timestamp(enrichment.next_enrichment_at) }
       end
 
-      # fetch(status, 0) because GROUP BY returns no key for a status with no rows, and an
-      # absent key here would be the missing-key shape the payload rule forbids. These
-      # zeros are counted, not fabricated: the table was read and held nothing.
-      def entity_counts(counts)
-        Enrichable::ENRICHMENT_STATUSES.index_with { |status| counts.fetch(status, 0) }
-                                       .symbolize_keys
-                                       .merge(candidates: candidates(counts))
+      # fetch(status, 0) because the aggregate drops a status with no rows. These zeros
+      # are counted, not fabricated: the table was read and held nothing. Stage counts
+      # arrive with their zeros already present.
+      def entity_counts(entry)
+        Enrichable::ENRICHMENT_STATUSES
+          .index_with { |status| entry.status_counts.fetch(status, 0) }
+          .symbolize_keys
+          .merge(backlog_count: entry.backlog_count,
+                 contract_backlog_count: entry.contract_backlog_count,
+                 oldest_pending_at: Ingestion::Report.timestamp(entry.oldest_pending_at),
+                 oldest_pending_age_seconds: entry.oldest_pending_age_seconds,
+                 stages: stage_payload(entry))
       end
 
-      def candidates(counts)
-        Enrichable::CANDIDATE_STATUSES.sum { |status| counts.fetch(status, 0) }
+      def stage_payload(entry)
+        Enrichable::ENRICHMENT_STAGES.index_with do |stage|
+          oldest = entry.stage_oldest.fetch(stage, nil)
+          { count: entry.stage_counts.fetch(stage, 0),
+            oldest_created_at: Ingestion::Report.timestamp(oldest),
+            oldest_age_seconds: Enrichment::BacklogMetrics.age_seconds(oldest, now: captured_at) }
+        end.symbolize_keys
       end
     end
   end

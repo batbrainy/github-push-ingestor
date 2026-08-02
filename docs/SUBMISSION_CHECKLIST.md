@@ -95,8 +95,11 @@ globally named `github-push-ingestor_pgdata` volume.
       grep -E 'Non-push events ignored:[[:space:]]+1' "$fixture_ingest_output"
       ```
 
-- [ ] `GITHUB_MODE=fixture docker compose run --rm enrich --limit 6` exits 0 and leaves
-      `complete 2 / permanent_failure 1` in each entity class.
+- [ ] `GITHUB_MODE=fixture docker compose run --rm -e SEARCH_PACING_SECONDS=0 enrich
+      --limit 6` exits 0 and leaves `complete 2 / permanent_failure 1` in each entity
+      class — two Search batches, then two detail-fallback `404` terminals (the pacing
+      override lets the second batch run immediately instead of reporting a pacing
+      deferral).
 - [ ] SQL state is exactly 4 events, 3 actors, 3 repositories, 3 quarantine rows, and 3 total
       quarantine occurrences:
 
@@ -112,18 +115,28 @@ globally named `github-push-ingestor_pgdata` volume.
         SELECT 'repository', enrichment_status, COUNT(*) FROM github_repositories GROUP BY 2;"
       ```
 
-- [ ] After the 60-second poll floor, capture `ingest --force`; require 4 duplicates and no
-      `enrichment.reactivated` line in that captured output:
+- [ ] Before replay, record entity activity; after the 60-second poll floor, capture
+      `ingest --force`, require 4 duplicates, and prove the duplicate registered no new
+      entity activity:
 
       ```bash
       sleep 60
+      activity_before="$(docker compose exec -T db psql -U postgres \
+        -d github_push_ingestor_development -Atc \
+        "SELECT md5(string_agg(row_to_json(entities)::text, ',' ORDER BY kind, github_id))
+           FROM (SELECT 'actor' AS kind, github_id, first_seen_at, last_seen_at, latest_event_at FROM github_actors
+                 UNION ALL
+                 SELECT 'repository', github_id, first_seen_at, last_seen_at, latest_event_at FROM github_repositories) entities;")"
       fixture_replay_output="$(mktemp)"
       GITHUB_MODE=fixture docker compose run --rm ingest --force 2>&1 | tee "$fixture_replay_output"
       grep -E 'Duplicates skipped:[[:space:]]+4' "$fixture_replay_output"
-      if grep -q 'enrichment.reactivated' "$fixture_replay_output"; then
-        echo "duplicate replay reactivated an entity" >&2
-        exit 1
-      fi
+      activity_after="$(docker compose exec -T db psql -U postgres \
+        -d github_push_ingestor_development -Atc \
+        "SELECT md5(string_agg(row_to_json(entities)::text, ',' ORDER BY kind, github_id))
+           FROM (SELECT 'actor' AS kind, github_id, first_seen_at, last_seen_at, latest_event_at FROM github_actors
+                 UNION ALL
+                 SELECT 'repository', github_id, first_seen_at, last_seen_at, latest_event_at FROM github_repositories) entities;")"
+      test "$activity_before" = "$activity_after"
       rm -f "$fixture_ingest_output" "$fixture_replay_output"
       ```
 
@@ -187,8 +200,8 @@ particular, read the erratum atop
 - [ ] **Both** actor and repository enrichment demonstrably occur within their fairness
       guarantees — `spec/services/github/enrichment/end_to_end_spec.rb`; fixture run gives
       `complete 2 / permanent_failure 1` per class
-- [ ] A duplicate event ID cannot add another `push_events` row or reactivate a skipped entity
-      — fixture replay: 4 duplicates absorbed, no `enrichment.reactivated`
+- [ ] A duplicate event ID cannot add another `push_events` row or register new entity
+      activity — fixture replay: 4 duplicates absorbed, activity hash unchanged
 - [ ] `Link`-header pagination is handled; every fetched page fully processed —
       `spec/services/github/ingestion/page_loop_spec.rb`; `paginated` scenario
 - [ ] Rate-limit behavior demonstrated: `304` quota accounting, class-aware ledger
@@ -198,6 +211,18 @@ particular, read the erratum atop
 - [ ] Malformed data quarantined durably per the taxonomy (canonical fingerprints,
       occurrence-counted) and does not terminate the batch — 3 rows, occurrences 3 → 6 on
       replay, and 4 events persisted beside them
+- [ ] **Both staged batch paths demonstrably run** (plan Appendix G): the fixture
+      `default` walkthrough completes one actor and one repository Search batch, then two
+      payload-URL detail fallbacks that meet `404`s and go terminal — two `complete` plus
+      one `permanent_failure` per class from exactly 2 search + 2 detail requests
+      (`fixtures/github/README.md`, the enrichment end-to-end specs)
+- [ ] Batch results apply only on a **stable-ID match** — the `search_renamed_repository`
+      and `search_unrequested_result` scenarios show a renamed and an unrequested item
+      observed but never applied, routed to fallback or recorded as `unrequested_result`
+- [ ] **No quota-based terminal state exists** — `git grep -n skipped_budget -- app lib
+      db/schema.rb` returns nothing, and every search/core denial reason
+      (`ceiling`, `reserve`, `pacing`, `blocked`, class/share exhaustion) defers rather
+      than terminates
 
 ---
 
@@ -219,8 +244,13 @@ particular, read the erratum atop
       idempotency of persisted state
 - [ ] Reconciliation recovers missing enrichment scheduling —
       `spec/recovery/pending_enrichment_recovery_spec.rb`
-- [ ] The enrichment backlog is bounded (eligibility window + `skipped_budget` +
-      distinct-event reactivation) — `spec/services/github/enrichment/age_out_spec.rb`
+- [ ] Never-enriched actor and repository rows remain durable backlog work across quota
+      exhaustion and window rollover; candidates are selected FIFO oldest-first —
+      `spec/services/github/enrichment/candidate_selector_spec.rb`,
+      `spec/recovery/pending_enrichment_recovery_spec.rb`
+- [ ] A selection that observes either entity class has never-enriched backlog work does
+      not choose a refresh; the documented concurrent-insert window is bounded to one
+      runner request — `spec/services/github/enrichment/fairness_spec.rb`
 
 ---
 
@@ -232,9 +262,18 @@ particular, read the erratum atop
       trace is one hop
 - [ ] `/health/live` and `/health/ready` are meaningful and never consume budget —
       `spec/requests/health_spec.rb`
-- [ ] `/status` reports window status, poll state, per-class ledger state, pending/skipped
-      counts, and coverage percentages by the defined formulas — without initiating GitHub
-      requests — `spec/requests/status_spec.rb`, `Github::Enrichment::Coverage`
+- [ ] `/status` reports window status, poll state, per-class ledger state, backlog size,
+      oldest pending timestamp/age, reserved allowance usage, and coverage percentages by
+      the defined formulas — without initiating GitHub requests or fabricating a drain ETA
+      — `spec/requests/status_spec.rb`, `Github::Enrichment::Coverage`
+- [ ] `/status` carries the Appendix G blocks with their exact keys: `ledger` uses
+      `detail_fallback` (renamed from `enrichment`); `search_ledger` publishes
+      ceiling/reserve/spendable/used/per-lane usage/`blocked_until`/
+      `next_request_earliest_at`; `scheduler` publishes every staged tunable; each entity
+      class publishes `contract_backlog_count` and all seven `stages` with counts and
+      oldest ages; `batches` publishes all four request-kind × entity-kind groups with
+      fill ratios; and `throughput.catch_up.state` is exactly one of
+      `keeping_up | not_keeping_up | insufficient_sample`
 - [ ] During §1's empty-volume fixture phase, while the worker has never been started, hash
       the complete budget row and record all request counters. Call `/health/live`,
       `/health/ready`, and `/status` repeatedly, then require the hash and counters to be
@@ -333,13 +372,16 @@ particular, read the erratum atop
 ## 7. Forbidden-claim scan
 
 ```bash
-claim_pattern='exactly[ -]?once|effectively[ -]?once|once-only[[:space:]]+(execution|processing|delivery)|(complete|full|exhaustive)[[:space:]]+(upstream[[:space:]]+)?(event[[:space:]]+)?capture|captur(e|es|ed|ing)[[:space:]]+(all|every)[[:space:]]+(upstream[[:space:]]+|public[[:space:]]+|GitHub[[:space:]]+)?events?|(complete|full|exhaustive)[[:space:]]+enrichment([[:space:]]+coverage)?|enrich(es|ed|ing)?[[:space:]]+(all|every)[[:space:]]+(actors?|repositories|entities)|sampling[[:space:]]+becomes[[:space:]]+coverage|100%[[:space:]]+(capture|enrichment|coverage)'
+claim_pattern='exactly[ -]?once|effectively[ -]?once|once-only[[:space:]]+(execution|processing|delivery)|(complete|full|exhaustive)[[:space:]]+(upstream[[:space:]]+)?(event[[:space:]]+)?capture|captur(e|es|ed|ing)[[:space:]]+(all|every)[[:space:]]+(upstream[[:space:]]+|public[[:space:]]+|GitHub[[:space:]]+)?events?|(complete|full|exhaustive)[[:space:]]+enrichment([[:space:]]+coverage)?|enrich(es|ed|ing)?[[:space:]]+(all|every)[[:space:]]+(actors?|repositories|entities)|sampling[[:space:]]+becomes[[:space:]]+coverage|100%[[:space:]]+(capture|enrichment|coverage)|guaranteed?[[:space:]]+catch[ -]?up|catch[ -]?up[[:space:]]+(is[[:space:]]+)?guaranteed|(will|shall)[[:space:]]+(always[[:space:]]+)?catch[[:space:]]+up|eventual(ly)?[[:space:]]+catch(es)?[ -]?(up|ing[[:space:]]+up)|backlog[[:space:]]+(always|will)[[:space:]]+drains?|bounded[[:space:]]+drain[[:space:]]+time'
 git grep -nI -i -E "$claim_pattern" -- .
 ```
 
 **The rule: every prose hit must explicitly reject the guarantee.** The regex assignment
 itself is scan vocabulary, not a claim. Any affirmative system-level promise of singular
-execution, exhaustive upstream capture, or exhaustive enrichment fails the gate; do not
-approve it merely because it avoids one exact phrase.
+execution, exhaustive upstream capture, exhaustive enrichment, or guaranteed catch-up
+fails the gate; do not approve it merely because it avoids one exact phrase. Catch-up may
+be described only as a dated, measured comparison of completion and arrival rates —
+`/status` says `not_keeping_up` when the comparison fails, and no document promises the
+backlog drains.
 
 - [ ] Every hit is a negation

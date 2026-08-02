@@ -44,7 +44,7 @@ module Github
           limit: limit,
           reserve: configuration.rate_limit_reserve,
           poll_allowance: poll,
-          enrichment_allowance: limit - configuration.rate_limit_reserve - poll,
+          enrichment_allowance: configuration.core_detail_fallback_allowance,
           actor_enrichment_share: configuration.actor_enrichment_share
         )
       end
@@ -82,15 +82,15 @@ module Github
     # is about capacity for Story 3, and one attempt of capacity is one attempt of
     # capacity whichever class holds it — a zero guarantee is relieved by borrowing.
     def feasible?
-      enrichment_allowance >= 1
+      poll_allowance + reserve + enrichment_allowance <= limit
     end
 
     # What to actually store when the observed limit makes the configuration
     # infeasible — an IP co-tenant scenario, a proxy, or an unexpected tier.
     #
-    # Polling wins the clamp: §10 ranks polling first, and enrichment reaching zero is
-    # an already-modelled, documented outcome (skipped_budget), whereas polling
-    # stopping is a Story 1 failure. Runtime degrades; only boot refuses.
+    # Polling wins the clamp: §10 ranks polling first, and enrichment reaching zero
+    # defers the durable backlog until a later window, whereas polling stopping is a
+    # Story 1 failure. Runtime degrades; only boot refuses.
     #
     # **The floor of one is what makes "degrades" true rather than "stops".** An observed
     # limit at or below the reserve leaves nothing spendable, and the plain minimum gave
@@ -105,7 +105,8 @@ module Github
       spendable = [ limit - reserve, 0 ].max
       poll = [ [ poll_allowance, spendable ].min, 1 ].max
 
-      with(poll_allowance: poll, enrichment_allowance: [ spendable - poll, 0 ].max)
+      with(poll_allowance: poll,
+           enrichment_allowance: [ enrichment_allowance, spendable - poll ].min.clamp(0, enrichment_allowance))
     end
 
     # The guarantees rather than the share: they are the numbers that actually bind, and

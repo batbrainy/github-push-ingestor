@@ -2,7 +2,7 @@
 
 Date: 2026-07-31
 
-Status: Accepted
+Status: Accepted; durable-backlog refresh priority amended 2026-08-02; staged-batch enrichment amended 2026-08-02
 
 ## Context
 
@@ -79,19 +79,24 @@ request on a service that has never been throttled — is one statement that mat
 and takes no lock. Zero affected rows is the expected outcome, so it deliberately does not
 go through the `LedgerInvariantViolation` check `#debit!` applies to the same condition.
 
-### The refresh pool allocates the same way the pending pool does
+### The refresh pool runs only after the durable backlog is observed empty
 
-`#refresh_choice` now mirrors `#pending_choice`: build an eligibility map, prefer a class
-with `room_within_guarantee?`, and only then borrow — and only from a class that has nothing
-to do. A borrowed refresh reports `borrowed_refresh`, mirroring `borrowed_pending`.
+Before considering any refresh, fairness checks both entity tables for every
+candidate-status row (`pending` or `retryable_failure`) without applying the due-time
+predicate. A backed-off row and a row carrying an active lease are still durable
+never-enriched work, so either blocks the entire refresh pool at that selection decision.
+This gives backlog priority within the 40-request enrichment allowance.
 
-The eligibility map is rebuilt over the refresh pool rather than reusing the pending one.
-`CandidateSelector#pending_available?` stays pending-only, and its documented reason stands:
-counting refreshes in the *pending* borrow test would let a refresh outrank a never-enriched
-candidate and invert §10's prioritization ladder. That hazard cannot arise inside
-`#refresh_choice`, which is only reached when no class has a pending candidate at all — so
-there is nothing left for a refresh to outrank. Keeping two maps preserves the invariant
-verbatim instead of weakening it.
+Only after that durable backlog is empty does `#refresh_choice` mirror the per-class
+allocation arithmetic: build a claimability map over stale refresh rows, prefer a class
+with `room_within_guarantee?`, and only then borrow from a class that has nothing to
+refresh. A borrowed refresh reports `borrowed_refresh`, mirroring `borrowed_pending`.
+
+The emptiness read and request debit are deliberately not serialized against ingestion.
+A poll can commit a new candidate between them, allowing the one refresh already selected
+to proceed. Since one runner invocation issues at most one entity request, the exposure is
+bounded to one request; the next decision observes the row and closes the refresh pool. The
+ledger cap remains authoritative and the durable row is never discarded.
 
 ## Consequences
 
@@ -102,6 +107,9 @@ verbatim instead of weakening it.
   successful live request that matches no row in the normal case.
 - The refresh pool can no longer starve a class. Total enrichment spend is unchanged — the
   ledger's cap was always the bound, and this is a fairness fix rather than an overspend fix.
+- A refresh TTL is an earliest eligible time rather than a completion deadline. Sustained
+  never-enriched backlog can postpone refresh indefinitely, which is preferable to spending
+  reserved backlog capacity on already-enriched rows.
 - `Choice::REASONS` gains `borrowed_refresh`. The only consumer of `Choice#reason` is
   `Github::EnrichmentRunner`'s deferral log, which reads it on the not-chosen path only.
 
@@ -124,4 +132,20 @@ non-positive delta, which `#fallback_instant` already treats exactly as an absen
 "within each class's share". Rejected: a class whose guarantee rounds to zero
 (`ACTOR_ENRICHMENT_SHARE` at `0.0` or `1.0`) could then never refresh at all, and it would
 leave capacity idle whenever the other class has no stale rows — while §10:812's borrowing
-rule is stated generally rather than scoped to the pending pool.
+rule is stated generally rather than scoped to the pending pool. Borrowing remains valid
+after the durable never-enriched backlog is empty.
+
+## Amendment (2026-08-02): refresh-pool fairness superseded by staged refresh composition
+
+Plan Appendix G ([ADR 0013](0013-derivation-first-staged-batch-enrichment.md)) deletes the
+per-entity refresh pool this ADR's second half repaired: there is no separate refresh
+request shape any more, so `#refresh_choice` and its `borrowed_refresh` reason are gone
+with `Enrichment::Fairness`. Refresh now rides the same Search batch path under the
+composition rule — a batch fills from its own class's never-enriched backlog first, tops
+up spare slots with TTL-stale, recently active (`REFRESH_ACTIVE_WITHIN_SECONDS`) complete
+rows only when neither class has claimable backlog, and refresh-only batches run only
+when neither class has backlog at all. The property this ADR fought for survives in
+stronger form: backlog outranks freshness in every lane, and refresh capacity cannot
+starve a class because lanes rotate by weight over whole batches. The secondary-limit
+escalation in the first half is untouched, and the search ledger gains its own
+`blocked_until` handling for search-resource limits.

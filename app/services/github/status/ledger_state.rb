@@ -83,7 +83,11 @@ module Github
           reserve: reserve,
           global_blocked_until: Ingestion::Report.timestamp(global_blocked_until),
           poll: { used: poll_used, allowance: poll_allowance },
-          enrichment: { used: enrichment_used, allowance: enrichment_allowance },
+          # Named for what the number now is (Appendix G): the explicit core
+          # detail-fallback allowance, not "everything after poll + reserve". The
+          # Search budget is a different rate-limit resource and lives in the
+          # search_ledger block.
+          detail_fallback: { used: enrichment_used, allowance: enrichment_allowance },
           actor_requests: { used: actor_share_used, guarantee: actor_guarantee,
                             available: actor_available },
           repository_requests: { used: repository_share_used,

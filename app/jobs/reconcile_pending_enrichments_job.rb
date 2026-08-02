@@ -16,6 +16,12 @@
 # derived class block is in force — so an exhausted window costs one indexed EXISTS per class
 # per minute rather than a queue full of cycles the ledger would refuse.
 class ReconcilePendingEnrichmentsJob < ApplicationJob
+  # The reconciler is control-plane work: two indexed existence checks and at most one
+  # wake-up per entity class. Its named, bounded queue shares the poll worker but remains
+  # isolated from the durable enrichment backlog, so recovery hints cannot sit behind an
+  # entity-sized workload.
+  queue_as :control
+
   def perform
     @outcome = Github::Enrichment::Dispatch.call(reason: "reconcile")
   end

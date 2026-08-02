@@ -8,7 +8,10 @@ plan wins.
 
 1. Read `IMPLEMENTATION_PLAN.md` (repository root). It is the frozen execution
    plan; its pre-implementation revision history lives in Git and in its
-   Appendices A–D, and Appendix E records how the build diverged from it.
+   Appendices A–D, Appendix E records how the build diverged from it, Appendix F
+   supersedes the enrichment load-shedding policy with a durable backlog, and
+   Appendix G supersedes Appendix F's per-entity service model with derivation-first
+   staged batch enrichment.
 2. Read `docs/DESIGN_BRIEF.md` and the ADRs under `docs/adr/`.
 3. Do not change architectural direction, add infrastructure, or add dependencies
    without first updating the plan and stating the tradeoff.
@@ -55,7 +58,7 @@ acquire `SourceLock` — they take only the request gate.
 
 Repeated observation and job execution are expected. State only the two proved ingestion
 invariants: a duplicate GitHub event ID cannot create another `push_events` row, and that
-duplicate cannot register entity activity or reactivate a `skipped_budget` entity.
+duplicate cannot register entity activity.
 Executions, ingestion runs, quarantine occurrence counts, budget debits, and logs may
 repeat or change. Recovery before commit is conditional on the event remaining in a later
 sliding-feed response. Never claim or code against exactly-once execution or universal
@@ -64,9 +67,9 @@ idempotency of persisted state.
 ### Duplicate-event invariants (plan §7)
 
 - `push_events` inserts use `ON CONFLICT (github_event_id) DO NOTHING RETURNING id`.
-- Entity activity fields (`last_seen_at`, `latest_event_at`, reactivation) update
-  only when `RETURNING` produced a row. Duplicate replays may refresh identity
-  fields but must never reactivate a `skipped_budget` entity.
+- Entity activity fields (`last_seen_at`, `latest_event_at`) update only when
+  `RETURNING` produced a row. Duplicate replays may refresh identity fields but must
+  never register new entity activity.
 - Quarantine identity is `payload_fingerprint` alone: SHA-256 of compact UTF-8
   JSON with recursively sorted object keys. One algorithm, no alternates.
 
@@ -75,6 +78,22 @@ idempotency of persisted state.
 Enrichment fetches only validated URLs: HTTPS, host exactly `api.github.com`, no
 userinfo, no non-default port, no IP literals, bounded re-validated redirects.
 Fixture mode fails closed — never a live fallback.
+
+### Durable staged enrichment backlog (plan §10, Appendices F–G)
+
+Entity rows are durable work, coalesced by stable GitHub ID, selected FIFO by
+`created_at ASC, id ASC`. The normal path is GitHub Search batches of up to
+`SEARCH_BATCH_SIZE` repeated exact `user:`/`repo:` qualifiers — never joined with `OR` —
+on the minute-scoped search ledger (ceiling 10, reserve 2, 6-second pacing). The
+payload-URL detail fallback serves only missing/renamed/mismatched/contract-invalid batch
+items and is bounded by `CORE_DETAIL_FALLBACK_ALLOWANCE` (40/hour); it never takes the
+polling allocation. Quota, pacing, reserve, and fairness denials defer work — they never
+terminate an entity. Batch results apply only on a stable-ID match. Observations are
+append-only; a refresh repoints the projection and never overwrites retained evidence.
+Refresh composition: a batch fills from its own class's never-enriched backlog first,
+tops up spare slots with TTL-stale refresh candidates only when its own backlog is
+exhausted and the other class has none claimable, and refresh-only batches run only when
+neither class has backlog.
 
 ## Database changes
 

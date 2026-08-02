@@ -15,6 +15,10 @@ RSpec.describe PollEventSourceJob do
 
   before { allow(Github::IngestionRunner).to receive(:new).and_return(runner) }
 
+  it "runs on the polling queue, isolated from backlog work" do
+    expect(described_class.new.queue_name).to eq("polling")
+  end
+
   def poll!(job = described_class.new)
     job.perform_now
     job
@@ -191,9 +195,10 @@ RSpec.describe PollEventSourceJob do
       expect(PushEvent.count).to eq(4)
     end
 
+    # One cycle job, however much the page created: Github::Enrichment::CycleRunner
+    # loops until a ledger denies, so the enqueue is a hint rather than a unit of work.
     it "hands the run's enrichment work to the queue" do
-      expect { poll! }.to have_enqueued_job(EnrichActorJob).exactly(:once)
-        .and have_enqueued_job(EnrichRepositoryJob).exactly(:once)
+      expect { poll! }.to have_enqueued_job(EnrichmentCycleJob).exactly(:once)
     end
   end
 end

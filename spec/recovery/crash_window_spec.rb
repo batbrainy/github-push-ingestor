@@ -133,31 +133,35 @@ RSpec.describe "crash windows", type: :integration do
       expect(GithubRepository.count).to eq(3)
     end
 
-    # ADR 0005's fourth mechanism, holding across a crash boundary rather than across a plain
-    # replay: the duplicated envelopes produce no RETURNING row, so the reactivation they
-    # would otherwise trigger never runs.
-    it "reactivates nothing the prefix already recorded" do
+    it "preserves retry state for entities in the duplicated prefix" do
       write_prefix
       GithubActor.where(github_id: IngestionHelpers::ACTOR_GITHUB_ID)
-                 .update_all(enrichment_status: "skipped_budget", skipped_at: frozen_time)
+                 .update_all(enrichment_status: "retryable_failure",
+                             next_retry_at: frozen_time + 3600,
+                             last_error: "GitHub unavailable")
 
       replay_whole_page
 
       expect(GithubActor.find_by(github_id: IngestionHelpers::ACTOR_GITHUB_ID))
-        .to have_attributes(enrichment_status: "skipped_budget", skipped_at: frozen_time)
+        .to have_attributes(enrichment_status: "retryable_failure",
+                            next_retry_at: frozen_time + 3600,
+                            last_error: "GitHub unavailable")
     end
 
-    # The other half of the same rule, so the first is not passing merely because nothing
-    # reactivates anything: a genuinely new event for the same entity does.
-    it "still reactivates that entity for an event the crash had not yet seen" do
+    it "registers activity for an event the crash had not yet seen without clearing retry state" do
       write_prefix
       GithubActor.where(github_id: IngestionHelpers::ACTOR_GITHUB_ID)
-                 .update_all(enrichment_status: "skipped_budget", skipped_at: frozen_time)
+                 .update_all(enrichment_status: "retryable_failure",
+                             next_retry_at: frozen_time + 3600,
+                             last_error: "GitHub unavailable")
 
-      writer.write([ well_formed_envelope("id" => "58000009999") ], run_id: SecureRandom.uuid)
+      writer.write([ well_formed_envelope("id" => "58000009999") ],
+                   run_id: SecureRandom.uuid)
 
       expect(GithubActor.find_by(github_id: IngestionHelpers::ACTOR_GITHUB_ID))
-        .to have_attributes(enrichment_status: "pending", skipped_at: nil)
+        .to have_attributes(enrichment_status: "retryable_failure",
+                            next_retry_at: frozen_time + 3600,
+                            last_error: "GitHub unavailable")
     end
 
     # PageWriter#quarantine is deliberately one statement outside every transaction. A crash
@@ -237,43 +241,45 @@ RSpec.describe "crash windows", type: :integration do
   # This is as close as RSpec gets to §15 step 8. The transcript in docs/evidence/ is the rest.
   describe "the whole container-kill cycle, without the container" do
     let(:source_namespace) { Github::AdvisoryLock::SOURCE_LOCK_NAMESPACE }
-    let(:claim) { Github::Enrichment::Claim.new(configuration: Github.configuration) }
+    let(:recovery_configuration) do
+      configuration_with("GITHUB_MODE" => "fixture", "SEARCH_PACING_SECONDS" => "0")
+    end
+    let(:claim) { Github::Enrichment::BatchClaim.new(configuration: recovery_configuration) }
     let(:actor_type) { Github::Enrichment::EntityType.fetch(:actor) }
     let!(:event_source) { fixture_event_source }
 
-    # Ingested at Time.current rather than at frozen_time, for the reason
-    # pending_enrichment_recovery_spec.rb states: Solid Queue constructs
-    # ReconcilePendingEnrichmentsJob, so there is no clock to inject into it and its sweep
-    # measures §10's eligibility window against the wall clock. Entities stamped in 2026-07-29
-    # would be outside that window today, and the reconciler would correctly find nothing —
-    # which would make this example pass for a reason that has nothing to do with recovery.
+    # Ingested at Time.current because Solid Queue constructs the reconciliation job and its
+    # operational timestamps should match the worker clock used in this recovery scenario.
     let(:crashed_at) { Time.current }
 
     before { active_budget_window(now: crashed_at) }
 
-    # Everything a worker container was holding at the instant it was killed.
+    # Everything a worker container was holding at the instant it was killed. The batch
+    # claim leases every actor in the FIFO and opens an in_flight enrichment_batches
+    # row — the exact durable residue a kill mid-batch leaves.
     def crash!
       fixture_runner(transport: transport, now: crashed_at).call(event_source: event_source)
 
-      claim.acquire(actor_type, pool: :pending, now: crashed_at)    # a lease with no worker
-      clear_enqueued_jobs                                           # the lost enqueue
-      acquire_in_other_session(source_namespace,                    # the dead poller's lock
+      @abandoned_lease = claim.acquire(actor_type, now: crashed_at)  # a lease with no worker
+      clear_enqueued_jobs                                            # the lost enqueue
+      acquire_in_other_session(source_namespace,                     # the dead poller's lock
                                Github::AdvisoryLock.key_for(event_source.id))
-      terminate_second_session!                                     # the kill
+      terminate_second_session!                                      # the kill
       wait_for_advisory_lock_release(source_namespace, Github::AdvisoryLock.key_for(event_source.id))
     end
 
     # The restart, running only the two recurring tasks a real worker runs, at a clock past
-    # the abandoned lease's expiry — so the entity the dead worker was holding is reachable
-    # again by arithmetic alone, with no cleanup step.
+    # the abandoned lease's expiry — so the entities the dead worker was holding are
+    # reachable again by arithmetic alone, with no cleanup step.
     def restart!
-      allow(Github).to receive(:configuration).and_return(configuration_with("GITHUB_MODE" => "fixture"))
-      allow(Github::EnrichmentRunner).to receive(:new).and_call_original
-      allow(Github::EnrichmentRunner).to receive(:new)
-        .and_return(fixture_enrichment_runner(transport: transport,
-                                              now: crashed_at + claim.lease_seconds + 1))
+      revived_at = crashed_at + recovery_configuration.enrichment_lease_seconds + 1
 
-      6.times do
+      allow(Github).to receive(:configuration).and_return(recovery_configuration)
+      allow(Github::Enrichment::CycleRunner).to receive(:new)
+        .and_return(fixture_cycle_runner(transport: transport, now: revived_at,
+                                         configuration: recovery_configuration))
+
+      3.times do
         ReconcilePendingEnrichmentsJob.perform_now
         perform_enqueued_jobs
       end
@@ -285,9 +291,16 @@ RSpec.describe "crash windows", type: :integration do
 
       expect(PushEvent.count).to eq(4)
       expect(GithubActor.find_by(github_id: IngestionHelpers::ACTOR_GITHUB_ID))
-        .to have_attributes(enrichment_status: "complete", name: "The Octocat")
+        .to have_attributes(enrichment_status: "complete", enrichment_stage: "contract_complete")
       expect(GithubRepository.find_by(github_id: IngestionHelpers::REPOSITORY_GITHUB_ID).enrichment_status)
         .to eq("complete")
+    end
+
+    it "finalizes the dead worker's batch as stale_lease evidence, never deleting it" do
+      crash!
+      restart!
+
+      expect(@abandoned_lease.batch.reload.status).to eq("stale_lease")
     end
 
     it "needs no operator step, no cleanup job and no sweeper to get there" do

@@ -22,6 +22,11 @@
 # tick writes nothing at all, and the lock frees a killed session in milliseconds where a
 # semaphore's fixed duration cannot. See spec/recovery/multi_poller_spec.rb and ADR 0008.
 class PollEventSourceJob < ApplicationJob
+  # Polling is isolated from the long-lived enrichment backlog. It shares a worker only
+  # with the bounded control queue, whose recurring tick cannot create an entity-sized
+  # workload.
+  queue_as :polling
+
   # Facts about the process rather than about one source: continuing to the next source
   # would only repeat them, and a tick that "completed" after boot-level breakage would be a
   # lie. The same line Github::Ingestion::PageWriter::FATAL_ERRORS and

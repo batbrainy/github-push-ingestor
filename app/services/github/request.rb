@@ -13,8 +13,10 @@ module Github
                               :context, :borrow)
     # §7: every outbound attempt debits its class counter. :poll comes from an event
     # source, :actor and :repository from enrichment (PR 7).
-    CLASSES = %i[ poll actor repository ].freeze
-    ENRICHMENT_CLASSES = %i[ actor repository ].freeze
+    CLASSES = %i[ poll actor repository actor_search repository_search ].freeze
+    ENRICHMENT_CLASSES = %i[ actor repository actor_search repository_search ].freeze
+    DETAIL_CLASSES = %i[ actor repository ].freeze
+    SEARCH_CLASSES = %i[ actor_search repository_search ].freeze
 
     # Where the URL came from, which decides how strictly Github::UrlPolicy validates it.
     #
@@ -52,9 +54,9 @@ module Github
       # Validated here as well as in Github::BudgetLedger#reserve!, for the reason
       # Github::RequestExecutor validates a URL twice: the earlier of the two guards
       # fails before the gate is ever taken.
-      if borrow && !ENRICHMENT_CLASSES.include?(request_class)
+      if borrow && !DETAIL_CLASSES.include?(request_class)
         raise ArgumentError,
-              "borrow applies to #{ENRICHMENT_CLASSES.inspect}, got #{request_class.inspect}"
+              "borrow applies to #{DETAIL_CLASSES.inspect}, got #{request_class.inspect}"
       end
 
       super(
@@ -82,6 +84,10 @@ module Github
 
     def enrichment?
       ENRICHMENT_CLASSES.include?(request_class)
+    end
+
+    def search?
+      SEARCH_CLASSES.include?(request_class)
     end
 
     def payload_supplied?

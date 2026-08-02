@@ -137,8 +137,8 @@ module Github
       # is reported without anyone remembering to extend this.
       #
       # This class logs rather than Github::IngestionRunner doing it on its behalf, for
-      # three reasons. Github::Enrichment::EntityState is this class's entity-side mirror and
-      # already logs three of its own anomalies, so a state writer announcing its own
+      # three reasons. The enrichment runners are this class's entity-side mirror and
+      # already log their own anomalies, so a state writer announcing its own
       # transitions is the established shape here. The runner would have to re-derive the
       # predicate, and two readers of one rule is drift waiting to happen. And only this
       # class knows the delay — backoff_seconds is retry_not_before_at minus its own `now`.

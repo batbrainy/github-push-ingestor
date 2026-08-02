@@ -99,27 +99,72 @@ module IngestionHelpers
     Github::Ingestion::SourceProvisioner.ensure!(mode: :fixture, now: frozen_time)
   end
 
-  # The enrichment counterpart of #fixture_runner: the real ledger, gate and URL policy
-  # over the offline transport, with only the clocks and the sleeper replaced. The same
-  # ledger_for caveat applies — a custom configuration has to reach the ledger, or the
-  # runner and the ledger would disagree in specs while agreeing in production.
-  def fixture_enrichment_runner(transport: fixture_transport, now: frozen_time,
-                                configuration: nil, executor: nil, **overrides)
-    configuration ||= Github.configuration
-    selector = Github::Enrichment::CandidateSelector.new(configuration: configuration)
+  # No jitter, so a scheduled retry is an instant a spec can name rather than a range.
+  def jitterless_backoff(configuration: Github.configuration)
+    Github::Enrichment::Backoff.new(
+      random: Struct.new(:value) { def rand(*) = 0.0 }.new,
+      configuration: configuration
+    )
+  end
 
-    Github::EnrichmentRunner.new(
-      executor: executor || fixture_executor(transport: transport, ledger: ledger_for(configuration)),
+  # The enrichment counterparts of #fixture_runner: the real ledgers, gate and URL
+  # policy over the offline transport, with only the clocks and the sleeper replaced.
+  # The same ledger_for caveat applies — a custom configuration has to reach both
+  # ledgers, or the runners and the ledgers would disagree in specs while agreeing in
+  # production.
+  def fixture_batch_runner(transport: fixture_transport, now: frozen_time,
+                           configuration: nil, executor: nil, **overrides)
+    configuration ||= Github.configuration
+
+    Github::Enrichment::BatchRunner.new(
+      executor: executor || fixture_executor(transport: transport, ledger: ledger_for(configuration),
+                                             search_ledger: search_ledger_for(configuration)),
       configuration: configuration,
+      claim: Github::Enrichment::BatchClaim.new(configuration: configuration),
+      search_ledger: search_ledger_for(configuration),
+      backoff: jitterless_backoff(configuration: configuration),
       clock: -> { now },
-      monotonic: -> { 0.0 },
-      selector: selector,
-      # No jitter, so a scheduled retry is an instant a spec can name rather than a range.
-      entity_state: Github::Enrichment::EntityState.new(
-        backoff: Github::Enrichment::Backoff.new(random: Struct.new(:value) { def rand(*) = 0.0 }.new)
-      ),
       **overrides
     )
+  end
+
+  def fixture_detail_runner(transport: fixture_transport, now: frozen_time,
+                            configuration: nil, executor: nil, **overrides)
+    configuration ||= Github.configuration
+
+    Github::Enrichment::DetailRunner.new(
+      executor: executor || fixture_executor(transport: transport, ledger: ledger_for(configuration),
+                                             search_ledger: search_ledger_for(configuration)),
+      configuration: configuration,
+      claim: Github::Enrichment::DetailClaim.new(configuration: configuration),
+      backoff: jitterless_backoff(configuration: configuration),
+      clock: -> { now },
+      **overrides
+    )
+  end
+
+  # A full staged cycle over the offline transport: batches until the search ledger
+  # denies, then detail fallbacks until the core allowance denies. The sleeper is a
+  # no-op, so pacing waits cost no wall clock.
+  def fixture_cycle_runner(transport: fixture_transport, now: frozen_time,
+                           configuration: nil, **overrides)
+    configuration ||= Github.configuration
+
+    Github::Enrichment::CycleRunner.new(
+      configuration: configuration,
+      batch_runner: fixture_batch_runner(transport: transport, now: now, configuration: configuration),
+      detail_runner: fixture_detail_runner(transport: transport, now: now, configuration: configuration),
+      admission: Github::Enrichment::Admission.new(configuration: configuration),
+      batch_claim: Github::Enrichment::BatchClaim.new(configuration: configuration),
+      detail_claim: Github::Enrichment::DetailClaim.new(configuration: configuration),
+      clock: -> { now },
+      sleeper: ->(_seconds) { },
+      **overrides
+    )
+  end
+
+  def search_ledger_for(configuration)
+    Github::SearchBudgetLedger.new(configuration: configuration)
   end
 end
 

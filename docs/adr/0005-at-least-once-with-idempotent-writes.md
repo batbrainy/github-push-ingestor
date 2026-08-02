@@ -2,7 +2,7 @@
 
 Date: 2026-07-30
 
-Status: Accepted; guarantee wording clarified 2026-07-31
+Status: Accepted; guarantee wording clarified 2026-07-31 and 2026-08-02
 
 ## Context
 
@@ -26,8 +26,7 @@ Accept repeated execution and enforce two narrow ingestion invariants at the dat
 boundary:
 
 1. A duplicate observation of a GitHub event cannot create a second `push_events` row.
-2. A duplicate observation cannot register new entity activity or reactivate an entity in
-   `skipped_budget`.
+2. A duplicate observation cannot register new entity activity.
 
 Those invariants are implemented by
 `ON CONFLICT (github_event_id) DO NOTHING RETURNING id` and by applying entity activity
@@ -53,7 +52,7 @@ payload.
 What this buys:
 
 - Re-polling or manually re-running ingestion cannot duplicate an accepted event row or
-  falsely reactivate a skipped entity from the same event ID.
+  falsely register new entity activity from the same event ID.
 - Committed events survive process and container restarts without a separate dedup table
   or distributed transaction.
 - Committed entity state is sufficient for the reconciler to rediscover pending enrichment
@@ -73,7 +72,7 @@ What it does not buy:
   precedence-ordered function of the payload.
 
 The suite tests the stated boundaries: fixture replay leaves four `push_events` rows,
-increments the three quarantine occurrence counters, does not register duplicate entity
-activity, and leaves a planted `skipped_budget` entity skipped. A separate recovery test
+increments the three quarantine occurrence counters, and does not register duplicate entity
+activity. A separate recovery test
 shows a delivered enrichment job may execute again without creating another entity row;
 that scenario does not widen the ingestion guarantees above.

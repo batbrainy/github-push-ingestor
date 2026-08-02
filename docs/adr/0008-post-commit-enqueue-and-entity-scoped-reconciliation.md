@@ -2,7 +2,7 @@
 
 Date: 2026-07-31
 
-Status: Accepted
+Status: Accepted; durable-backlog ordering amended 2026-08-02; staged-batch enrichment amended 2026-08-02
 
 ## Context
 
@@ -21,7 +21,8 @@ event rows per entity."
 
 A second fact shapes the design as much as the first: **enrichment jobs carry no entity
 id.** `Github::EnrichmentRunner` enriches one entity per call and chooses it itself,
-through §10's fairness policy and a `FOR UPDATE SKIP LOCKED` lease, newest-first. That is
+through §10's fairness policy and a `FOR UPDATE SKIP LOCKED` lease, FIFO by
+`created_at ASC, id ASC`. That is
 not an accident to route around — an id-addressed job would have to bypass that ordering to
 honour its argument, which is precisely how a repository flood starves actors (ADR 0007).
 So an enqueue cannot mean "enrich this actor". It can only mean "there may be actor work".
@@ -59,10 +60,11 @@ Positive:
 - The crash window has no special case. The system's recovery path and its steady-state
   path are the same code, which means the recovery path is exercised on every tick rather
   than only during an incident.
-- Queue depth is bounded by the hourly allowance rather than by arrival rate. One live page
+- Operational job-queue depth is bounded by dispatch rather than by entity arrival rate;
+  the durable business backlog is intentionally not bounded. One live page
   references ~181 distinct entities; enqueuing per created event would produce ~2,400
   argument-identical cycles an hour against 40 spendable requests, and each surplus cycle
-  would run the age-out sweep and the fairness reads to be told no.
+  would run selection and fairness reads only to be told no.
 - The queue is never read to answer a question about business state, which keeps
   CLAUDE.md's source-of-truth rule intact: PostgreSQL business tables are the durable
   record, not the queue.
@@ -135,11 +137,25 @@ iterates them. The global request gate makes outbound concurrency exactly one
 application-wide, so the fanned-out jobs would serialize on the same advisory lock while
 each held a database connection. Deferred to PR 9, which owns multi-source allocation.
 
+## Amendment (2026-08-02): dispatch enqueues staged cycles; observations commit with the event
+
+Plan Appendix G ([ADR 0013](0013-derivation-first-staged-batch-enrichment.md)) replaces
+the per-class `EnrichActorJob`/`EnrichRepositoryJob` with a single argument-less
+`EnrichmentCycleJob`: `Github::Enrichment::Dispatch` enqueues at most one cycle when the
+dual-ledger admission and claimability checks say work could proceed, and a cycle runs
+batch lanes then detail lanes inside its time budget. The decisions here carry over
+unweakened — the enqueue is still a hint, the entity rows (now stage-carrying) are still
+the durable record, and `ReconcilePendingEnrichmentsJob` still sweeps them every 60
+seconds. One addition strengthens the durability boundary: event-source
+`enrichment_observations` rows are written **inside** the ingest transaction, so the raw
+evidence an entity's derivation rests on commits atomically with the push event itself.
+
 ## Related
 
 - ADR 0002 — advisory locks and the request gate (the crash-safety property this decision
   leans on)
 - ADR 0004 — the class-aware budget ledger (what bounds enrichment throughput)
 - ADR 0005 — repeated execution with duplicate-safe event writes (the narrow event-row and
-  skipped-reactivation guarantees under redelivery)
+  entity-activity guarantees under redelivery)
 - ADR 0007 — enrichment fairness shares and borrowing (why a job cannot carry an entity id)
+- ADR 0013 — derivation-first staged batch enrichment (the staged cycle this dispatch feeds)

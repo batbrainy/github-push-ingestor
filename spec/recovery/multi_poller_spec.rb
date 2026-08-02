@@ -131,17 +131,22 @@ RSpec.describe "multiple pollers", type: :integration do
   # to put back.
   describe "the global request gate, across both request paths" do
     let(:transport) { fixture_transport }
+    let(:configuration) { configuration_with("GITHUB_MODE" => "fixture") }
     let!(:actor) do
       create_actor(github_id: IngestionHelpers::ACTOR_GITHUB_ID, last_seen_at: frozen_time,
-                   enrichment_status: "pending")
+                   enrichment_status: "pending",
+                   created_at: frozen_time, updated_at: frozen_time)
     end
 
     # 0.1s, never 0: PostgreSQL reads lock_timeout = 0 as "no timeout", so a zero wait would
     # block forever rather than defer.
-    def enrichment_cycle
-      fixture_enrichment_runner(
-        executor: fixture_executor(transport: transport, request_gate_wait: 0.1)
-      ).call
+    def batch_attempt
+      fixture_batch_runner(
+        configuration: configuration,
+        executor: fixture_executor(transport: transport, request_gate_wait: 0.1,
+                                   ledger: ledger_for(configuration),
+                                   search_ledger: search_ledger_for(configuration))
+      ).call(entity_class: GithubActor)
     end
 
     def poll_cycle
@@ -149,46 +154,49 @@ RSpec.describe "multiple pollers", type: :integration do
         .call(event_source: fixture_event_source)
     end
 
-    it "defers an enrichment cycle rather than failing it" do
-      result = other_session_holding(gate_namespace, gate_key) { enrichment_cycle }
+    it "defers a Search batch rather than failing it" do
+      result = other_session_holding(gate_namespace, gate_key) { batch_attempt }
 
-      expect(result).to be_deferred
+      expect(result.status).to eq("deferred")
       expect(result.deferral_reason).to eq("gate_unavailable")
     end
 
     it "spends nothing and issues no request while the gate is held" do
-      other_session_holding(gate_namespace, gate_key) { enrichment_cycle }
+      other_session_holding(gate_namespace, gate_key) { batch_attempt }
 
       expect(current_budget.enrichment_used).to eq(0)
-      expect(current_budget.actor_share_used).to eq(0)
+      expect(GithubSearchBudget.find_by(id: GithubSearchBudget::SINGLETON_ID)&.used.to_i).to eq(0)
       expect(transport.requests).to be_empty
     end
 
-    # The assertion this file exists for. A deferred cycle still *claimed* the row — it
-    # wrote next_retry_at as a lease before discovering the gate was busy — so proving the
-    # entity is untouched proves Github::Enrichment::Claim#release! restored the exact prior
-    # instant rather than clearing it or leaving the lease stranded for its full 594s.
+    # The assertion this file exists for. A deferred batch still *claimed* the row — it
+    # wrote the lease columns and opened a batch row before discovering the gate was
+    # busy — so proving the entity is untouched proves BatchClaim#release! restored the
+    # row exactly rather than leaving the lease stranded for its full 600s. The batch
+    # row itself survives as `deferred` evidence, which is about the window, never the
+    # entity.
     it "gives the lease back exactly, leaving the entity byte-identical" do
       before = actor.reload.attributes
 
-      other_session_holding(gate_namespace, gate_key) { enrichment_cycle }
+      other_session_holding(gate_namespace, gate_key) { batch_attempt }
 
       expect(actor.reload.attributes).to eq(before)
+      expect(EnrichmentBatch.sole.status).to eq("deferred")
     end
 
     # One gate, application-wide — asserted as a single fact rather than as two separate
     # claims about two subsystems.
     it "stops the poller and the enrichment worker alike" do
       poll_result = nil
-      enrichment_result = nil
+      batch_result = nil
 
       other_session_holding(gate_namespace, gate_key) do
         poll_result = poll_cycle
-        enrichment_result = enrichment_cycle
+        batch_result = batch_attempt
       end
 
       expect(poll_result).to be_deferred
-      expect(enrichment_result).to be_deferred
+      expect(batch_result.status).to eq("deferred")
       expect(current_budget.poll_used).to eq(0)
       expect(current_budget.enrichment_used).to eq(0)
       expect(transport.requests).to be_empty
@@ -197,7 +205,7 @@ RSpec.describe "multiple pollers", type: :integration do
     it "leaves the gate free and the lock order clean after both deferrals" do
       other_session_holding(gate_namespace, gate_key) do
         poll_cycle
-        enrichment_cycle
+        batch_attempt
       end
 
       expect(advisory_lock_holders(gate_namespace, gate_key)).to be_empty

@@ -41,11 +41,9 @@ x-app-env: &app_env
   RATE_LIMIT_RESERVE: ${RATE_LIMIT_RESERVE:-8}
   # §10's enrichment policy, in the shared anchor for a sharper version of the same
   # reason. ACTOR_ENRICHMENT_SHARE decides how the ledger splits the enrichment allowance
-  # under its row lock, and the three timings decide which candidates are *currently
-  # eligible* — which is the input to the borrow decision the ledger then acts on. Two
+  # under its row lock, and the refresh TTLs decide when completed rows become stale. Two
   # processes reading different values would enforce different policies against one row.
   ACTOR_ENRICHMENT_SHARE: ${ACTOR_ENRICHMENT_SHARE:-0.50}
-  ENRICHMENT_ELIGIBILITY_WINDOW_SECONDS: ${ENRICHMENT_ELIGIBILITY_WINDOW_SECONDS:-3600}
   ACTOR_REFRESH_TTL_SECONDS: ${ACTOR_REFRESH_TTL_SECONDS:-86400}
   REPOSITORY_REFRESH_TTL_SECONDS: ${REPOSITORY_REFRESH_TTL_SECONDS:-86400}
   # §11's coverage window, forwarded for the same reason the four allowance inputs are —
@@ -55,6 +53,27 @@ x-app-env: &app_env
   # member here it changes only what /status *reports*, never what any process *does*, so
   # a disagreement between two processes would be cosmetic rather than a policy split.
   ENRICHMENT_COVERAGE_WINDOW_SECONDS: ${ENRICHMENT_COVERAGE_WINDOW_SECONDS:-86400}
+  # Appendix G's staged-enrichment scheduler, forwarded for the reason the allowance
+  # inputs are: without these lines the variables .env.example documents and /status
+  # publishes would set nothing inside any container. They belong in the shared anchor
+  # because both ledgers are single rows serving every process — a worker pacing at six
+  # seconds beside a one-shot pacing at zero would be two policies against one row.
+  CORE_DETAIL_FALLBACK_ALLOWANCE: ${CORE_DETAIL_FALLBACK_ALLOWANCE:-40}
+  SEARCH_REQUEST_CEILING: ${SEARCH_REQUEST_CEILING:-10}
+  SEARCH_SAFETY_RESERVE: ${SEARCH_SAFETY_RESERVE:-2}
+  SEARCH_BATCH_SIZE: ${SEARCH_BATCH_SIZE:-10}
+  SEARCH_PACING_SECONDS: ${SEARCH_PACING_SECONDS:-6}
+  SEARCH_WORKER_CONCURRENCY: ${SEARCH_WORKER_CONCURRENCY:-1}
+  ACTOR_ENRICHMENT_WEIGHT: ${ACTOR_ENRICHMENT_WEIGHT:-1}
+  REPOSITORY_ENRICHMENT_WEIGHT: ${REPOSITORY_ENRICHMENT_WEIGHT:-1}
+  DETAIL_FALLBACK_MAX_ATTEMPTS: ${DETAIL_FALLBACK_MAX_ATTEMPTS:-3}
+  ENRICHMENT_LEASE_SECONDS: ${ENRICHMENT_LEASE_SECONDS:-600}
+  ENRICHMENT_CYCLE_BUDGET_SECONDS: ${ENRICHMENT_CYCLE_BUDGET_SECONDS:-55}
+  ENRICHMENT_RETRY_BASE_SECONDS: ${ENRICHMENT_RETRY_BASE_SECONDS:-60}
+  ENRICHMENT_RETRY_MAX_SECONDS: ${ENRICHMENT_RETRY_MAX_SECONDS:-3600}
+  ENRICHMENT_METRICS_WINDOW_SECONDS: ${ENRICHMENT_METRICS_WINDOW_SECONDS:-3600}
+  CATCH_UP_MIN_SAMPLE_SECONDS: ${CATCH_UP_MIN_SAMPLE_SECONDS:-900}
+  REFRESH_ACTIVE_WITHIN_SECONDS: ${REFRESH_ACTIVE_WITHIN_SECONDS:-604800}
 
 services:
   db:

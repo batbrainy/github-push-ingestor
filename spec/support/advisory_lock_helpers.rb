@@ -85,12 +85,20 @@ module AdvisoryLockHelpers
 
   # Which backends hold this lock right now, straight from the server. Uncached, because the
   # query cache would happily answer a second question with the first answer.
+  #
+  # Scoped to the current database, and that is load-bearing rather than tidy: pg_locks is
+  # instance-wide, and this project's Compose file runs the development stack against the
+  # same PostgreSQL container as the test databases. Without the filter, a `worker`
+  # container mid-poll holds the request gate in the *development* database and this helper
+  # reports it as a holder here — the suite then fails, intermittently, on whether someone
+  # happened to be polling. Observed exactly that way.
   def advisory_lock_holders(namespace, key)
     ActiveRecord::Base.uncached do
       ActiveRecord::Base.connection.select_values(
         ActiveRecord::Base.sanitize_sql_array([ <<~SQL.squish, namespace, key ])
           SELECT pid FROM pg_locks
           WHERE locktype = 'advisory' AND classid::bigint = ? AND objid::bigint = ?
+            AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
         SQL
       )
     end

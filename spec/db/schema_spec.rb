@@ -9,7 +9,8 @@ RSpec.describe "Core data model schema" do
   it "defines every table plan §7 specifies" do
     expect(connection.tables).to include(
       "event_sources", "github_api_budget", "ingestion_runs", "push_events",
-      "quarantined_events", "github_actors", "github_repositories"
+      "quarantined_events", "github_actors", "github_repositories",
+      "github_search_budget", "enrichment_batches", "enrichment_observations"
     )
   end
 
@@ -31,6 +32,105 @@ RSpec.describe "Core data model schema" do
       names = connection.check_constraints("github_api_budget").map(&:name)
 
       expect(names).to include("github_api_budget_singleton")
+    end
+  end
+
+  describe "github_search_budget" do
+    # Mirrors the core ledger's posture above: the Search ledger's columns are its
+    # contract, and Github::SearchBudgetLedger reserves against exactly these counters.
+    it "carries exactly the columns the search ledger reserves against" do
+      expect(connection.columns("github_search_budget").map(&:name)).to match_array(%w[
+        id resource limit remaining reset_at observed_at
+        request_ceiling reserve used actor_used repository_used
+        blocked_until last_request_at
+        lock_version created_at updated_at
+      ])
+    end
+
+    it "constrains itself to a single row" do
+      names = connection.check_constraints("github_search_budget").map(&:name)
+
+      expect(names).to include("github_search_budget_singleton")
+    end
+
+    it "refuses negative counters at the schema level" do
+      names = connection.check_constraints("github_search_budget").map(&:name)
+
+      expect(names).to include("github_search_budget_counters_valid")
+    end
+  end
+
+  describe "enrichment_batches" do
+    it "carries the request envelope, counters, and rate-limit evidence columns" do
+      expect(connection.columns("enrichment_batches").map(&:name)).to include(
+        "correlation_id", "request_kind", "entity_kind", "status",
+        "requested_github_ids", "requested_identifiers", "request_url",
+        "response_status", "response_body", "total_count", "incomplete_results",
+        "requested_count", "returned_count", "valid_count", "missing_count", "invalid_count",
+        "started_at", "completed_at",
+        "rate_limit_resource", "rate_limit_limit", "rate_limit_remaining",
+        "rate_limit_used", "rate_limit_reset_at", "last_error"
+      )
+    end
+
+    it "makes the correlation id unique" do
+      index = connection.indexes("enrichment_batches")
+                        .find { |i| i.columns == [ "correlation_id" ] }
+
+      expect(index.unique).to be(true)
+    end
+
+    # The /status batch-quality window filters on started_at alone; the composite index
+    # cannot range-scan it because started_at is its last column.
+    it "indexes both the per-kind history and the bare started_at window" do
+      columns = connection.indexes("enrichment_batches").map(&:columns)
+
+      expect(columns).to include(%w[request_kind entity_kind started_at])
+      expect(columns).to include([ "started_at" ])
+    end
+
+    it "constrains kind, entity, status, and counter signs" do
+      names = connection.check_constraints("enrichment_batches").map(&:name)
+
+      expect(names).to include(
+        "enrichment_batches_request_kind_check",
+        "enrichment_batches_entity_kind_check",
+        "enrichment_batches_status_check",
+        "enrichment_batches_counters_nonnegative"
+      )
+    end
+  end
+
+  describe "enrichment_observations" do
+    it "carries the append-only evidence columns" do
+      expect(connection.columns("enrichment_observations").map(&:name)).to include(
+        "entity_kind", "entity_github_id", "source", "observed_at",
+        "raw_payload", "payload_fingerprint", "enrichment_batch_id", "push_event_id",
+        "request_correlation_id", "requested_identifier", "validation_outcome"
+      )
+    end
+
+    it "indexes the per-entity timeline and the fingerprint" do
+      indexes = connection.indexes("enrichment_observations")
+
+      timeline = indexes.find { |i| i.name == "index_enrichment_observations_on_entity_and_time" }
+      expect(timeline.columns).to eq(%w[entity_kind entity_github_id observed_at])
+      expect(indexes.map(&:columns)).to include([ "payload_fingerprint" ])
+    end
+
+    it "constrains entity kind and source to their vocabularies" do
+      names = connection.check_constraints("enrichment_observations").map(&:name)
+
+      expect(names).to include(
+        "enrichment_observations_entity_kind_check",
+        "enrichment_observations_source_check"
+      )
+    end
+
+    it "references its batch and its push event with real foreign keys" do
+      tables = connection.foreign_keys("enrichment_observations").map(&:to_table)
+
+      expect(tables).to contain_exactly("enrichment_batches", "push_events")
     end
   end
 
@@ -73,6 +173,18 @@ RSpec.describe "Core data model schema" do
     end
   end
 
+  # The same posture for every raw_payload in the schema: retention is a durability
+  # decision, indexing is a query decision, and no query demands one yet.
+  describe "raw payload retention" do
+    it "carries no GIN index on any raw_payload column" do
+      %w[push_events quarantined_events enrichment_observations
+         github_actors github_repositories].each do |table|
+        expect(connection.indexes(table).map(&:columns)).not_to include([ "raw_payload" ]),
+                                                                "expected no raw_payload index on #{table}"
+      end
+    end
+  end
+
   describe "quarantined_events" do
     it "makes the payload fingerprint the only unique identity" do
       unique = connection.indexes("quarantined_events").select(&:unique).map(&:columns)
@@ -85,11 +197,29 @@ RSpec.describe "Core data model schema" do
     it "each carry the same enrichment state columns" do
       enrichment_columns = %w[
         enrichment_status enrichment_attempts next_retry_at last_error fetched_at
-        first_seen_at last_seen_at latest_event_at skipped_at
+        first_seen_at last_seen_at latest_event_at
       ]
 
       %w[github_actors github_repositories].each do |table|
-        expect(connection.columns(table).map(&:name)).to include(*enrichment_columns)
+        column_names = connection.columns(table).map(&:name)
+
+        expect(column_names).to include(*enrichment_columns)
+        expect(column_names).not_to include("skipped_at")
+      end
+    end
+
+    # Appendix G's staged pipeline: the stage machine's resting position, the instant
+    # columns for the three non-resting facts, and the lease that makes a claim durable.
+    it "each carry the same staged pipeline columns" do
+      staged_columns = %w[
+        enrichment_stage detail_attempts event_native_at derived_at batch_pending_at
+        batch_applied_at detail_pending_at retry_scheduled_at contract_completed_at
+        terminal_at latest_observation_id latest_observation_source latest_observed_at
+        lease_token leased_until current_enrichment_batch_id
+      ]
+
+      %w[github_actors github_repositories].each do |table|
+        expect(connection.columns(table).map(&:name)).to include(*staged_columns)
       end
     end
 
@@ -103,10 +233,41 @@ RSpec.describe "Core data model schema" do
       end
     end
 
-    it "stores enrichment status as text so the index predicate needs no cast" do
+    # BatchClaim's FIFO is `ORDER BY created_at, id` under a stage predicate; the index
+    # leads with the stage so the order it yields is the order the claim reads.
+    it "each index the staged FIFO in claim order" do
       %w[github_actors github_repositories].each do |table|
-        column = connection.columns(table).find { |c| c.name == "enrichment_status" }
-        expect(column.type).to eq(:text)
+        index = connection.indexes(table).find { |i| i.name == "index_#{table}_on_stage_fifo" }
+
+        expect(index).not_to be_nil, "expected index_#{table}_on_stage_fifo"
+        expect(index.columns).to eq(%w[enrichment_stage created_at id])
+      end
+    end
+
+    # The lease-expiry predicate (`leased_until IS NULL OR leased_until <= now`) is on
+    # every claim scope, so expiry re-admission never scans the table.
+    it "each index leased_until for lease-expiry reclaims" do
+      %w[github_actors github_repositories].each do |table|
+        expect(connection.indexes(table).map(&:columns)).to include([ "leased_until" ]),
+                                                            "expected a leased_until index on #{table}"
+      end
+    end
+
+    it "each constrain the stage to the seven resting stages" do
+      %w[github_actors github_repositories].each do |table|
+        names = connection.check_constraints(table).map(&:name)
+
+        expect(names).to include("#{table}_enrichment_stage_check")
+        expect(names).to include("#{table}_detail_attempts_nonnegative")
+      end
+    end
+
+    it "stores enrichment status and stage as text so the index predicates need no cast" do
+      %w[github_actors github_repositories].each do |table|
+        %w[enrichment_status enrichment_stage].each do |name|
+          column = connection.columns(table).find { |c| c.name == name }
+          expect(column.type).to eq(:text)
+        end
       end
     end
   end

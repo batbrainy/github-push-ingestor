@@ -134,6 +134,93 @@ RSpec.describe Github::RequestExecutor do
     end
   end
 
+  # Appendix F: the executor routes on Request#search?. A search-class request reserves
+  # and reconciles against the per-minute search ledger, and a core-class request against
+  # the hourly core ledger — the same chain, two ledgers, with no cross-talk in either
+  # direction.
+  describe "the two ledgers (Appendix F)" do
+    let(:search_request) do
+      Github::Request.new(url: "https://api.github.com/search/users?q=user%3Aoctocat&per_page=10",
+                          request_class: :actor_search)
+    end
+
+    def search_rate_limit_headers(remaining: 8)
+      {
+        "x-ratelimit-resource" => "search", "x-ratelimit-limit" => "10",
+        "x-ratelimit-remaining" => remaining.to_s,
+        "x-ratelimit-reset" => (frozen_time + 60).to_i.to_s
+      }
+    end
+
+    def search_executor(transport)
+      executor(transport, search_ledger: Github::SearchBudgetLedger.new(configuration: Github.configuration))
+    end
+
+    it "reserves a search request on the search ledger before the transport is called" do
+      active_search_window
+      observed = nil
+      transport = recording_transport do
+        observed = { search_used: current_search_budget.used, gate_held: Github::RequestGate.held? }
+        response(status: 200, headers: search_rate_limit_headers, body: "{}")
+      end
+
+      result = search_executor(transport).call(search_request)
+
+      expect(result).to be_ok
+      expect(observed).to eq(search_used: 1, gate_held: true)
+      expect(current_search_budget).to have_attributes(actor_used: 1, repository_used: 0,
+                                                       last_request_at: frozen_time)
+    end
+
+    # The reconciliation lands on the search row — monotonic against the local estimate,
+    # exactly as the core ledger treats its own headers.
+    it "reconciles the search response onto the search row" do
+      active_search_window(remaining: 9)
+      transport = recording_transport { response(status: 200, headers: search_rate_limit_headers(remaining: 7), body: "{}") }
+
+      search_executor(transport).call(search_request)
+
+      expect(current_search_budget).to have_attributes(remaining: 7, reset_at: frozen_time + 60)
+    end
+
+    # The strongest form of "no cross-talk": the core singleton is created only by a core
+    # reservation, so a search request that touched it at all would have left a row behind.
+    it "leaves the core ledger row untouched by a search request" do
+      active_search_window
+      transport = recording_transport { response(status: 200, headers: search_rate_limit_headers, body: "{}") }
+
+      search_executor(transport).call(search_request)
+
+      expect(GithubApiBudget.count).to eq(0)
+    end
+
+    # And the mirror image: a core-class request never creates or spends the search row.
+    it "touches only the core ledger for a core-class request" do
+      active_budget_window
+      transport = recording_transport { response(status: 200, headers: rate_limit_headers) }
+
+      executor(transport).call(poll_request)
+
+      expect(current_budget.poll_used).to eq(1)
+      expect(GithubSearchBudget.count).to eq(0)
+    end
+
+    # A search-ledger denial takes the same shape as a core one: nothing spent, nothing
+    # sent, and a deferral the caller can read the reason off.
+    it "surfaces a search-ledger denial as a budget denial that spends nothing" do
+      active_search_window(used: 8)
+      transport = recording_transport { response(status: 200, headers: search_rate_limit_headers, body: "{}") }
+
+      result = search_executor(transport).call(search_request)
+
+      expect(transport.calls).to be_empty
+      expect(result.classification).to eq(:budget_denied)
+      expect(result).to be_deferred
+      expect(result.error).to be_a(Github::Errors::BudgetExhausted)
+      expect(result.error.reason).to eq(:search_ceiling_exhausted)
+    end
+  end
+
   describe "retries (plan §10)" do
     # "Retry up to MAX_HTTP_RETRIES through the same gate and ledger — each attempt is a
     # reservation." Collapsing that to one debit per logical fetch would silently
@@ -216,6 +303,48 @@ RSpec.describe Github::RequestExecutor do
                              http_status: 500, next_attempt: 1, max_attempts: 2)).once
       expect(Rails.logger).to have_received(:info)
         .with(hash_including(event: "github.retry_scheduled", next_attempt: 2)).once
+    end
+
+    # SEARCH_PACING_SECONDS is six and the retry backoff is around a second, so a
+    # Search retry that slept only the backoff would arrive before its own ledger would
+    # admit it: the reservation is refused as :search_pacing and the transport failure
+    # the retry existed to repeat is replaced by a budget denial. MAX_HTTP_RETRIES would
+    # be inert on this resource.
+    it "waits out Search pacing before retrying, so the retry is a retry" do
+      active_search_window(last_request_at: nil)
+      slept = []
+      # The clock advances with the sleep, as it does in production: pacing is measured
+      # against wall time, so a frozen clock would refuse the retry however long the
+      # process actually waited.
+      current = frozen_time
+      request = Github::Request.new(
+        url: "https://api.github.com/search/users?q=user%3Aoctocat&per_page=10",
+        request_class: :actor_search
+      )
+      headers = { "x-ratelimit-resource" => "search", "x-ratelimit-limit" => "10",
+                  "x-ratelimit-remaining" => "8",
+                  "x-ratelimit-reset" => (frozen_time + 3600).to_i.to_s }
+
+      result = executor(recording_transport { response(status: 500, headers: headers) },
+                        sleeper: ->(seconds) { slept << seconds; current += seconds },
+                        clock: -> { current },
+                        search_pacing_seconds: 6).call(request)
+
+      expect(slept).to all(be >= 6)
+      # Every attempt reached the transport, so the failure that survives is the
+      # server's rather than a pacing denial.
+      expect(result.classification).to eq(:server_error)
+      expect(current_search_budget.used).to eq(3)
+    end
+
+    it "leaves a core retry on its own backoff, which no pacing constrains" do
+      active_budget_window
+      slept = []
+
+      executor(always(500), sleeper: ->(seconds) { slept << seconds },
+               search_pacing_seconds: 6).call(poll_request)
+
+      expect(slept).to all(be < 6)
     end
 
     # RetryPolicy jitters, so a line that recomputed the delay would report a number this
@@ -383,8 +512,11 @@ RSpec.describe Github::RequestExecutor do
       expect(transport.calls.size).to eq(1)
     end
 
+    # An explicit forty-attempt window: three hops are three repository reservations,
+    # which the default two-attempt repository guarantee would deny before the redirect
+    # limit — and this example is about the limit, not the budget.
     it "stops after MAX_REDIRECTS rather than looping" do
-      active_budget_window
+      active_budget_window(enrichment_allowance: 40)
       transport = recording_transport do |call|
         response(status: 301, headers: rate_limit_headers.merge(
           "location" => "https://api.github.com/repos/octocat/hop-#{call}"

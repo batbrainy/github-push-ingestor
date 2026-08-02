@@ -118,6 +118,10 @@ jobs:
       - name: Smoke test the one-shot enrichment command
         env:
           GITHUB_MODE: fixture
+          # The one-shot never sleeps pacing out; at the default 6-second search
+          # pacing the second batch would be reported as a pacing deferral instead
+          # of running, and the smoke would prove one lane instead of the chain.
+          SEARCH_PACING_SECONDS: "0"
         run: bin/enrich --limit 6
 
       # Solid Queue's own validator over config/queue.yml and config/recurring.yml: a

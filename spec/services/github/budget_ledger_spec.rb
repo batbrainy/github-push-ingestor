@@ -63,9 +63,9 @@ RSpec.describe Github::BudgetLedger do
     it "records each enrichment request against its own class share" do
       active_window
 
-      3.times { ledger.reserve!(:actor, now: frozen_time) }
+      2.times { ledger.reserve!(:actor, now: frozen_time) }
 
-      expect(budget).to have_attributes(actor_share_used: 3, repository_share_used: 0)
+      expect(budget).to have_attributes(actor_share_used: 2, repository_share_used: 0)
     end
 
     it "decrements the local remaining estimate, so a failure is spent against it too" do
@@ -84,8 +84,8 @@ RSpec.describe Github::BudgetLedger do
   end
 
   describe "class isolation (plan §10)" do
-    # §10: enrichment exhausting its forty attempts never stops polling, and polling
-    # exhausting its twelve never stops enrichment.
+    # §10: detail fallback exhausting its four attempts never stops polling, and polling
+    # exhausting its twelve never stops the fallback.
     it "denies polling once its allowance is spent, without touching enrichment" do
       active_window(poll_used: 12)
 
@@ -95,7 +95,7 @@ RSpec.describe Github::BudgetLedger do
     end
 
     it "denies enrichment once its allowance is spent, without touching polling" do
-      active_window(enrichment_used: 40)
+      active_window(enrichment_used: 4)
 
       expect { ledger.reserve!(:actor, now: frozen_time) }
         .to raise_error(Github::Errors::BudgetExhausted, /class_allowance_exhausted/)
@@ -199,7 +199,7 @@ RSpec.describe Github::BudgetLedger do
 
   describe "window rollover" do
     it "resets the counters when the stored window boundary has passed" do
-      active_window(poll_used: 12, enrichment_used: 40, actor_share_used: 20, repository_share_used: 20)
+      active_window(poll_used: 12, enrichment_used: 4, actor_share_used: 2, repository_share_used: 2)
 
       ledger.reserve!(:poll, now: window_reset + 1)
 
@@ -420,7 +420,7 @@ RSpec.describe Github::BudgetLedger do
     # The clock-driven rollover inside reserve! has no in-flight request to carry, so it
     # still starts the window clean.
     it "still starts a clean window when the rollover happens before a reservation" do
-      active_window(poll_used: 12, enrichment_used: 40)
+      active_window(poll_used: 12, enrichment_used: 4)
 
       ledger.reserve!(:poll, now: window_reset + 1)
 
@@ -709,7 +709,7 @@ RSpec.describe Github::BudgetLedger do
 
       expect(Rails.logger).to have_received(:warn).with(
         hash_including(event: "budget.allowances_clamped",
-                       requested_poll_allowance: 12, requested_enrichment_allowance: -5,
+                       requested_poll_allowance: 12, requested_enrichment_allowance: 40,
                        poll_allowance: 7, enrichment_allowance: 0)
       )
     end
@@ -754,6 +754,9 @@ RSpec.describe Github::BudgetLedger do
       count.times { create_event_source(source_type: "github_public_events") }
     end
 
+    # Two sources double the poll commitment, and polling has priority: the configured
+    # detail-fallback allowance no longer fits beside it, so #clamped funds what is left
+    # (60 - 8 reserve - 24 poll) rather than over-committing the limit.
     it "derives the poll allowance from the rows that exist when a window opens" do
       live_sources(2)
       ledger.bootstrap!(now: frozen_time)
@@ -798,12 +801,12 @@ RSpec.describe Github::BudgetLedger do
 
   describe "fairness shares (plan §10)" do
     # §10's reason for the split, in one example: one observed live page held ~92
-    # repositories against ~89 actors, so a repository-first policy would spend the whole
-    # hourly allowance before a single actor was enriched.
+    # repositories against ~89 actors, so a repository-first fallback policy would spend
+    # the whole detail allowance before a single actor was fetched.
     it "stops a repository flood at its guarantee, leaving the actor share untouched" do
       active_window
 
-      20.times { ledger.reserve!(:repository, now: frozen_time) }
+      2.times { ledger.reserve!(:repository, now: frozen_time) }
 
       expect { ledger.reserve!(:repository, now: frozen_time) }
         .to raise_error(Github::Errors::BudgetExhausted, /share_exhausted/)
@@ -811,39 +814,42 @@ RSpec.describe Github::BudgetLedger do
     end
 
     it "grants an actor reservation right up to its guarantee" do
-      active_window(actor_share_used: 19, enrichment_used: 19)
+      active_window(actor_share_used: 1, enrichment_used: 1)
 
       expect { ledger.reserve!(:actor, now: frozen_time) }
-        .to change { budget.actor_share_used }.from(19).to(20)
+        .to change { budget.actor_share_used }.from(1).to(2)
     end
 
     it "refuses the next one while the caller has not reported the other class quiet" do
-      active_window(actor_share_used: 20, enrichment_used: 20)
+      active_window(actor_share_used: 2, enrichment_used: 2)
 
       expect { ledger.reserve!(:actor, now: frozen_time) }
         .to raise_error(Github::Errors::BudgetExhausted, /share_exhausted/)
     end
 
     it "spends nothing when it refuses a share, so a denied reservation costs no quota" do
-      active_window(actor_share_used: 20, enrichment_used: 20)
+      active_window(actor_share_used: 2, enrichment_used: 2)
 
       expect { suppress(Github::Errors::BudgetExhausted) { ledger.reserve!(:actor, now: frozen_time) } }
-        .not_to change { budget.enrichment_used }.from(20)
+        .not_to change { budget.enrichment_used }.from(2)
     end
 
     it "grants the same reservation once the caller reports no eligible repository candidate" do
-      active_window(actor_share_used: 20, enrichment_used: 20)
+      active_window(actor_share_used: 2, enrichment_used: 2)
 
       expect { ledger.reserve!(:actor, now: frozen_time, borrow: true) }
-        .to change { budget.actor_share_used }.from(20).to(21)
+        .to change { budget.actor_share_used }.from(2).to(3)
     end
 
     # The plan's phrasing is "borrow the other's unused capacity", and capping at the whole
     # enrichment allowance authorizes exactly that set: actor_share_used +
     # repository_share_used == enrichment_used is an invariant of the debit statements, so
     # the class guard already limits a borrower to allowance - other_share_used.
+    # An explicit forty-attempt window: this example is about the arithmetic of the cap
+    # itself, so it keeps the roomier volume rather than the four-attempt default.
     it "lets a borrowing class spend the whole enrichment allowance and not one request more" do
-      active_window(actor_share_used: 20, repository_share_used: 5, enrichment_used: 25)
+      active_window(enrichment_allowance: 40, actor_share_used: 20, repository_share_used: 5,
+                    enrichment_used: 25)
 
       15.times { ledger.reserve!(:actor, now: frozen_time, borrow: true) }
 
@@ -855,21 +861,23 @@ RSpec.describe Github::BudgetLedger do
     # The ordering is not arbitrary: both conditions are true here, and naming the share
     # would send an operator to ACTOR_ENRICHMENT_SHARE when the answer is the window.
     it "names the class allowance rather than the share once the whole budget is gone" do
-      active_window(actor_share_used: 40, enrichment_used: 40)
+      active_window(actor_share_used: 4, enrichment_used: 4)
 
       expect { ledger.reserve!(:actor, now: frozen_time) }
         .to raise_error(Github::Errors::BudgetExhausted, /class_allowance_exhausted/)
     end
 
     it "never applies a share to a poll, which has none to spend" do
-      active_window(actor_share_used: 40, repository_share_used: 40)
+      active_window(actor_share_used: 2, repository_share_used: 2, enrichment_used: 4)
 
       expect { ledger.reserve!(:poll, now: frozen_time) }.to change { budget.poll_used }.from(0).to(1)
     end
 
+    # At a quarter share of the four-attempt allowance the actor guarantee floors to one
+    # while repository keeps three, so one spent attempt each splits the two verdicts.
     it "derives the guarantees from the configured share rather than from a fixed half" do
       quarter = described_class.new(configuration: configuration_with(ACTOR_ENRICHMENT_SHARE: "0.25"))
-      active_window(actor_share_used: 10, repository_share_used: 10, enrichment_used: 20)
+      active_window(actor_share_used: 1, repository_share_used: 1, enrichment_used: 2)
 
       expect { quarter.reserve!(:actor, now: frozen_time) }
         .to raise_error(Github::Errors::BudgetExhausted, /share_exhausted/)
@@ -902,7 +910,7 @@ RSpec.describe Github::BudgetLedger do
     it "keeps the two shares summing to the class counter, whichever class spends" do
       active_window
 
-      3.times { ledger.reserve!(:actor, now: frozen_time) }
+      2.times { ledger.reserve!(:actor, now: frozen_time) }
       2.times { ledger.reserve!(:repository, now: frozen_time) }
 
       expect(budget.actor_share_used + budget.repository_share_used).to eq(budget.enrichment_used)

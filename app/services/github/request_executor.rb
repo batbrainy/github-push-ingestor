@@ -22,17 +22,21 @@ module Github
   class RequestExecutor
     def initialize(transport: Github.transport,
                    ledger: BudgetLedger.new,
+                   search_ledger: SearchBudgetLedger.new,
                    retry_policy: RetryPolicy.new,
                    mode: Github.configuration.mode,
                    max_redirects: Github.configuration.max_redirects,
+                   search_pacing_seconds: Github.configuration.search_pacing_seconds,
                    request_gate_wait: RequestGate::WAIT_SECONDS,
                    sleeper: ->(seconds) { Kernel.sleep(seconds) },
                    clock: -> { Time.current })
       @transport = transport
       @ledger = ledger
+      @search_ledger = search_ledger
       @retry_policy = retry_policy
       @mode = mode.to_sym
       @max_redirects = max_redirects
+      @search_pacing_seconds = search_pacing_seconds
       @request_gate_wait = request_gate_wait
       @sleeper = sleeper
       @clock = clock
@@ -51,7 +55,7 @@ module Github
 
         # Computed once and both slept and logged, never recomputed: RetryPolicy jitters, so
         # asking twice would report a delay this process never took.
-        backoff_seconds = @retry_policy.backoff_seconds(attempt)
+        backoff_seconds = retry_delay_for(request, attempt)
         log_retry_scheduled(result, backoff_seconds: backoff_seconds)
 
         # The backoff happens with no lock held and no reservation outstanding: the
@@ -62,6 +66,18 @@ module Github
     end
 
     private
+
+    # A Search retry must outwait that ledger's pacing, or MAX_HTTP_RETRIES is inert on
+    # this resource: the default backoff is around a second, pacing is six, so every
+    # retry would be refused as :search_pacing and the transport failure it was meant to
+    # retry would be replaced by a budget denial. Taking the larger of the two keeps one
+    # meaning for "retry" across both resources.
+    def retry_delay_for(request, attempt)
+      backoff = @retry_policy.backoff_seconds(attempt)
+      return backoff unless request.search?
+
+      [ backoff, @search_pacing_seconds ].max
+    end
 
     # A retryable failure at hop n restarts from the original request rather than from
     # the last hop, so MAX_HTTP_RETRIES keeps its plain meaning: this logical fetch was
@@ -98,7 +114,8 @@ module Github
         # which reserve again — stay authorized under the same fairness decision the
         # caller made once (§10). This class does not interpret it and could not
         # compute it: it is a fact about the entity tables.
-        @ledger.reserve!(request.request_class, now: @clock.call, borrow: request.borrow)
+        ledger = ledger_for(request)
+        ledger.reserve!(request.request_class, now: @clock.call, borrow: request.borrow)
 
         # Authoritative, in-chain validation: its return value is what the transport
         # receives, so an unvalidated URL cannot physically reach a socket.
@@ -109,8 +126,8 @@ module Github
         # The class travels with the reconciliation so that a response proving the
         # rate-limit window has moved on can carry this request's debit into the window
         # GitHub actually counted it in.
-        @ledger.reconcile!(rate_limit_from(response), request_class: request.request_class,
-                           now: @clock.call)
+        ledger.reconcile!(rate_limit_from(response), request_class: request.request_class,
+                          now: @clock.call)
 
         log_result(FetchResult.from_response(
           request: request, status: response.status, headers: response.headers,
@@ -149,6 +166,10 @@ module Github
 
     def rate_limit_from(response)
       RateLimitSnapshot.from_headers(response.headers, observed_at: @clock.call)
+    end
+
+    def ledger_for(request)
+      request.search? ? @search_ledger : @ledger
     end
 
     def failure(request, error, attempt:, classification: nil)

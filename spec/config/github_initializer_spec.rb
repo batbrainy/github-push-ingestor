@@ -18,7 +18,8 @@ RSpec.describe "the Github startup initializer" do
   it "logs the resolved allowances at boot" do
     expect(Rails.logger).to receive(:info).with(hash_including(
       event: "config.budget_resolved", mode: "live",
-      poll_allowance: 12, enrichment_allowance: 40, reserve: 8
+      poll_allowance: 12, enrichment_allowance: 40, reserve: 8,
+      actor_guarantee: 20, repository_guarantee: 20
     ))
 
     boot
@@ -62,13 +63,24 @@ RSpec.describe "the Github startup initializer" do
     end
   end
 
-  # The rejection §10 states outright: "Startup validation rejects any configuration where
-  # poll_attempt_allowance + reserve >= effective_limit." Raising here stops the container
-  # rather than letting it poll into an over-commitment.
-  it "refuses to finish booting on a configuration that leaves no enrichment capacity" do
+  # The rejection Appendix F restates for the staged budget: polling, the configured
+  # detail-fallback allowance, and the reserve must fit inside the core limit together.
+  # Raising here stops the container rather than letting it poll into an over-commitment,
+  # and the message names CORE_DETAIL_FALLBACK_ALLOWANCE among the levers an operator
+  # can move.
+  it "refuses to finish booting on a configuration whose commitments exceed the core limit" do
     allow(Github).to receive(:configuration)
       .and_return(Github::Configuration.new("POLL_INTERVAL_SECONDS" => "60", "MAX_PAGES_PER_POLL" => "2"))
 
-    expect { boot }.to raise_error(Github::Errors::ConfigurationError)
+    expect { boot }.to raise_error(Github::Errors::ConfigurationError, /CORE_DETAIL_FALLBACK_ALLOWANCE/)
+  end
+
+  # Appendix F's structural rules run in the same boot-time validation, so a container
+  # with a lease its own worst-case fetch could outlive never starts.
+  it "refuses to finish booting on a staged-enrichment rule violation" do
+    allow(Github).to receive(:configuration)
+      .and_return(Github::Configuration.new("ENRICHMENT_LEASE_SECONDS" => "585"))
+
+    expect { boot }.to raise_error(Github::Errors::ConfigurationError, /ENRICHMENT_LEASE_SECONDS/)
   end
 end

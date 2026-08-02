@@ -10,9 +10,67 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_07_31_120000) do
+ActiveRecord::Schema[8.1].define(version: 2026_08_02_010000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
+
+  create_table "enrichment_batches", force: :cascade do |t|
+    t.datetime "completed_at"
+    t.uuid "correlation_id", default: -> { "gen_random_uuid()" }, null: false
+    t.datetime "created_at", null: false
+    t.text "entity_kind", null: false
+    t.boolean "incomplete_results"
+    t.integer "invalid_count", default: 0, null: false
+    t.text "last_error"
+    t.integer "missing_count", default: 0, null: false
+    t.integer "rate_limit_limit"
+    t.integer "rate_limit_remaining"
+    t.datetime "rate_limit_reset_at"
+    t.text "rate_limit_resource"
+    t.integer "rate_limit_used"
+    t.text "request_kind", null: false
+    t.text "request_url"
+    t.integer "requested_count", default: 0, null: false
+    t.jsonb "requested_github_ids", default: [], null: false
+    t.jsonb "requested_identifiers", default: [], null: false
+    t.text "response_body"
+    t.integer "response_status"
+    t.integer "returned_count", default: 0, null: false
+    t.datetime "started_at", null: false
+    t.text "status", default: "in_flight", null: false
+    t.integer "total_count"
+    t.datetime "updated_at", null: false
+    t.integer "valid_count", default: 0, null: false
+    t.index ["correlation_id"], name: "index_enrichment_batches_on_correlation_id", unique: true
+    t.index ["request_kind", "entity_kind", "started_at"], name: "idx_on_request_kind_entity_kind_started_at_62b9f3c5e7"
+    t.index ["started_at"], name: "index_enrichment_batches_on_started_at"
+    t.check_constraint "entity_kind = ANY (ARRAY['actor'::text, 'repository'::text])", name: "enrichment_batches_entity_kind_check"
+    t.check_constraint "request_kind = ANY (ARRAY['search'::text, 'detail'::text])", name: "enrichment_batches_request_kind_check"
+    t.check_constraint "requested_count >= 0 AND returned_count >= 0 AND valid_count >= 0 AND missing_count >= 0 AND invalid_count >= 0", name: "enrichment_batches_counters_nonnegative"
+    t.check_constraint "status = ANY (ARRAY['in_flight'::text, 'succeeded'::text, 'failed'::text, 'deferred'::text, 'stale_lease'::text])", name: "enrichment_batches_status_check"
+  end
+
+  create_table "enrichment_observations", force: :cascade do |t|
+    t.datetime "created_at", null: false
+    t.bigint "enrichment_batch_id"
+    t.bigint "entity_github_id"
+    t.text "entity_kind", null: false
+    t.datetime "observed_at", null: false
+    t.text "payload_fingerprint", null: false
+    t.bigint "push_event_id"
+    t.jsonb "raw_payload", null: false
+    t.uuid "request_correlation_id"
+    t.text "requested_identifier"
+    t.text "source", null: false
+    t.datetime "updated_at", null: false
+    t.text "validation_outcome", null: false
+    t.index ["enrichment_batch_id"], name: "index_enrichment_observations_on_enrichment_batch_id"
+    t.index ["entity_kind", "entity_github_id", "observed_at"], name: "index_enrichment_observations_on_entity_and_time"
+    t.index ["payload_fingerprint"], name: "index_enrichment_observations_on_payload_fingerprint"
+    t.index ["push_event_id"], name: "index_enrichment_observations_on_push_event_id"
+    t.check_constraint "entity_kind = ANY (ARRAY['actor'::text, 'repository'::text])", name: "enrichment_observations_entity_kind_check"
+    t.check_constraint "source = ANY (ARRAY['event'::text, 'search'::text, 'detail'::text])", name: "enrichment_observations_source_check"
+  end
 
   create_table "event_sources", force: :cascade do |t|
     t.datetime "cadence_due_at"
@@ -36,29 +94,51 @@ ActiveRecord::Schema[8.1].define(version: 2026_07_31_120000) do
   end
 
   create_table "github_actors", force: :cascade do |t|
+    t.text "account_type"
     t.text "api_url"
     t.text "avatar_url"
+    t.datetime "batch_applied_at"
+    t.datetime "batch_pending_at"
+    t.datetime "contract_completed_at"
     t.datetime "created_at", null: false
+    t.bigint "current_enrichment_batch_id"
+    t.datetime "derived_at"
+    t.integer "detail_attempts", default: 0, null: false
+    t.datetime "detail_pending_at"
     t.text "display_login"
     t.integer "enrichment_attempts", default: 0, null: false
+    t.text "enrichment_stage", default: "batch_pending", null: false
     t.text "enrichment_status", default: "pending", null: false
+    t.datetime "event_native_at"
     t.datetime "fetched_at"
     t.datetime "first_seen_at"
     t.bigint "github_id", null: false
     t.text "last_error"
     t.datetime "last_seen_at"
     t.datetime "latest_event_at"
+    t.bigint "latest_observation_id"
+    t.text "latest_observation_source"
+    t.datetime "latest_observed_at"
+    t.uuid "lease_token"
+    t.datetime "leased_until"
     t.text "login", null: false
     t.text "name"
     t.datetime "next_retry_at"
     t.jsonb "raw_payload"
-    t.datetime "skipped_at"
+    t.datetime "retry_scheduled_at"
+    t.datetime "terminal_at"
     t.datetime "updated_at", null: false
+    t.index ["created_at", "id"], name: "index_github_actors_on_enrichment_candidates", where: "(enrichment_status = ANY (ARRAY['pending'::text, 'retryable_failure'::text]))"
+    t.index ["current_enrichment_batch_id"], name: "index_github_actors_on_current_enrichment_batch_id"
+    t.index ["enrichment_stage", "created_at", "id"], name: "index_github_actors_on_stage_fifo"
     t.index ["fetched_at", "next_retry_at"], name: "index_github_actors_on_enrichment_refresh", where: "(enrichment_status = 'complete'::text)"
     t.index ["github_id"], name: "index_github_actors_on_github_id", unique: true
-    t.index ["next_retry_at", "last_seen_at"], name: "index_github_actors_on_enrichment_candidates", where: "(enrichment_status = ANY (ARRAY['pending'::text, 'retryable_failure'::text]))"
+    t.index ["latest_observation_id"], name: "index_github_actors_on_latest_observation_id"
+    t.index ["leased_until"], name: "index_github_actors_on_leased_until"
+    t.check_constraint "detail_attempts >= 0", name: "github_actors_detail_attempts_nonnegative"
     t.check_constraint "enrichment_attempts >= 0", name: "github_actors_enrichment_attempts_nonnegative"
-    t.check_constraint "enrichment_status = ANY (ARRAY['pending'::text, 'complete'::text, 'retryable_failure'::text, 'permanent_failure'::text, 'skipped_budget'::text])", name: "github_actors_enrichment_status_check"
+    t.check_constraint "enrichment_stage = ANY (ARRAY['batch_pending'::text, 'batch_in_flight'::text, 'detail_pending'::text, 'detail_in_flight'::text, 'retry_scheduled'::text, 'contract_complete'::text, 'terminal'::text])", name: "github_actors_enrichment_stage_check"
+    t.check_constraint "enrichment_status = ANY (ARRAY['pending'::text, 'complete'::text, 'retryable_failure'::text, 'permanent_failure'::text])", name: "github_actors_enrichment_status_check"
   end
 
   create_table "github_api_budget", id: :integer, default: 1, force: :cascade do |t|
@@ -89,29 +169,75 @@ ActiveRecord::Schema[8.1].define(version: 2026_07_31_120000) do
 
   create_table "github_repositories", force: :cascade do |t|
     t.text "api_url"
+    t.boolean "archived"
+    t.datetime "batch_applied_at"
+    t.datetime "batch_pending_at"
+    t.datetime "contract_completed_at"
     t.datetime "created_at", null: false
+    t.bigint "current_enrichment_batch_id"
+    t.text "default_branch"
+    t.datetime "derived_at"
     t.text "description"
+    t.integer "detail_attempts", default: 0, null: false
+    t.datetime "detail_pending_at"
     t.integer "enrichment_attempts", default: 0, null: false
+    t.text "enrichment_stage", default: "batch_pending", null: false
     t.text "enrichment_status", default: "pending", null: false
+    t.datetime "event_native_at"
     t.datetime "fetched_at"
     t.datetime "first_seen_at"
+    t.boolean "fork"
     t.text "full_name", null: false
+    t.datetime "github_created_at"
     t.bigint "github_id", null: false
     t.text "language"
     t.text "last_error"
     t.datetime "last_seen_at"
     t.datetime "latest_event_at"
+    t.bigint "latest_observation_id"
+    t.text "latest_observation_source"
+    t.datetime "latest_observed_at"
+    t.uuid "lease_token"
+    t.datetime "leased_until"
     t.text "name"
     t.datetime "next_retry_at"
     t.bigint "owner_github_id"
+    t.text "owner_login"
     t.jsonb "raw_payload"
-    t.datetime "skipped_at"
+    t.datetime "retry_scheduled_at"
+    t.datetime "terminal_at"
     t.datetime "updated_at", null: false
+    t.index ["created_at", "id"], name: "index_github_repositories_on_enrichment_candidates", where: "(enrichment_status = ANY (ARRAY['pending'::text, 'retryable_failure'::text]))"
+    t.index ["current_enrichment_batch_id"], name: "index_github_repositories_on_current_enrichment_batch_id"
+    t.index ["enrichment_stage", "created_at", "id"], name: "index_github_repositories_on_stage_fifo"
     t.index ["fetched_at", "next_retry_at"], name: "index_github_repositories_on_enrichment_refresh", where: "(enrichment_status = 'complete'::text)"
     t.index ["github_id"], name: "index_github_repositories_on_github_id", unique: true
-    t.index ["next_retry_at", "last_seen_at"], name: "index_github_repositories_on_enrichment_candidates", where: "(enrichment_status = ANY (ARRAY['pending'::text, 'retryable_failure'::text]))"
+    t.index ["latest_observation_id"], name: "index_github_repositories_on_latest_observation_id"
+    t.index ["leased_until"], name: "index_github_repositories_on_leased_until"
+    t.check_constraint "detail_attempts >= 0", name: "github_repositories_detail_attempts_nonnegative"
     t.check_constraint "enrichment_attempts >= 0", name: "github_repositories_enrichment_attempts_nonnegative"
-    t.check_constraint "enrichment_status = ANY (ARRAY['pending'::text, 'complete'::text, 'retryable_failure'::text, 'permanent_failure'::text, 'skipped_budget'::text])", name: "github_repositories_enrichment_status_check"
+    t.check_constraint "enrichment_stage = ANY (ARRAY['batch_pending'::text, 'batch_in_flight'::text, 'detail_pending'::text, 'detail_in_flight'::text, 'retry_scheduled'::text, 'contract_complete'::text, 'terminal'::text])", name: "github_repositories_enrichment_stage_check"
+    t.check_constraint "enrichment_status = ANY (ARRAY['pending'::text, 'complete'::text, 'retryable_failure'::text, 'permanent_failure'::text])", name: "github_repositories_enrichment_status_check"
+  end
+
+  create_table "github_search_budget", id: :integer, default: 1, force: :cascade do |t|
+    t.integer "actor_used", default: 0, null: false
+    t.datetime "blocked_until"
+    t.datetime "created_at", null: false
+    t.datetime "last_request_at"
+    t.integer "limit"
+    t.integer "lock_version", default: 0, null: false
+    t.datetime "observed_at"
+    t.integer "remaining"
+    t.integer "repository_used", default: 0, null: false
+    t.integer "request_ceiling", default: 10, null: false
+    t.integer "reserve", default: 2, null: false
+    t.datetime "reset_at"
+    t.text "resource", default: "search", null: false
+    t.datetime "updated_at", null: false
+    t.integer "used", default: 0, null: false
+    t.check_constraint "id = 1", name: "github_search_budget_singleton"
+    t.check_constraint "request_ceiling > 0 AND reserve >= 0 AND used >= 0 AND actor_used >= 0 AND repository_used >= 0 AND (\"limit\" IS NULL OR \"limit\" >= 0) AND (remaining IS NULL OR remaining >= 0)", name: "github_search_budget_counters_valid"
   end
 
   create_table "ingestion_runs", force: :cascade do |t|
@@ -171,6 +297,12 @@ ActiveRecord::Schema[8.1].define(version: 2026_07_31_120000) do
     t.check_constraint "occurrence_count >= 1", name: "quarantined_events_occurrence_count_positive"
   end
 
+  add_foreign_key "enrichment_observations", "enrichment_batches"
+  add_foreign_key "enrichment_observations", "push_events"
+  add_foreign_key "github_actors", "enrichment_batches", column: "current_enrichment_batch_id"
+  add_foreign_key "github_actors", "enrichment_observations", column: "latest_observation_id"
+  add_foreign_key "github_repositories", "enrichment_batches", column: "current_enrichment_batch_id"
+  add_foreign_key "github_repositories", "enrichment_observations", column: "latest_observation_id"
   add_foreign_key "ingestion_runs", "event_sources"
   add_foreign_key "push_events", "github_actors", primary_key: "github_id"
   add_foreign_key "push_events", "github_repositories", primary_key: "github_id"

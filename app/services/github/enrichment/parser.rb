@@ -29,6 +29,9 @@ module Github
         end
         return Document.identity_mismatch(expected: github_id, actual: identity) unless identity == github_id
 
+        contract_error = respond_to?(:contract_error, true) ? contract_error(document) : nil
+        return contract_error if contract_error
+
         Document.ok(attributes: attributes_from(document).merge(raw_payload: document))
       end
 
@@ -64,6 +67,17 @@ module Github
 
       def optional_integer(value)
         value if value.is_a?(Integer)
+      end
+
+      def optional_boolean(value)
+        value if value == true || value == false
+      end
+
+      def required_string(value, field)
+        return value if value.is_a?(String) && value.present?
+
+        Document.malformed(error_code: "invalid_contract_field",
+                           error_message: "#{field} is not a non-empty string")
       end
     end
   end

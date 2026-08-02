@@ -2,101 +2,104 @@ module Github
   module Enrichment
     # §8 step 10's enqueue and step 11's reconciliation, as one rule with two callers.
     #
-    # Github::IngestionRunner calls it after a run whose events committed; PR 8's recurring
-    # ReconcilePendingEnrichmentsJob calls it every 60 seconds. Both ask the same question —
-    # "is there durable enrichment work this class could do right now?" — and the answer is
-    # read from the committed entity rows and the ledger, never from the queue. That is what
-    # makes the enqueue a *hint*: §2A's outbox-style recovery says "the committed entity
-    # state is the durable record of pending work". A process killed between the COMMIT and
-    # enqueue can lose that hint while leaving eligible pending entity state discoverable by
-    # a later successful reconciler tick.
+    # Github::IngestionRunner calls it after a run whose events committed; the recurring
+    # ReconcilePendingEnrichmentsJob calls it every 60 seconds. Both ask the same
+    # question — "is there staged enrichment work a cycle could do right now?" — and the
+    # answer is read from the committed entity rows and the two ledgers, never from the
+    # queue. That is what makes the enqueue a *hint*: §2A's outbox-style recovery says
+    # the committed entity state is the durable record of pending work. A process killed
+    # between COMMIT and enqueue loses the hint while leaving the work discoverable by a
+    # later reconciler tick.
     #
-    # **At most one job per class per call**, however deep the backlog. §5 gives each class
-    # one job and Github::EnrichmentRunner enriches at most one entity per call, so the
-    # queue depth that matters is set by §10's hourly allowance (40 at the defaults), not by
-    # how fast jobs can be created. One live page carries ~90 distinct actors and ~90
-    # distinct repositories; enqueuing per created event would put ~2,400 argument-identical
-    # cycles an hour on a queue that can spend 40 requests, and every surplus one would run
-    # the age-out sweep and the fairness reads to be told no. The reconciler's 60-second
-    # cadence is what refills the pipeline instead — it is faster than the budget can be
-    # spent, and it self-limits when the budget is gone.
+    # **At most one cycle per call**, however deep the backlog: EnrichmentCycleJob loops
+    # until a ledger denies, so queue depth is set by the budgets, not by how fast jobs
+    # can be created. This is also the churn gate — a tick with nothing admissible
+    # enqueues nothing, so an exhausted hour creates no cycle jobs and no batch rows.
     #
     # It takes no lock, opens no transaction, and makes no request.
     class Dispatch
-      # Job classes by name, constantized at the call, for EntityType's reason: a constant
-      # holding the class object would pin it across a development reload.
-      JOBS = { actor: "EnrichActorJob", repository: "EnrichRepositoryJob" }.freeze
+      # Constantized at the call, for EntityType's reason: a constant holding the class
+      # object would pin it across a development reload.
+      JOB = "EnrichmentCycleJob".freeze
 
       def self.call(reason:, **options)
         new(**options).call(reason: reason)
       end
 
-      def initialize(configuration: Github.configuration, clock: -> { Time.current }, selector: nil)
+      def initialize(configuration: Github.configuration, clock: -> { Time.current },
+                     admission: nil, batch_claim: nil, detail_claim: nil)
         @configuration = configuration
         @clock = clock
-        @selector = selector || CandidateSelector.new(configuration: configuration)
+        @admission = admission || Admission.new(configuration: configuration)
+        @batch_claim = batch_claim || BatchClaim.new(configuration: configuration)
+        @detail_claim = detail_claim || DetailClaim.new(configuration: configuration)
       end
 
-      # @param reason [String] what asked — "ingestion" or "reconcile". It is on every line
-      #   because the two have different meanings when they disagree: an ingestion dispatch
-      #   that enqueues nothing means the events created no new work, while a reconcile one
-      #   that enqueues means something was committed and never scheduled.
+      # @param reason [String] what asked — "ingestion" or "reconcile". An ingestion
+      #   dispatch that enqueues nothing means the events created no admissible work; a
+      #   reconcile one that enqueues means something committed was never scheduled.
       # @return [Hash] the payload it logged, so a caller can assert on it.
       def call(reason:)
         now = @clock.call
-        schedule = class_schedule(now: now)
-        blocked = !schedule.due?(now: now)
 
-        payload = EntityType.all.each_with_object({}) do |entity_type, counts|
-          enqueue = !blocked && @selector.claimable?(entity_type, now: now)
-          JOBS.fetch(entity_type.key).constantize.perform_later if enqueue
+        search_verdict = @admission.search(now: now)
+        detail_verdict = @admission.detail(now: now)
 
-          counts[:"#{entity_type.key}_enqueued"] = enqueue ? 1 : 0
+        # Pacing is admissible: the cycle can wait it out. Everything else is not.
+        search_admissible = search_verdict.granted? || search_verdict.reason == :search_pacing
+        batch_work = search_admissible &&
+                     EntityType.all.any? { |type| @batch_claim.claimable?(type, now: now) }
+        detail_work = detail_verdict.granted? &&
+                      EntityType.all.any? { |type| @detail_claim.claimable?(type, now: now) }
+
+        # One unfinished cycle is enough. A cycle can outlive the 60-second tick when a
+        # single fetch runs long, and the work it would find is still claimable, so an
+        # unguarded reconciler would enqueue another every minute for as long as the
+        # overrun lasted. The single-thread queue serializes them but does not bound
+        # them: each surplus job is a wake-up that will find the state the running cycle
+        # left behind. Counted rather than assumed — the queue database answers it.
+        pending = cycle_pending?
+        enqueue = (batch_work || detail_work) && !pending
+        JOB.constantize.perform_later if enqueue
+
+        blocked_by = unless enqueue
+          if pending
+            [ :cycle_in_flight ]
+          else
+            [ (search_verdict.reason || :no_batch_work),
+              (detail_verdict.reason || :no_detail_work) ]
+          end
         end
 
-        log(payload.merge(reason: reason, blocked_by: (schedule.binding_component if blocked)).compact, now: now)
+        log({ cycle_enqueued: enqueue ? 1 : 0, reason: reason,
+              blocked_by: blocked_by }.compact)
       end
 
       private
 
-      # §9's effective_enrichment_time with the entity component omitted, because this object
-      # is not choosing an entity — Github::Enrichment::Claim does that, under a lease, after
-      # Github::Enrichment::Fairness has chosen a class. What it can answer cheaply is
-      # whether *any* enrichment is legal right now, and both of the remaining components are
-      # single reads of one row.
-      #
-      # The per-class share is deliberately absent, for the reason
-      # Github::EnrichmentSchedule's own comment gives: a share exhaustion is a denial
-      # relieved by borrowing, not a deferral, so refusing to enqueue on it would withhold
-      # work the ledger would have granted.
-      #
-      # find_by, never bootstrap!: a read path must not create the ledger row. A clean
-      # checkout has no row, every component is nil, and the schedule is due — which is
-      # right, because the first poll is what initializes the window.
-      def class_schedule(now:)
-        budget = GithubApiBudget.find_by(id: GithubApiBudget::SINGLETON_ID)
-
-        EnrichmentSchedule.new(
-          next_retry_at: nil,
-          global_blocked_until: budget&.global_blocked_until,
-          enrichment_class_blocked_until: budget&.enrichment_class_blocked_until(now: now)
-        )
+      # Queued or running, in Solid Queue's own terms: a job row exists until it
+      # finishes, so "not finished" covers both. Failures are excluded — a failed
+      # execution is not going to run again on its own, and treating it as in flight
+      # would stop dispatch permanently.
+      def cycle_pending?
+        SolidQueue::Job.where(class_name: JOB, finished_at: nil)
+                       .where.missing(:failed_execution)
+                       .exists?
+      rescue StandardError => error
+        # The queue database is not the source of truth for enrichment work; if it
+        # cannot answer, fall back to enqueueing rather than stalling the pipeline.
+        Rails.logger.warn(event: "enrichment.dispatch_probe_failed",
+                          error_class: error.class.name)
+        false
       end
 
-      # §11 lists "reconciliation summaries" among the INFO events, and this is that line —
-      # but only when it scheduled something. A tick that enqueued nothing is the ordinary
-      # steady state of an exhausted window, and at 60-second cadence it would emit a line a
-      # minute for the rest of the hour: the volume argument
-      # Github::BudgetLedger#log_class_exhausted and Github::EnrichmentRunner#log already make.
-      #
-      # The summary is PR 7's, unchanged: per-status counts per class, per-class share usage,
-      # the window state, and when enrichment is next due.
-      def log(payload, now:)
-        enqueued = payload.fetch(:actor_enqueued) + payload.fetch(:repository_enqueued)
-        entry = { event: "enrichment.dispatched", **payload,
-                  **Summary.capture(now: now, configuration: @configuration, selector: @selector).to_log }
-
-        enqueued.positive? ? Rails.logger.info(entry) : Rails.logger.debug(entry)
+      # INFO only when it scheduled something: a tick that enqueued nothing is the
+      # ordinary steady state of an exhausted window, and at 60-second cadence it would
+      # emit a line a minute for the rest of the hour. The rich per-stage summary lives
+      # on /status and the one-shot, not on this line.
+      def log(payload)
+        entry = { event: "enrichment.dispatched", **payload }
+        payload.fetch(:cycle_enqueued).positive? ? Rails.logger.info(entry) : Rails.logger.debug(entry)
         payload
       end
     end

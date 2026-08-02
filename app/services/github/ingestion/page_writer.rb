@@ -119,14 +119,12 @@ module Github
 
           # §7 merge rule 3 and Appendix D item 5: activity updates happen **only** when
           # RETURNING produced a row. On a duplicate the transaction still commits, carrying
-          # rule 1's identity refresh and nothing else, so rule 4 — "a duplicate event
-          # replay can never reactivate enrichment" — holds structurally rather than by a
-          # later check. PR 5 owns this gate; PR 7 put the skipped_budget reactivation
-          # behind it, which is why that guarantee needed no code of its own.
+          # rule 1's identity refresh and nothing else. Durable enrichment state remains
+          # unchanged by a duplicate observation.
           next nil if id.nil?
 
           touch_activity(outcome, received_at: received_at)
-          reactivate(outcome, run_id: run_id, received_at: received_at)
+          record_event_observations(outcome, push_event_id: id, received_at: received_at)
           id
         end
 
@@ -145,24 +143,50 @@ module Github
         )
       end
 
-      # §7's reactivation rule, behind the same RETURNING gate as the activity update
-      # above — which is the whole of rule 4's guarantee. Actor before repository, keeping
-      # the ordering the stub upserts established so two concurrent pages touching the
-      # same pair cannot deadlock.
-      #
-      # §11 puts "reactivated" at INFO, and it belongs there rather than at DEBUG: an
-      # entity coming back from skipped_budget is the observable half of §10's bounded
-      # backlog, and the README's Phase B replay check greps for exactly this event to be
-      # absent on a replay.
-      def reactivate(outcome, run_id:, received_at:)
-        [ [ GithubActor, outcome.actor_attributes, :github_actor_id ],
-          [ GithubRepository, outcome.repository_attributes, :github_repository_id ] ].each do |model, attributes, log_key|
-          github_id = attributes.fetch(:github_id)
-          next if model.reactivate_skipped!(github_id: github_id, now: received_at).zero?
+      # The accepted event and both event-native identity fragments commit together. The
+      # entity row coalesces future demand by stable GitHub id; these rows preserve the
+      # distinct raw evidence supplied by every accepted event.
+      def record_event_observations(outcome, push_event_id:, received_at:)
+        raw_event = outcome.raw_payload
 
-          Rails.logger.info(event: "enrichment.reactivated", run_id: run_id, log_key => github_id,
-                            github_event_id: outcome.github_event_id)
+        observations = [
+          [ "actor", outcome.actor_attributes.fetch(:github_id), raw_event.fetch("actor") ],
+          [ "repository", outcome.repository_attributes.fetch(:github_id), raw_event.fetch("repo") ]
+        ].map do |kind, github_id, raw_item|
+          {
+            entity_kind: kind,
+            entity_github_id: github_id,
+            source: "event",
+            observed_at: received_at,
+            raw_payload: raw_item,
+            payload_fingerprint: Events::PayloadFingerprint.fingerprint(raw_item),
+            push_event_id: push_event_id,
+            validation_outcome: "event_native",
+            created_at: received_at,
+            updated_at: received_at
+          }
         end
+
+        EnrichmentObservation.insert_all!(observations)
+
+        mark_derived(GithubActor, outcome.actor_attributes.fetch(:github_id), received_at)
+        mark_derived(GithubRepository, outcome.repository_attributes.fetch(:github_id), received_at)
+      end
+
+      # COALESCE keeps the first-ever instant: a replayed identity refreshes nothing
+      # here, and a repeat event for a known entity does not restart its pipeline clock.
+      def mark_derived(model, github_id, observed_at)
+        model.where(github_id: github_id).update_all(
+          event_native_at: keep_first(model, :event_native_at, observed_at),
+          derived_at: keep_first(model, :derived_at, observed_at),
+          batch_pending_at: keep_first(model, :batch_pending_at, observed_at)
+        )
+      end
+
+      def keep_first(model, column, instant)
+        Arel::Nodes::NamedFunction.new(
+          "COALESCE", [ model.arel_table[column], Arel::Nodes.build_quoted(instant) ]
+        )
       end
 
       def log_persisted(outcome, run_id:, created_id:)
