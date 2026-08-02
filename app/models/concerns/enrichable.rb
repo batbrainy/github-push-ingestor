@@ -2,11 +2,22 @@
 # (IMPLEMENTATION_PLAN.md §7). This concern carries the *data* half — the value set, the
 # enum, and the scope whose WHERE clause matches the partial index.
 #
-# Every other transition is a fetch outcome and lives in Github::Enrichment::EntityState
-# or Github::Enrichment::Claim, both of which are constructed
-# without an executor or a transport so a GitHub request cannot be issued from them.
+# Every other transition is a fetch outcome and lives in the batch and detail runners,
+# which reach the entity rows through Github::Enrichment::BatchClaim and
+# Github::Enrichment::DetailClaim — neither claim holds an executor or a transport, so a
+# GitHub request cannot be issued from them.
 #
-# Two column conventions this state machine relies on, stated here because both invite
+# Two columns carry the *business* outcome and the *pipeline position* separately, and the
+# split is load-bearing (plan Appendix G): enrichment_status is what an operator reports
+# on, enrichment_stage is where the row sits in the staged pipeline. Legal pairs:
+#
+#   pending            → batch_pending, batch_in_flight, detail_pending,
+#                        detail_in_flight, retry_scheduled
+#   retryable_failure  → retry_scheduled, batch_in_flight, detail_pending, detail_in_flight
+#   complete           → contract_complete, and the in-flight/pending stages during a refresh
+#   permanent_failure  → terminal
+#
+# Three column conventions this state machine relies on, stated here because each invites
 # the other reading:
 #
 #   * enrichment_attempts counts attempts **since the last success**, not for the
@@ -14,11 +25,26 @@
 #     Github::Ingestion::PollState's consecutive_failures. Its only two consumers — the
 #     backoff exponent and the log line — both want that number.
 #   * next_retry_at means one thing everywhere: *this entity may not be attempted before
-#     T*. It is simultaneously the failure backoff, a secondary-limit deferral, and the
-#     in-flight claim lease. One meaning is what lets a single predicate exclude
-#     in-flight rows from both candidate pools at once.
+#     T*. It is both the failure backoff and a secondary-limit deferral. It is no longer
+#     the claim lease — leases are explicit now (lease_token, leased_until), so a retry
+#     instant and a live claim can no longer be mistaken for each other.
+#   * detail_attempts counts only fallback fetches, so the bounded core allowance's
+#     ladder is independent of how many times the Search lane batched the row.
 module Enrichable
   extend ActiveSupport::Concern
+
+  # Resting pipeline positions only. Event-native persistence, local derivation,
+  # and batch application are instants (event_native_at / derived_at /
+  # batch_applied_at); a row never rests in them, so they are not stages.
+  ENRICHMENT_STAGES = %w[
+    batch_pending
+    batch_in_flight
+    detail_pending
+    detail_in_flight
+    retry_scheduled
+    contract_complete
+    terminal
+  ].freeze
 
   ENRICHMENT_STATUSES = %w[
     pending
@@ -32,6 +58,8 @@ module Enrichable
 
   included do
     enum :enrichment_status, ENRICHMENT_STATUSES.index_by(&:itself), validate: true
+    enum :enrichment_stage, ENRICHMENT_STAGES.index_by(&:itself), validate: true,
+                              prefix: :stage
 
     # Guards upsert_stub!, which otherwise reaches PostgreSQL directly and turns a
     # malformed envelope into a NotNullViolation that aborts the ingest transaction
@@ -39,6 +67,10 @@ module Enrichable
     validates :github_id, presence: true
 
     scope :enrichment_candidates, -> { where(enrichment_status: CANDIDATE_STATUSES) }
+    scope :durable_enrichment_backlog, -> { where.not(enrichment_stage: %w[contract_complete terminal]) }
+
+    belongs_to :latest_observation, class_name: "EnrichmentObservation", optional: true
+    belongs_to :current_enrichment_batch, class_name: "EnrichmentBatch", optional: true
   end
 
   class_methods do

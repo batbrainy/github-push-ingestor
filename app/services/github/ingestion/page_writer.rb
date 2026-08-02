@@ -124,6 +124,7 @@ module Github
           next nil if id.nil?
 
           touch_activity(outcome, received_at: received_at)
+          record_event_observations(outcome, push_event_id: id, received_at: received_at)
           id
         end
 
@@ -139,6 +140,52 @@ module Github
         GithubRepository.touch_activity!(
           github_id: outcome.repository_attributes.fetch(:github_id),
           seen_at: received_at, event_occurred_at: outcome.occurred_at
+        )
+      end
+
+      # The accepted event and both event-native identity fragments commit together. The
+      # entity row coalesces future demand by stable GitHub id; these rows preserve the
+      # distinct raw evidence supplied by every accepted event.
+      def record_event_observations(outcome, push_event_id:, received_at:)
+        raw_event = outcome.raw_payload
+
+        observations = [
+          [ "actor", outcome.actor_attributes.fetch(:github_id), raw_event.fetch("actor") ],
+          [ "repository", outcome.repository_attributes.fetch(:github_id), raw_event.fetch("repo") ]
+        ].map do |kind, github_id, raw_item|
+          {
+            entity_kind: kind,
+            entity_github_id: github_id,
+            source: "event",
+            observed_at: received_at,
+            raw_payload: raw_item,
+            payload_fingerprint: Events::PayloadFingerprint.fingerprint(raw_item),
+            push_event_id: push_event_id,
+            validation_outcome: "event_native",
+            created_at: received_at,
+            updated_at: received_at
+          }
+        end
+
+        EnrichmentObservation.insert_all!(observations)
+
+        mark_derived(GithubActor, outcome.actor_attributes.fetch(:github_id), received_at)
+        mark_derived(GithubRepository, outcome.repository_attributes.fetch(:github_id), received_at)
+      end
+
+      # COALESCE keeps the first-ever instant: a replayed identity refreshes nothing
+      # here, and a repeat event for a known entity does not restart its pipeline clock.
+      def mark_derived(model, github_id, observed_at)
+        model.where(github_id: github_id).update_all(
+          event_native_at: keep_first(model, :event_native_at, observed_at),
+          derived_at: keep_first(model, :derived_at, observed_at),
+          batch_pending_at: keep_first(model, :batch_pending_at, observed_at)
+        )
+      end
+
+      def keep_first(model, column, instant)
+        Arel::Nodes::NamedFunction.new(
+          "COALESCE", [ model.arel_table[column], Arel::Nodes.build_quoted(instant) ]
         )
       end
 

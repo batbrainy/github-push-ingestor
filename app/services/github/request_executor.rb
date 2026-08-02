@@ -22,6 +22,7 @@ module Github
   class RequestExecutor
     def initialize(transport: Github.transport,
                    ledger: BudgetLedger.new,
+                   search_ledger: SearchBudgetLedger.new,
                    retry_policy: RetryPolicy.new,
                    mode: Github.configuration.mode,
                    max_redirects: Github.configuration.max_redirects,
@@ -30,6 +31,7 @@ module Github
                    clock: -> { Time.current })
       @transport = transport
       @ledger = ledger
+      @search_ledger = search_ledger
       @retry_policy = retry_policy
       @mode = mode.to_sym
       @max_redirects = max_redirects
@@ -98,7 +100,8 @@ module Github
         # which reserve again — stay authorized under the same fairness decision the
         # caller made once (§10). This class does not interpret it and could not
         # compute it: it is a fact about the entity tables.
-        @ledger.reserve!(request.request_class, now: @clock.call, borrow: request.borrow)
+        ledger = ledger_for(request)
+        ledger.reserve!(request.request_class, now: @clock.call, borrow: request.borrow)
 
         # Authoritative, in-chain validation: its return value is what the transport
         # receives, so an unvalidated URL cannot physically reach a socket.
@@ -109,8 +112,8 @@ module Github
         # The class travels with the reconciliation so that a response proving the
         # rate-limit window has moved on can carry this request's debit into the window
         # GitHub actually counted it in.
-        @ledger.reconcile!(rate_limit_from(response), request_class: request.request_class,
-                           now: @clock.call)
+        ledger.reconcile!(rate_limit_from(response), request_class: request.request_class,
+                          now: @clock.call)
 
         log_result(FetchResult.from_response(
           request: request, status: response.status, headers: response.headers,
@@ -149,6 +152,10 @@ module Github
 
     def rate_limit_from(response)
       RateLimitSnapshot.from_headers(response.headers, observed_at: @clock.call)
+    end
+
+    def ledger_for(request)
+      request.search? ? @search_ledger : @ledger
     end
 
     def failure(request, error, attempt:, classification: nil)

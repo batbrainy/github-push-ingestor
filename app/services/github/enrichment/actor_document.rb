@@ -1,7 +1,7 @@
 module Github
   module Enrichment
-    # §7's actor mapping, which is one line long: "(enrichment populates name and
-    # raw_payload)".
+    # The useful-data actor contract intentionally excludes full-profile fields. Search
+    # and detail responses contribute account type plus the complete raw item.
     #
     # login, display_login, api_url and avatar_url are deliberately absent. They are
     # envelope-owned — GithubActor::IDENTITY_MERGE is their only writer, and §7 keeps the
@@ -15,7 +15,11 @@ module Github
         private
 
         def attributes_from(document)
-          { name: optional_string(document["name"]) }
+          { account_type: document["type"] }
+        end
+
+        def contract_error(document)
+          required_string(document["type"], "type") unless document["type"].is_a?(String) && document["type"].present?
         end
       end
     end

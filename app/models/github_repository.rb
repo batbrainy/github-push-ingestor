@@ -28,6 +28,10 @@ class GithubRepository < ApplicationRecord
       CASE WHEN EXCLUDED.updated_at >= github_repositories.updated_at
            THEN EXCLUDED.name END,
       github_repositories.name),
+    owner_login = COALESCE(
+      CASE WHEN EXCLUDED.updated_at >= github_repositories.updated_at
+           THEN EXCLUDED.owner_login END,
+      github_repositories.owner_login),
     api_url = COALESCE(
       CASE WHEN EXCLUDED.updated_at >= github_repositories.updated_at
            THEN EXCLUDED.api_url END,
@@ -39,6 +43,7 @@ class GithubRepository < ApplicationRecord
   # from aborting the ingest transaction before it can be quarantined.
   def self.upsert_stub!(github_id:, full_name:, name: nil, api_url: nil,
                         now: Time.current)
+    owner_login = full_name.to_s.split("/", 2).first if full_name.to_s.include?("/")
     new(github_id: github_id, full_name: full_name, name: name,
         api_url: api_url).validate!
 
@@ -47,6 +52,7 @@ class GithubRepository < ApplicationRecord
         github_id: github_id,
         full_name: full_name,
         name: name,
+        owner_login: owner_login,
         api_url: api_url,
         created_at: now,
         updated_at: now

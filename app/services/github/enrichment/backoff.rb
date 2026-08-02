@@ -26,25 +26,33 @@ module Github
     # retry sooner than the floor, and the floor is the one property §10 states
     # numerically.
     class Backoff
+      # Issue #45 makes the retry ladder configurable; these remain as the documented
+      # defaults ENRICHMENT_RETRY_BASE_SECONDS / ENRICHMENT_RETRY_MAX_SECONDS start from.
       BASE_SECONDS = 60
       MAX_SECONDS = 3600
       JITTER_FRACTION = 0.25
 
       # @param random [Random] injected so a spec asserts the schedule without sleeping.
-      def initialize(random: Random.new)
+      def initialize(random: Random.new, base_seconds: nil, max_seconds: nil,
+                     configuration: nil)
+        configuration ||= Github.configuration if base_seconds.nil? || max_seconds.nil?
+        @base_seconds = base_seconds || configuration.enrichment_retry_base_seconds
+        @max_seconds = max_seconds || configuration.enrichment_retry_max_seconds
         @random = random
       end
 
+      attr_reader :base_seconds, :max_seconds
+
       # @param attempts [Integer] the count *including* the attempt being scheduled for,
-      #   so the first failure waits BASE_SECONDS rather than half of it.
+      #   so the first failure waits base_seconds rather than half of it.
       # @return [Float] seconds
       def delay_for(attempts)
         exponent = [ attempts.to_i, 1 ].max - 1
-        base = [ BASE_SECONDS * (2**exponent), MAX_SECONDS ].min
+        base = [ base_seconds * (2**exponent), max_seconds ].min
 
-        # Capped after jitter, so MAX_SECONDS is an honest bound rather than a bound plus
+        # Capped after jitter, so max_seconds is an honest bound rather than a bound plus
         # up to 25%.
-        [ base + (@random.rand * base * JITTER_FRACTION), MAX_SECONDS.to_f ].min
+        [ base + (@random.rand * base * JITTER_FRACTION), max_seconds.to_f ].min
       end
 
       # @return [Time]

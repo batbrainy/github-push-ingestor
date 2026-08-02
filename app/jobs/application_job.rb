@@ -8,7 +8,7 @@
 # **No retry_on, deliberately, anywhere in this application.** Every job here can spend
 # GitHub request budget, and both retry ladders already exist and are durable:
 # Github::Ingestion::PollState writes consecutive_failures + retry_not_before_at for a
-# source, and Github::Enrichment::EntityState writes next_retry_at for an entity. A second,
+# source, and the enrichment runners write next_retry_at for an entity. A second,
 # uncoordinated Active Job ladder would re-poll a source whose backoff was just written and
 # spend the hourly allowance twice on the same failure. The 60-second recurring tick is the
 # retry — an escaped exception is a defect, so it fails the execution, job.failed says why,

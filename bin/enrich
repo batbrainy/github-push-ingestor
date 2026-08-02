@@ -9,10 +9,10 @@
 # ends a process.
 #
 # Separate from bin/ingest rather than a flag on it, because §5 gives enrichment its own
-# path: it belongs to no event source, never takes a source lock, and spends a different
-# class of the budget. EnrichActorJob and EnrichRepositoryJob wrap the same
-# Github::EnrichmentRunner one cycle at a time; this stays the operator's handle on it,
-# for a burst of cycles on demand rather than the worker's budgeted trickle.
+# path: it belongs to no event source, never takes a source lock, and spends the search
+# ledger plus the bounded core detail allowance. EnrichmentCycleJob drives the same
+# batch and detail runners on the worker's cadence; this stays the operator's handle on
+# them, for a bounded burst of requests on demand rather than the worker's paced loop.
 #
 # config/environment rather than config/boot: this command uses models, so Rails has to be
 # initialized rather than merely loadable.

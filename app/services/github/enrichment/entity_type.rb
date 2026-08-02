@@ -8,19 +8,22 @@ module Github
     # A memoised class method rather than a constant assigned in the class body: a
     # constant would pin the model class objects across a development reload, which is the
     # same reason Github::EventSources::Base memoises its registry.
-    class EntityType < Data.define(:key, :model, :request_class, :document, :log_key)
+    class EntityType < Data.define(:key, :model, :request_class, :search_request_class,
+                                   :document, :log_key)
       class << self
         def all
           @all ||= [
             new(key: :actor, model: GithubActor, request_class: :actor,
+                search_request_class: :actor_search,
                 document: ActorDocument, log_key: :github_actor_id),
             new(key: :repository, model: GithubRepository, request_class: :repository,
+                search_request_class: :repository_search,
                 document: RepositoryDocument, log_key: :github_repository_id)
           ].freeze
         end
 
         # @param key [Symbol, String, Class] a key, or the model class itself — which is
-        #   what Github::EnrichmentRunner#call(entity_class:) is handed.
+        #   what the runners' #call(entity_class:) is handed.
         # @return [EntityType]
         def fetch(key)
           resolve(key) ||
