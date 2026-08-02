@@ -431,7 +431,7 @@ Single-row global ledger (constrained singleton), through which **every** outbou
 - `window_initialized_at`
 - `poll_allowance`, `poll_used`
 - `enrichment_allowance`, `enrichment_used` — since Appendix G these budget the
-  **detail-fallback** lane only (`CORE_DETAIL_FALLBACK_ALLOWANCE`, default 4); the
+  **detail-fallback** lane only (`CORE_DETAIL_FALLBACK_ALLOWANCE`, default 40); the
   batch normal path spends the separate search ledger
 - `actor_share_used`, `repository_share_used` (fairness accounting — Section 10)
 - `reserve`
@@ -877,14 +877,15 @@ ceil(3600 / 300) × 1 × 1 = 12 poll attempts/hour
 | Allocation | Default |
 |---|---:|
 | Scheduled polling | 12 request-attempts/hour |
-| Detail fallback (bounded core lane — Appendix G) | up to 4 request-attempts/hour |
+| Detail fallback (bounded core lane — Appendix G) | up to 40 request-attempts/hour |
 | Intentionally unspent reserve | 8 requests/hour |
-| **Deliberately unspent remainder** | 36 requests/hour |
 | **Total** | **60 requests/hour** |
 
-The remainder is deliberately unspent: since Appendix G, normal-path enrichment runs on
-the **search** rate-limit resource, not on core, so leaving core headroom costs enrichment
-nothing and protects polling from co-tenant pressure. The stored
+The three lanes fill the limit exactly. Normal-path enrichment does not appear because
+since Appendix G it runs on the **search** rate-limit resource, not on core; the core
+detail lane funds only the residue Search does not return, measured at roughly 2% of
+arrivals. Polling keeps priority: a configuration that raises the poll allowance clamps
+the fallback lane rather than over-committing the limit. The stored
 `enrichment_allowance`/`enrichment_used` pair now budgets the detail-fallback lane.
 
 Startup validation **rejects** any configuration where
@@ -963,7 +964,7 @@ fairness shares with explicit rounding:
 actor_guarantee      = floor(enrichment_allowance × ACTOR_ENRICHMENT_SHARE)
 repository_guarantee = enrichment_allowance − actor_guarantee
 
-Defaults: 4 × 0.50 → 2 actor / 2 repository detail-fallback attempts/hour
+Defaults: 40 × 0.50 → 20 actor / 20 repository detail-fallback attempts/hour
 
 Borrowing: a class may borrow the other’s unused detail capacity only when the
 other class has no CURRENTLY CLAIMABLE detail candidate (not merely no rows).
@@ -1074,9 +1075,9 @@ Never disable the event source because one enrichment target disappeared.
 On the **core** resource:
 
 1. Polling for new events (from `poll_attempt_allowance`)
-2. Detail fallback, only within its explicit `CORE_DETAIL_FALLBACK_ALLOWANCE` (4/hour),
+2. Detail fallback, only within its explicit `CORE_DETAIL_FALLBACK_ALLOWANCE` (40/hour),
    under the fairness guarantees — it can never take the polling allocation
-3. Nothing else spends core; the remainder is deliberately unspent headroom
+3. Nothing else spends core; polling and the reserve are never borrowed against
 
 The **search** resource is independent: batch enrichment — backlog first, then refresh
 under Appendix G's composition rule — spends the per-minute search ledger and competes
@@ -1649,7 +1650,7 @@ with a limit of 10; and joining exact qualifiers with `OR` produced HTTP 422.
 - **Payload-URL detail fallback, bounded.** Only items a batch could not settle —
   missing, renamed, identity-mismatched, or contract-invalid — fetch their stored
   payload-provided `api_url` through the core ledger's
-  `CORE_DETAIL_FALLBACK_ALLOWANCE` (4/hour). The fallback never constructs a URL from an
+  `CORE_DETAIL_FALLBACK_ALLOWANCE` (40/hour). The fallback never constructs a URL from an
   identifier and never touches the polling allocation.
 - **Dual ledgers.** `github_api_budget` (core: 12 poll + 4 detail fallback + 8 reserve
   ≤ 60, remainder deliberately unspent) and `github_search_budget` (per-minute search)

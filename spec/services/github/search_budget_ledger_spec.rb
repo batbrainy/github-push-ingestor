@@ -407,6 +407,9 @@ RSpec.describe Github::SearchBudgetLedger do
     end
   end
 
+  # Primary exhaustion of this resource only. A secondary limit is IP-scoped and is
+  # decided once by Github::RateLimitPolicy for both resources, so it does not arrive
+  # through here — see "the two resources and one IP" below.
   describe "#block_from!" do
     def limited(status: 403, **headers)
       request = Github::Request.new(url: "https://api.github.com/search/users?q=user%3Aoctocat&per_page=1",
@@ -416,22 +419,17 @@ RSpec.describe Github::SearchBudgetLedger do
                                         body: "", duration_ms: 1.0)
     end
 
-    # 403 with a non-zero remaining classifies as :secondary_limited; with "0" it is
-    # :rate_limited — the same discriminator Github::ResponseClassifier applies to core.
-    it "prefers Retry-After, the server's explicit instruction" do
-      active_window
-
-      ledger.block_from!(limited("retry-after" => "120",
-                                 "x-ratelimit-reset" => window_reset.to_i.to_s),
-                         now: frozen_time)
-
-      expect(budget.blocked_until).to eq(frozen_time + 120)
+    # 403 with x-ratelimit-remaining "0" classifies as :rate_limited — the same
+    # discriminator Github::ResponseClassifier applies to core.
+    def exhausted(**headers)
+      limited(**{ "x-ratelimit-remaining" => "0" }.merge(headers.transform_keys(&:to_s)))
     end
 
-    it "falls back to the reset header when no Retry-After was sent" do
+    it "blocks until the reset the exhausted response reported" do
       active_window
 
-      ledger.block_from!(limited("x-ratelimit-reset" => window_reset.to_i.to_s), now: frozen_time)
+      ledger.block_from!(exhausted("x-ratelimit-reset" => window_reset.to_i.to_s),
+                         now: frozen_time)
 
       expect(budget.blocked_until).to eq(window_reset)
     end
@@ -439,18 +437,9 @@ RSpec.describe Github::SearchBudgetLedger do
     it "falls back to one search window when the response named no instant at all" do
       active_window
 
-      ledger.block_from!(limited, now: frozen_time)
+      ledger.block_from!(exhausted, now: frozen_time)
 
       expect(budget.blocked_until).to eq(frozen_time + described_class::SEARCH_WINDOW_SECONDS)
-    end
-
-    it "blocks on a primary exhaustion as well as a secondary limit" do
-      active_window
-
-      ledger.block_from!(limited("x-ratelimit-remaining" => "0", "retry-after" => "90"),
-                         now: frozen_time)
-
-      expect(budget.blocked_until).to eq(frozen_time + 90)
     end
 
     # GREATEST ignores NULL, so a block only ever moves later — a short block landing
@@ -458,19 +447,21 @@ RSpec.describe Github::SearchBudgetLedger do
     it "only ever moves a block later" do
       active_window
 
-      ledger.block_from!(limited("retry-after" => "300"), now: frozen_time)
-      ledger.block_from!(limited("retry-after" => "60"), now: frozen_time)
+      ledger.block_until!(until_at: frozen_time + 300, now: frozen_time)
+      ledger.block_until!(until_at: frozen_time + 60, now: frozen_time)
       expect(budget.blocked_until).to eq(frozen_time + 300)
 
-      ledger.block_from!(limited("retry-after" => "600"), now: frozen_time)
+      ledger.block_until!(until_at: frozen_time + 600, now: frozen_time)
       expect(budget.blocked_until).to eq(frozen_time + 600)
     end
 
-    it "ignores every classification that is not a rate limit" do
+    it "ignores every classification that is not this resource's own exhaustion" do
       active_window
 
       ledger.block_from!(limited(status: 500), now: frozen_time)
       ledger.block_from!(limited(status: 200), now: frozen_time)
+      # A secondary limit reaches the row through the policy, not through here.
+      ledger.block_from!(limited("retry-after" => "60"), now: frozen_time)
 
       expect(budget.blocked_until).to be_nil
     end
@@ -480,66 +471,105 @@ RSpec.describe Github::SearchBudgetLedger do
   # separate PostgreSQL sessions reserving at once must serialise on the row, with no
   # lost debit and no deadlock. Transactional tests are off for the reason
   # spec/support/concurrency_helpers.rb documents, paid for with explicit cleanup.
-  # §10: a secondary rate limit is IP-scoped, so it stops every live request rather
-  # than only the resource that provoked it. Two ledgers meter two resources, but they
-  # share one outbound address — a block written by either has to bind both.
-  describe "the global block both ledgers share" do
+  # §10: a secondary rate limit is IP-scoped, so it stops every live request rather than
+  # only the resource that provoked it. A *primary* exhaustion is the opposite — it bounds
+  # the resource that reported it and nothing else. Github::RateLimitPolicy is the single
+  # decider for both, so the escalation ladder, the one-minute floor, the one-hour cap and
+  # the streak counter live in one place rather than being reimplemented per ledger.
+  describe "the two resources and one IP" do
     def search_request
       Github::Request.new(url: "https://api.github.com/search/users?q=user%3Aoctocat&per_page=1",
                           request_class: :actor_search)
     end
 
-    it "refuses a Search reservation while the core ledger holds a global block" do
-      active_window
-      Github::BudgetLedger.new.bootstrap!(now: frozen_time)
-      Github::BudgetLedger.new.block_globally!(until_at: frozen_time + 300,
-                                               reason: "secondary_limit", now: frozen_time)
+    def policy = Github::RateLimitPolicy.new(search_ledger: ledger)
 
-      expect { ledger.reserve!(:actor_search, now: frozen_time) }
-        .to raise_error(Github::Errors::BudgetExhausted) { |error|
-          expect(error.reason).to eq(:globally_blocked)
-        }
-      expect(budget.used).to eq(0)
+    def search_response(status:, **headers)
+      Github::FetchResult.from_response(request: search_request, status: status,
+                                        headers: headers.transform_keys(&:to_s),
+                                        body: "", duration_ms: 1.0)
     end
 
-    it "grants the reservation once that block has expired" do
+    # The regression this replaced: reading github_api_budget.global_blocked_until made
+    # *core* primary exhaustion stop Search for the rest of the hour. That column carries
+    # primary exhaustion and reserve breaches as well as secondary limits, and neither of
+    # the first two says anything about the Search resource.
+    it "keeps searching while core is merely out of its own hourly requests" do
       active_window
       Github::BudgetLedger.new.bootstrap!(now: frozen_time)
-      Github::BudgetLedger.new.block_globally!(until_at: frozen_time + 300,
-                                               reason: "secondary_limit", now: frozen_time)
+      Github::RateLimitPolicy.new(search_ledger: ledger).apply!(
+        Github::FetchResult.from_response(
+          request: Github::Request.new(url: "https://api.github.com/events?per_page=100",
+                                       request_class: :poll),
+          status: 403,
+          headers: { "x-ratelimit-remaining" => "0",
+                     "x-ratelimit-reset" => (frozen_time + 3600).to_i.to_s },
+          body: "", duration_ms: 1.0
+        ), now: frozen_time
+      )
 
-      expect { ledger.reserve!(:actor_search, now: frozen_time + 301) }.not_to raise_error
+      expect(current_budget.global_blocked_until).to eq(frozen_time + 3600)
+      expect(budget.blocked_until).to be_nil
+      expect { ledger.reserve!(:actor_search, now: frozen_time) }.not_to raise_error
     end
 
-    # The mirror image: a secondary limit provoked by Search stops polling too.
-    it "writes the core global block when a Search response is secondary-limited" do
+    # The condition that genuinely is IP-scoped stops both, whichever resource saw it.
+    it "stops Search when a poll reports a secondary limit" do
       active_window
       Github::BudgetLedger.new.bootstrap!(now: frozen_time)
-      secondary = Github::FetchResult.from_response(
-        request: search_request, status: 403,
-        headers: { "x-ratelimit-remaining" => "5", "retry-after" => "60" },
+      poll_secondary = Github::FetchResult.from_response(
+        request: Github::Request.new(url: "https://api.github.com/events?per_page=100",
+                                     request_class: :poll),
+        status: 403, headers: { "x-ratelimit-remaining" => "5", "retry-after" => "90" },
         body: "", duration_ms: 1.0
       )
 
-      ledger.block_from!(secondary, now: frozen_time)
+      Github::RateLimitPolicy.new(search_ledger: ledger).apply!(poll_secondary, now: frozen_time)
 
-      expect(current_budget.global_blocked_until).to eq(frozen_time + 60)
-      expect(budget.blocked_until).to eq(frozen_time + 60)
+      expect(budget.blocked_until).to eq(frozen_time + 90)
+      expect { ledger.reserve!(:actor_search, now: frozen_time) }
+        .to raise_error(Github::Errors::BudgetExhausted) { |error|
+          expect(error.reason).to eq(:search_blocked)
+        }
     end
 
-    # A primary Search exhaustion bounds only this resource. Blocking polling on it
-    # would let the search lane starve event capture, which no quota rule permits.
+    it "stops polling when a Search response reports a secondary limit" do
+      active_window
+      Github::BudgetLedger.new.bootstrap!(now: frozen_time)
+
+      policy.apply!(search_response(status: 403, "x-ratelimit-remaining" => "5",
+                                    "retry-after" => "90"),
+                    now: frozen_time, resource: :search)
+
+      expect(current_budget.global_blocked_until).to eq(frozen_time + 90)
+      expect(budget.blocked_until).to eq(frozen_time + 90)
+    end
+
+    # The escalation ladder is the policy's, so a Search limit advances the same streak
+    # a poll's would — and the next good Search response ends it.
+    it "advances and clears the shared secondary streak" do
+      active_window
+      Github::BudgetLedger.new.bootstrap!(now: frozen_time)
+
+      policy.apply!(search_response(status: 403, "x-ratelimit-remaining" => "5"),
+                    now: frozen_time, resource: :search)
+      expect(current_budget.consecutive_secondary_limits).to eq(1)
+      # No Retry-After, so the block is the policy's floor rather than nothing at all.
+      expect(budget.blocked_until).to be >= frozen_time + Github::RateLimitPolicy::MIN_BLOCK_SECONDS
+
+      policy.apply!(search_response(status: 200), now: frozen_time, resource: :search)
+      expect(current_budget.consecutive_secondary_limits).to eq(0)
+    end
+
+    # A spent Search minute must not cost polling its hour.
     it "leaves polling alone when Search merely exhausted its own limit" do
       active_window
       Github::BudgetLedger.new.bootstrap!(now: frozen_time)
-      exhausted = Github::FetchResult.from_response(
-        request: search_request, status: 403,
-        headers: { "x-ratelimit-remaining" => "0",
-                   "x-ratelimit-reset" => window_reset.to_i.to_s },
-        body: "", duration_ms: 1.0
-      )
+      response = search_response(status: 403, "x-ratelimit-remaining" => "0",
+                                 "x-ratelimit-reset" => window_reset.to_i.to_s)
 
-      ledger.block_from!(exhausted, now: frozen_time)
+      policy.apply!(response, now: frozen_time, resource: :search)
+      ledger.block_from!(response, now: frozen_time)
 
       expect(current_budget.global_blocked_until).to be_nil
       expect(budget.blocked_until).to eq(window_reset)

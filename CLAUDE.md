@@ -86,7 +86,7 @@ Entity rows are durable work, coalesced by stable GitHub ID, selected FIFO by
 `SEARCH_BATCH_SIZE` repeated exact `user:`/`repo:` qualifiers — never joined with `OR` —
 on the minute-scoped search ledger (ceiling 10, reserve 2, 6-second pacing). The
 payload-URL detail fallback serves only missing/renamed/mismatched/contract-invalid batch
-items and is bounded by `CORE_DETAIL_FALLBACK_ALLOWANCE` (4/hour); it never takes the
+items and is bounded by `CORE_DETAIL_FALLBACK_ALLOWANCE` (40/hour); it never takes the
 polling allocation. Quota, pacing, reserve, and fairness denials defer work — they never
 terminate an entity. Batch results apply only on a stable-ID match. Observations are
 append-only; a refresh repoints the projection and never overwrites retained evidence.

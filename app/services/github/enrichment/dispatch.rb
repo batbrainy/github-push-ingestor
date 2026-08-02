@@ -52,12 +52,23 @@ module Github
         detail_work = detail_verdict.granted? &&
                       EntityType.all.any? { |type| @detail_claim.claimable?(type, now: now) }
 
-        enqueue = batch_work || detail_work
+        # One unfinished cycle is enough. A cycle can outlive the 60-second tick when a
+        # single fetch runs long, and the work it would find is still claimable, so an
+        # unguarded reconciler would enqueue another every minute for as long as the
+        # overrun lasted. The single-thread queue serializes them but does not bound
+        # them: each surplus job is a wake-up that will find the state the running cycle
+        # left behind. Counted rather than assumed — the queue database answers it.
+        pending = cycle_pending?
+        enqueue = (batch_work || detail_work) && !pending
         JOB.constantize.perform_later if enqueue
 
         blocked_by = unless enqueue
-          [ (search_verdict.reason || :no_batch_work),
-            (detail_verdict.reason || :no_detail_work) ]
+          if pending
+            [ :cycle_in_flight ]
+          else
+            [ (search_verdict.reason || :no_batch_work),
+              (detail_verdict.reason || :no_detail_work) ]
+          end
         end
 
         log({ cycle_enqueued: enqueue ? 1 : 0, reason: reason,
@@ -65,6 +76,22 @@ module Github
       end
 
       private
+
+      # Queued or running, in Solid Queue's own terms: a job row exists until it
+      # finishes, so "not finished" covers both. Failures are excluded — a failed
+      # execution is not going to run again on its own, and treating it as in flight
+      # would stop dispatch permanently.
+      def cycle_pending?
+        SolidQueue::Job.where(class_name: JOB, finished_at: nil)
+                       .where.missing(:failed_execution)
+                       .exists?
+      rescue StandardError => error
+        # The queue database is not the source of truth for enrichment work; if it
+        # cannot answer, fall back to enqueueing rather than stalling the pipeline.
+        Rails.logger.warn(event: "enrichment.dispatch_probe_failed",
+                          error_class: error.class.name)
+        false
+      end
 
       # INFO only when it scheduled something: a tick that enqueued nothing is the
       # ordinary steady state of an exhausted window, and at 60-second cadence it would

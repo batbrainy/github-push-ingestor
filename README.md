@@ -81,7 +81,7 @@ What it does, running:
 ten entities per GitHub Search request on Search's own per-minute budget (10 ceiling, 2
 reserved, 6-second pacing); only items a batch could not settle fall back to individual
 payload-URL fetches inside a bounded core allowance of 4 per hour. The core ledger keeps
-12 requests for polling and 8 in reserve, leaving the rest deliberately unspent. Entity
+12 requests for polling, 8 in reserve, and the rest for the detail-fallback lane. Entity
 rows remain actionable until enrichment satisfies the useful-data contract or an
 entity-specific terminal outcome is established; quota exhaustion, pacing, and reserve
 denials only defer them. Selection remains FIFO, oldest-first within each class, and delay
@@ -570,11 +570,12 @@ plan §9's rule that every fetched page is processed in full and `github_event_i
 uniqueness absorbs the overlap — there is no stop-on-known-event, because
 documented event latency is 30 seconds to 6 hours and a delayed event can surface
 beside one already seen. And **raising the cap is not free**: at
-`MAX_PAGES_PER_POLL=3` the poll allowance becomes 12 × 3 = 36 attempts an hour, and the
-core headroom left deliberately unspent shrinks from 36 to 60 − 36 − 8 − 4 = 12; one more
-page and it is zero, and at 5 the formula is infeasible and boot refuses. Since plan
-Appendix G, capture depth spends headroom rather than enrichment capacity — batch
-enrichment lives on the separate search budget.
+`MAX_PAGES_PER_POLL=2` the poll allowance becomes 12 × 2 = 24 attempts an hour, and the
+three core lanes ask for 24 + 40 + 8 = 72 of 60 — over-committed, so the detail-fallback
+allowance is clamped down to what is left (60 − 8 − 24 = 28). At 5 pages polling alone
+would take the whole limit and boot refuses. Since plan Appendix G, capture depth trades
+against the *fallback* lane rather than against enrichment as a whole — batch enrichment
+lives on the separate search budget.
 
 At `MAX_PAGES_PER_POLL=2` the counts are identical except `Pages fetched: 2` — page
 3 is empty — and the stop reason on the `ingestion.pagination_stopped` debug line
@@ -1185,11 +1186,13 @@ feasible  ⇔  poll_attempt_allowance + RATE_LIMIT_RESERVE
              + CORE_DETAIL_FALLBACK_ALLOWANCE <= rate_limit
 ```
 
-With the defaults: 12 poll attempts, 4 detail-fallback attempts, and 8 in reserve —
-24 of GitHub's unauthenticated 60, with **36 core requests an hour deliberately
-unspent**. Enrichment's normal path does not appear in this formula because it does not
-spend core at all. **The process refuses to boot** if the three core lanes together
-exceed the limit.
+With the defaults: 12 poll attempts, 40 detail-fallback attempts, and 8 in reserve —
+**exactly GitHub's unauthenticated 60**. Enrichment's normal path does not appear in this
+formula because it does not spend core at all; the 40 is what the ~2% of entities Search
+does not return need, measured in
+[the live run](docs/evidence/2026-08-02-live-staged-batch-enrichment.md). **The process
+refuses to boot** if the three core lanes together exceed the limit, and clamps the
+fallback lane when polling is raised.
 
 The detail-fallback allowance is then split by `ACTOR_ENRICHMENT_SHARE` (plan §10):
 
@@ -1198,25 +1201,26 @@ actor_guarantee      = floor(enrichment_allowance x ACTOR_ENRICHMENT_SHARE)
 repository_guarantee = enrichment_allowance - actor_guarantee
 ```
 
-With the defaults: 2 actor and 2 repository detail attempts an hour. The remainder
+With the defaults: 20 actor and 20 repository detail attempts an hour. The remainder
 always goes to repositories, because the formula floors one side and subtracts for
 the other — so the two always add up to the whole allowance. A class may borrow the
 other's unused detail capacity when the other has no claimable detail candidate.
 
 ### The core budget table
 
-At limit 60, reserve 8, detail allowance 4, cadence 300s, one source — the only variable
-is page depth:
+At limit 60, reserve 8, configured detail allowance 40, cadence 300s, one source — the
+only variable is page depth. Polling has priority, so a deeper poll clamps the fallback
+lane rather than over-committing the limit:
 
-| `MAX_PAGES_PER_POLL` | Poll allowance | Detail fallback | Reserve | Deliberately unspent |
+| `MAX_PAGES_PER_POLL` | Poll allowance | Detail fallback | Reserve | Unspent |
 |---|---|---|---|---|
-| 1 (default) | 12 | 4 | 8 | 36 |
-| 2 | 24 | 4 | 8 | 24 |
-| 3 | 36 | 4 | 8 | 12 |
-| 4 | 48 | 4 | 8 | 0 |
+| 1 (default) | 12 | 40 | 8 | 0 |
+| 2 | 24 | 28 (clamped) | 8 | 0 |
+| 3 | 36 | 16 (clamped) | 8 | 0 |
+| 4 | 48 | 4 (clamped) | 8 | 0 |
 | 5 | 60 | — | — | **refuses to boot** |
 
-Capture depth now spends the unspent headroom rather than enrichment capacity: batch
+Capture depth now clamps the detail-fallback lane rather than enrichment as a whole: batch
 enrichment lives on the search budget, so deeper polls no longer starve it — the formula
 simply becomes infeasible at 5 pages.
 
@@ -1323,10 +1327,10 @@ is [`.env.example`](.env.example).
 | `MAX_REDIRECTS` | `2` | Redirect hops followed per request, each re-validated and separately reserved |
 | `SOURCE_LOCK_WAIT_SECONDS` | `30` | How long the one-shot waits for a busy source lock; the poller attempts once (plan §9) |
 | `POLL_INTERVAL_SECONDS` | `300` | The poll cadence, and an allowance-formula input. A source polled at T is due again at T + this; an unforced run before then is deferred rather than made. The worker's 60-second tick checks the schedule; it does not replace it (plan §9, §10) |
-| `MAX_PAGES_PER_POLL` | `1` | How many `Link`-followed pages one poll may fetch, and an allowance-formula input. Raising it spends the deliberately unspent core headroom on capture depth — see [the core budget table](#the-core-budget-table) (plan §9, §10) |
+| `MAX_PAGES_PER_POLL` | `1` | How many `Link`-followed pages one poll may fetch, and an allowance-formula input. Raising it takes core capacity from the detail-fallback lane, which is clamped down to fit — see [the core budget table](#the-core-budget-table) (plan §9, §10) |
 | `ENABLED_LIVE_SOURCE_COUNT` | `1` | Allowance-formula input: live sources sharing one per-IP budget. **A fallback rather than the authority** — at window initialization and rollover the formula counts the enabled, in-service `event_sources` rows of the running mode and uses that instead, falling back to this value only when there are none yet. A disagreement is logged as `budget.source_allocation_drift` (plan §10, [ADR 0009](docs/adr/0009-runtime-source-allocation-and-shared-ip-observability.md)) |
 | `RATE_LIMIT_RESERVE` | `8` | Core requests per hour left deliberately unspent (plan §10) |
-| `CORE_DETAIL_FALLBACK_ALLOWANCE` | `4` | The bounded core lane for individual detail fetches — only batch items that came back missing, renamed, mismatched, or contract-invalid reach it. Third term of the core feasibility rule; can never take the polling allocation (plan §10, Appendix G) |
+| `CORE_DETAIL_FALLBACK_ALLOWANCE` | `40` | The bounded core lane for individual detail fetches — only batch items that came back missing, renamed, mismatched, or contract-invalid reach it. Third term of the core feasibility rule; can never take the polling allocation (plan §10, Appendix G) |
 | `SEARCH_REQUEST_CEILING` | `10` | Per-minute Search request ceiling — the observed unauthenticated header limit (Appendix G) |
 | `SEARCH_SAFETY_RESERVE` | `2` | Search requests per minute never spent, leaving 8 spendable |
 | `SEARCH_BATCH_SIZE` | `10` | Exact `user:`/`repo:` qualifiers per Search request, capped at 10 and never `OR`-joined |

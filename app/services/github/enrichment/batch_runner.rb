@@ -22,12 +22,14 @@ module Github
       def initialize(executor: Github.executor, configuration: Github.configuration,
                      claim: BatchClaim.new(configuration: configuration),
                      search_ledger: SearchBudgetLedger.new(configuration: configuration),
+                     rate_limit_policy: RateLimitPolicy.new(search_ledger: search_ledger),
                      backoff: Backoff.new(configuration: configuration),
                      clock: -> { Time.current })
         @executor = executor
         @configuration = configuration
         @claim = claim
         @search_ledger = search_ledger
+        @rate_limit_policy = rate_limit_policy
         @backoff = backoff
         @clock = clock
       end
@@ -38,6 +40,10 @@ module Github
         return idle(entity_type) if lease.nil?
 
         fetched = @executor.call(request_for(lease))
+        # The policy owns the IP-scoped verdict — a secondary limit here stops polling
+        # too, escalates the shared streak, and is cleared by the next good response.
+        # The search ledger records only this resource's own primary exhaustion.
+        @rate_limit_policy.apply!(fetched, now: @clock.call, resource: :search)
         @search_ledger.block_from!(fetched, now: @clock.call)
         finish(lease, fetched)
       rescue StandardError => error

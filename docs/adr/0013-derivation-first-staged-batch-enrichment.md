@@ -44,7 +44,7 @@ Adopt **derivation-first, lossless staged batch enrichment** (plan Appendix G; i
 3. **Payload-URL detail fallback is the amendment, not the rule.** Only missing,
    renamed, identity-mismatched, or contract-invalid batch items fetch their stored
    payload-provided `api_url`, through the core ledger's
-   `CORE_DETAIL_FALLBACK_ALLOWANCE` (4/hour). No identifier is ever turned into a
+   `CORE_DETAIL_FALLBACK_ALLOWANCE` (40/hour). No identifier is ever turned into a
    constructed detail URL; the polling allocation is never touched.
 4. **Dual ledgers.** `github_api_budget` (core, hourly: 12 poll + 4 detail + 8 reserve
    ≤ 60, remainder deliberately unspent) and `github_search_budget` (search, per-minute:

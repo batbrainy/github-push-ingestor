@@ -235,7 +235,11 @@ changed" below.
 
 ```text
 Run window:        2026-08-02T20:35:29Z → 2026-08-02T21:01:30Z  (26 minutes)
-Samples:           53 (60s cadence), 24 of them past CATCH_UP_MIN_SAMPLE_SECONDS
+Samples:           53, 24 of them past CATCH_UP_MIN_SAMPLE_SECONDS. Two sampling
+                   loops were running against the same endpoint, so the effective
+                   cadence was ~30s rather than the 60s each loop used; the
+                   duplicates are harmless to the counts below, which are read from
+                   the last sample rather than summed across samples.
 Trailing window:   ENRICHMENT_METRICS_WINDOW_SECONDS = 3600
 
 Arrivals:          872 entities
@@ -257,9 +261,11 @@ Core ledger:       poll_used 2 of 12, detail_fallback used 4 of 4
 
 **Verdict across the 24 mature samples: 8 `keeping_up`, 16 `not_keeping_up`.** The
 verdict oscillates, and the reason is visible in the numbers rather than a mystery: the
-Search lane settled 872 entities in 92 requests and drained each five-minute arrival
-burst within roughly two minutes, while a residue that Search does not return — 1.6% of
-requested items — waits on the detail lane. With that lane capped at 4 requests an hour,
+Search lane requested 872 items across 92 requests and had 858 of them returned and
+applied directly, sending the other 14 to the fallback, and it drained each five-minute
+arrival burst within roughly two minutes. The pipeline as a whole produced 870 exits,
+leaving two entities outstanding at the final sample — a residue that Search does not
+return, waiting on the detail lane. With that lane capped at 4 requests an hour,
 the residue outlives the window it arrived in, and any sample taken while it is
 outstanding reports a positive backlog delta.
 

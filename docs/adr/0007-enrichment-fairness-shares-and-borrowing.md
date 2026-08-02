@@ -188,7 +188,7 @@ Plan Appendix G ([ADR 0013](0013-derivation-first-staged-batch-enrichment.md)) m
 Search batches the normal enrichment path, so this ADR's share arithmetic —
 `floor(enrichment_allowance × ACTOR_ENRICHMENT_SHARE)`, borrowing on the caller's word,
 `:share_exhausted` as a denial — now governs only the bounded core **detail-fallback**
-lane, whose allowance is `CORE_DETAIL_FALLBACK_ALLOWANCE` (default 4, so the guarantees
+lane, whose allowance is `CORE_DETAIL_FALLBACK_ALLOWANCE` (default 40, so the guarantees
 default to 2/2). The batch lanes are balanced differently: a weighted rotation
 (`ACTOR_ENRICHMENT_WEIGHT` / `REPOSITORY_ENRICHMENT_WEIGHT`, defaults 1/1) over whole
 Search requests, with a lane that has nothing claimable yielding its slot — batch

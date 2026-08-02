@@ -32,16 +32,6 @@ module Github
       end
 
       bootstrap!(now: now)
-
-      # §10: a secondary rate limit is IP-scoped, so it stops *all* live requests, not
-      # only the resource that provoked it. The two ledgers meter separate resources but
-      # share one outbound address, so each honours the other's global block.
-      if (blocked_until = global_block(now: now))
-        Rails.logger.info(event: "search_budget.globally_blocked",
-                          blocked_until: blocked_until.utc.iso8601)
-        raise Errors::BudgetExhausted.new(request_class, :globally_blocked)
-      end
-
       reason = nil
 
       GithubSearchBudget.transaction do
@@ -108,30 +98,26 @@ module Github
       end
     end
 
-    # @param core_ledger [Github::BudgetLedger] the writer of global_blocked_until. A
-    #   secondary limit provoked by a Search request is IP-scoped like any other, so it
-    #   has to stop polling too — §10 is explicit that one timestamp covers every live
-    #   request. A primary Search exhaustion is *not* global: it bounds only this
-    #   resource, and blocking polling on it would hand the search lane the power to
-    #   starve event capture.
-    def block_from!(fetched, now: Time.current, core_ledger: BudgetLedger.new)
-      return unless %i[rate_limited secondary_limited].include?(fetched.classification)
+    # Primary exhaustion of *this* resource only: Search says it is out of requests for
+    # the minute, which bounds this lane and nothing else. A secondary limit is not
+    # handled here — it is IP-scoped, so Github::RateLimitPolicy decides it once for both
+    # resources and calls #block_until! on this row, which is what keeps the escalation
+    # ladder, the one-minute floor, the one-hour cap, and the streak counter in a single
+    # place rather than reimplemented per ledger.
+    def block_from!(fetched, now: Time.current)
+      return unless fetched.classification == :rate_limited
 
       snapshot = fetched.rate_limit(observed_at: now)
-      retry_seconds = snapshot.retry_after_seconds
-      until_at = if retry_seconds.is_a?(Integer) && retry_seconds.positive?
-        now + retry_seconds
-      else
-        snapshot.reset_at || now + SEARCH_WINDOW_SECONDS
-      end
+      block_until!(until_at: snapshot.reset_at || now + SEARCH_WINDOW_SECONDS,
+                   classification: fetched.classification, now: now)
+    end
 
-      if fetched.classification == :secondary_limited
-        core_ledger.block_globally!(until_at: until_at, reason: "search_secondary_limit",
-                                    now: now)
-      end
+    # @param until_at [Time] an instant another component decided. GREATEST ignores NULL,
+    #   so a block only ever moves later — the core ledger's BLOCK_SQL rule, restated for
+    #   the search row.
+    def block_until!(until_at:, classification: :secondary_limited, now: Time.current)
+      return if until_at.nil?
 
-      # GREATEST ignores NULL, so a block only ever moves later — the core ledger's
-      # BLOCK_SQL rule, restated for the search row.
       GithubSearchBudget.where(id: SINGLETON_ID).update_all(
         blocked_until: Arel::Nodes::NamedFunction.new(
           "GREATEST",
@@ -139,8 +125,7 @@ module Github
         ),
         updated_at: now
       )
-      Rails.logger.info(event: "search_budget.blocked",
-                        classification: fetched.classification,
+      Rails.logger.info(event: "search_budget.blocked", classification: classification,
                         blocked_until: until_at.utc.iso8601)
     end
 
@@ -158,16 +143,6 @@ module Github
     end
 
     private
-
-    # The core ledger owns global_blocked_until because a secondary limit can arise on
-    # any live request and Github::RateLimitPolicy already writes it there. Read with
-    # find_by, never through BudgetLedger: this path must not create that row.
-    def global_block(now:)
-      blocked_until = GithubApiBudget.find_by(id: GithubApiBudget::SINGLETON_ID)
-                                     &.global_blocked_until
-
-      blocked_until if blocked_until&.>(now)
-    end
 
     # The window has moved on when GitHub's own reset instant passed, or — when no
     # response ever told us one — when a full Search window elapsed since the last

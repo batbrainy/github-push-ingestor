@@ -117,7 +117,7 @@ singleton ledger (`Github::SearchBudgetLedger` over `github_search_budget`). Thi
 mechanics — transactional reservation, failures-stay-spent, monotonic reconciliation,
 resource verification, per-window bootstrap — are unchanged, but its
 `enrichment_allowance`/`enrichment_used` pair is **redefined**: it now budgets the bounded
-payload-URL detail-fallback lane (`CORE_DETAIL_FALLBACK_ALLOWANCE`, default 4/hour) rather
+payload-URL detail-fallback lane (`CORE_DETAIL_FALLBACK_ALLOWANCE`, default 40/hour) rather
 than the remainder formula, and feasibility becomes
 `poll + reserve + detail_fallback ≤ limit`, with the remainder deliberately unspent.
 The resource-mismatch skip above now cuts both ways: this ledger ignores `search` headers,

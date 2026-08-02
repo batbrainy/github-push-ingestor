@@ -51,9 +51,11 @@ module Github
       end
     end
 
-    def initialize(ledger: BudgetLedger.new, backoff: PollBackoff.new)
+    def initialize(ledger: BudgetLedger.new, backoff: PollBackoff.new,
+                   search_ledger: SearchBudgetLedger.new)
       @ledger = ledger
       @backoff = backoff
+      @search_ledger = search_ledger
     end
 
     # Called once per FetchResult a poll observes, including pages after the first: a rate
@@ -63,30 +65,41 @@ module Github
     # open — which is what keeps the ledger's row lock innermost.
     #
     # @param fetched [Github::FetchResult]
+    # @param resource [Symbol] :core or :search — which rate-limit resource answered.
+    #   It changes only the *primary* verdict: a primary exhaustion bounds the resource
+    #   that reported it, so a spent Search minute must not stop polling for the hour,
+    #   and Github::SearchBudgetLedger records that one locally. Secondary limits are
+    #   IP-scoped whichever resource surfaced them, so they are decided here once and
+    #   written to both ledgers.
     # @return [Decision]
-    def apply!(fetched, now: Time.current)
-      decision = decide(fetched, now: now)
+    def apply!(fetched, now: Time.current, resource: :core)
+      decision = decide(fetched, now: now, resource: resource)
 
       unless decision.blocking?
         # A live request that completed without a secondary limit is the evidence that the
         # IP is no longer being throttled, and §10's backoff is exponential in
         # *consecutive* limits. Asked of successful? rather than of the decision alone: a
         # 5xx or a timeout produced no verdict from GitHub about throttling, so it must
-        # neither escalate the streak nor end it.
+        # neither escalate the streak nor end it. A successful Search response is that
+        # same evidence, which is why the streak is cleared for either resource.
         @ledger.clear_secondary_limit_streak!(now: now) if fetched.successful?
         return decision
       end
 
       @ledger.block_globally!(until_at: decision.blocked_until, reason: decision.kind,
                               window_status: decision.window_status, now: now)
+      # The one condition that stops every live request stops the other resource too.
+      if decision.kind == :secondary_rate_limit
+        @search_ledger.block_until!(until_at: decision.blocked_until, now: now)
+      end
       decision
     end
 
     private
 
-    def decide(fetched, now:)
+    def decide(fetched, now:, resource: :core)
       case fetched.classification
-      when :rate_limited then primary_limit(fetched, now: now)
+      when :rate_limited then resource == :search ? Decision.none : primary_limit(fetched, now: now)
       when :secondary_limited then secondary_limit(fetched, now: now)
       when :budget_denied then reserve_breach(fetched, now: now)
       else Decision.none

@@ -475,8 +475,15 @@ RSpec.describe Github::Enrichment::BatchRunner do
         expect(EnrichmentBatch.find(result.batch_id)).to have_attributes(
           status: "deferred", last_error: expected[:reason]
         )
-        # block_from! propagated the response's reset instant to the search ledger.
-        expect(current_search_budget.blocked_until).to eq(Time.zone.at((frozen_time + 60).to_i))
+        # Both block the Search lane, by different routes: a primary exhaustion is this
+        # resource's own fact and takes the reset instant it reported, while a secondary
+        # limit is IP-scoped and takes Github::RateLimitPolicy's escalating floor.
+        if expected[:reason] == "rate_limited"
+          expect(current_search_budget.blocked_until).to eq(Time.zone.at((frozen_time + 60).to_i))
+        else
+          expect(current_search_budget.blocked_until)
+            .to be >= frozen_time + Github::RateLimitPolicy::MIN_BLOCK_SECONDS
+        end
         expect(Rails.logger).to have_received(:info).with(
           hash_including(event: "enrichment.batch_deferred", deferral_reason: expected[:reason])
         )
