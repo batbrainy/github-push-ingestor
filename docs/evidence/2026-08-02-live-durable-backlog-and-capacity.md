@@ -202,26 +202,42 @@ In plain terms: this correction turns dropped work into a real waiting list. It 
 make the service desk faster. The waiting list shrinks only during periods when new unique
 work arrives more slowly than enrichment completes.
 
-GitHub currently documents 60 requests/hour for unauthenticated clients and 5,000
-requests/hour for authenticated users and GitHub App installations, with some installations
-scaling higher: [REST API rate limits](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api).
-Authentication is therefore the right source of request capacity, but it is not the only
-change required here.
+GitHub authentication is explicitly outside this project's permitted scope. The service
+must remain inside GitHub's documented 60-request/hour unauthenticated limit:
+[REST API rate limits](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api).
+No scheduler, queue, or additional local worker can turn that fixed upstream allowance into
+more requests.
 
-The current automatic dispatcher normally enqueues at most two entity cycles per minute
-from reconciliation, plus at most two after each successful poll. At the default twelve
-polls/hour, that is roughly 144 automatic cycles/hour. This is deliberately above the
-current 40-request allowance, but far below both an authenticated allowance and the live
-pressure sample. A catch-up design needs both:
+The current automatic dispatcher can already offer roughly 144 entity cycles/hour, which
+is deliberately above the 40-request enrichment allowance. A faster or self-refilling pump
+would therefore spend the same 40 requests earlier in the window and then stop; it would not
+increase service capacity.
 
-1. authenticated requests with a safely reserved poll/control budget; and
-2. a self-refilling or bounded-batch enrichment pump that can use that larger allowance
-   without weakening FIFO, fairness, the request gate, or secondary-limit backoff.
+Under the simultaneous requirements of five-minute polling, full per-entity API enrichment,
+no discarded backlog work, and no authentication, bounded catch-up is not achievable when
+unique arrivals remain above 40/hour. The valid no-token choices are explicit tradeoffs:
 
-No finite API allowance can guarantee bounded backlog against arbitrary retries or an
-unbounded arrival rate. The operationally honest target is a drain-rate SLO: alert whenever
-the measured unique-arrival rate remains above the measured completion rate, and provision
-enough authenticated capacity and worker throughput to restore a negative backlog slope.
+1. keep the present polling cadence and retain every enrichment request durably, accepting
+   that backlog size and age can grow without bound under sustained pressure; or
+2. apply polling backpressure while backlog exists, reassign unused polling capacity to
+   enrichment, and accept substantially less event capture.
+
+With the 8-request safety reserve and polling suspended, at most 52 unauthenticated requests
+per hour could work enrichment. A backpressure implementation would also have to let one
+enrichment request bootstrap each later quota window; the current ledger permits only a poll
+to initialize a new window, and that poll would add more work. With that correction, even
+the first observed page's 198 cold rows would consume about 3.8 full hourly enrichment
+allowances, with no intervening polls, retries, or redirects. As above, allowance-hours are
+not a wall-clock lower bound because work can arrive near a reset. A strict bounded-backlog
+mode would therefore poll only after the previous page's backlog had drained, materially
+worsening the public feed sampling rate. Redefining the required enrichment fields to use
+only event-envelope data would be a third product-scope choice, not an implementation
+optimization: actor names and repository descriptions and languages are absent from those
+envelopes.
+
+The honest operational response is to expose arrival rate, completion rate, backlog slope,
+and oldest age, then make the polling-versus-backlog priority explicit. There is no hidden
+no-token implementation that preserves all four requirements and guarantees catch-up.
 
 ## Automated coverage matching this behavior
 
@@ -252,7 +268,7 @@ concurrency specs continue to cover their respective boundaries.
   as such above.
 - Two polls on one host and one date do not establish a sustained arrival average.
 - The one-request live allowance is a test configuration, not the production default.
-- No authenticated request was made, so the documented authenticated limits were not
-  measured here.
+- No authenticated request was made or proposed; authentication is outside the permitted
+  project scope.
 - The probe proves durability and honest capacity accounting. It does not claim that the
   present unauthenticated deployment can catch up; the live data shows the opposite.
