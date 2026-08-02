@@ -84,8 +84,8 @@ RSpec.describe Github::BudgetLedger do
   end
 
   describe "class isolation (plan §10)" do
-    # §10: detail fallback exhausting its four attempts never stops polling, and polling
-    # exhausting its twelve never stops the fallback.
+    # §10: detail fallback exhaustion never stops polling, and polling exhaustion never
+    # stops the fallback. This context uses the helper's deliberately small allowance of 4.
     it "denies polling once its allowance is spent, without touching enrichment" do
       active_window(poll_used: 12)
 

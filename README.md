@@ -80,7 +80,7 @@ What it does, running:
 **Enrichment is a durable, staged, batch-served backlog.** The normal path resolves up to
 ten entities per GitHub Search request on Search's own per-minute budget (10 ceiling, 2
 reserved, 6-second pacing); only items a batch could not settle fall back to individual
-payload-URL fetches inside a bounded core allowance of 4 per hour. The core ledger keeps
+payload-URL fetches inside a bounded core allowance of 40 per hour. The core ledger keeps
 12 requests for polling, 8 in reserve, and the rest for the detail-fallback lane. Entity
 rows remain actionable until enrichment satisfies the useful-data contract or an
 entity-specific terminal outcome is established; quota exhaustion, pacing, and reserve
@@ -632,7 +632,7 @@ Reports persisted state only, as nine top-level blocks in a fixed order: `captur
   which one is binding.
 - **`ledger`** — the core hourly ledger: window status, `poll` used/allowance,
   **`detail_fallback`** used/allowance (renamed from `enrichment` — it budgets the
-  bounded detail lane, default 4/hour), and the `actor_requests`/`repository_requests`
+  bounded detail lane, default 40/hour), and the `actor_requests`/`repository_requests`
   share pairs.
 - **`search_ledger`** — the per-minute Search ledger: `present`, the observed
   resource/limit/remaining/reset, the configured `request_ceiling` and `reserve`, the
@@ -1026,9 +1026,9 @@ and the JSON stream, so a leading brace is exactly what separates them.
 Boot, then a poll that created four events and quarantined three:
 
 ```text
-{"timestamp":"2026-07-31T15:50:49.677Z","level":"info","service":"github-push-ingestor","environment":"development","event":"config.budget_resolved","mode":"fixture","poll_interval_seconds":300,"max_pages_per_poll":1,"enabled_live_source_count":1,"worst_case_reservations_per_poll":9,"limit":60,"reserve":8,"poll_allowance":12,"enrichment_allowance":4,"actor_guarantee":2,"repository_guarantee":2}
+{"timestamp":"2026-07-31T15:50:49.677Z","level":"info","service":"github-push-ingestor","environment":"development","event":"config.budget_resolved","mode":"fixture","poll_interval_seconds":300,"max_pages_per_poll":1,"enabled_live_source_count":1,"worst_case_reservations_per_poll":9,"limit":60,"reserve":8,"poll_allowance":12,"enrichment_allowance":40,"actor_guarantee":20,"repository_guarantee":20}
 {"timestamp":"2026-07-31T15:50:49.896Z","level":"info","service":"github-push-ingestor","environment":"development","event":"ingestion.run_started","run_id":"099d562d-1261-488d-9003-cb0c443cdb55","event_source_id":1,"source_type":"github_fixture_events","github_mode":"fixture","forced":false,"lock_wait_ms":2.2}
-{"timestamp":"2026-07-31T15:50:49.924Z","level":"info","service":"github-push-ingestor","environment":"development","event":"budget.window_initialized","limit":60,"reserve":8,"poll_allowance":12,"enrichment_allowance":4,"actor_guarantee":2,"repository_guarantee":2,"rate_limit_resource":"core","rate_limit_limit":60,"rate_limit_remaining":59,"rate_limit_used":1,"rate_limit_reset_at":"2026-07-31T16:50:49Z","poll_used":1}
+{"timestamp":"2026-07-31T15:50:49.924Z","level":"info","service":"github-push-ingestor","environment":"development","event":"budget.window_initialized","limit":60,"reserve":8,"poll_allowance":12,"enrichment_allowance":40,"actor_guarantee":20,"repository_guarantee":20,"rate_limit_resource":"core","rate_limit_limit":60,"rate_limit_remaining":59,"rate_limit_used":1,"rate_limit_reset_at":"2026-07-31T16:50:49Z","poll_used":1}
 {"timestamp":"2026-07-31T15:50:49.965Z","level":"info","service":"github-push-ingestor","environment":"development","event":"ingestion.event_quarantined","run_id":"099d562d-1261-488d-9003-cb0c443cdb55","github_event_id":"58000000006","event_type":"PushEvent","error_code":"invalid_field_format","error_message":"payload.head is \"not-a-valid-object-name\", not 40 or 64 hexadecimal characters","payload_fingerprint":"a8ad67ca97a4c48049f5fa447d5d88ae10c58c514e0129546e18b5ff22368020"}
 {"timestamp":"2026-07-31T15:50:49.973Z","level":"info","service":"github-push-ingestor","environment":"development","event":"ingestion.run_completed","run_id":"099d562d-1261-488d-9003-cb0c443cdb55","event_source_id":1,"duration_ms":100.7,"next_poll_at":"2026-07-31T15:55:49Z","consecutive_failures":0,"run_status":"completed","classification":"ok","stop_reason":"no_next_link","pages_fetched":1,"events_received":8,"push_events_seen":6,"events_created":4,"duplicates_skipped":0,"events_quarantined":3,"events_ignored":1,"events_failed":0}
 {"timestamp":"2026-07-31T15:50:50.024Z","level":"info","service":"github-push-ingestor","environment":"development","event":"enrichment.dispatched","cycle_enqueued":1,"reason":"ingestion"}
@@ -1257,7 +1257,7 @@ Two different things that both stop requests, deliberately kept apart:
   limit set it; it stops **everything**. `budget.global_block_set` and
   `budget.global_block_cleared` mark the edges.
 - **Class exhaustion** is *derived* from the counters and writes nothing. When polling has
-  spent its twelve, the detail lane carries on; when the detail lane has spent its four,
+  spent its twelve, the detail lane carries on; when the detail lane has spent its forty,
   polling carries on — and batch enrichment, on its own resource, notices neither.
   `budget.class_exhausted` fires once per class per window, and
   `budget.share_exhausted` once per fairness share.
@@ -1560,8 +1560,8 @@ Each dispatch call enqueues at most one `EnrichmentCycleJob` regardless of backl
 entity rows, not queued jobs, are the backlog. Each cycle runs batch lanes then detail
 lanes inside its 55-second budget, every claim under a lease.
 Steady state at the defaults: twelve polls an hour on core, up to eight paced Search
-batches a minute serving as many as ten entities each, and at most four detail fallbacks
-an hour split 2/2 with borrowing. Within each class the oldest never-enriched entity is
+batches a minute serving as many as ten entities each, and at most forty detail fallbacks
+an hour split 20/20 with borrowing. Within each class the oldest never-enriched entity is
 batched first; refresh candidates ride along only under the composition rule — own
 backlog exhausted, none claimable in the other class.
 

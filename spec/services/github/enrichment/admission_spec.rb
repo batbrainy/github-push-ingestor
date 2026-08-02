@@ -132,8 +132,8 @@ RSpec.describe Github::Enrichment::Admission do
       expect(admission.detail(now: frozen_time)).to be_granted
     end
 
-    # enrichment_allowance now means CORE_DETAIL_FALLBACK_ALLOWANCE (=4), and the class
-    # block is derived from the counters — spent allowance defers to the window reset.
+    # enrichment_allowance now means CORE_DETAIL_FALLBACK_ALLOWANCE. This example uses the
+    # helper's deliberately small value of 4; spent allowance defers to the window reset.
     it "denies :class_exhausted once the detail-fallback allowance is spent" do
       active_budget_window(enrichment_used: 4)
 

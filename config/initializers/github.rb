@@ -11,7 +11,7 @@
 # and no schema — it is arithmetic over the environment — so `bin/rails db:prepare`,
 # `rails runner`, CI's schema load, and a container starting before the `setup`
 # service completes are all unaffected. Every variable has a working default, and the
-# default set is feasible (12 + 8 = 20 < 60), so a clean checkout never raises.
+# default set is feasible (12 + 40 + 8 = 60), so a clean checkout never raises.
 #
 # That property is why the *configured* source count is what is validated here and the
 # *observed* one is not: ADR 0004 puts deriving ENABLED_LIVE_SOURCE_COUNT from

@@ -46,8 +46,8 @@ Adopt **derivation-first, lossless staged batch enrichment** (plan Appendix G; i
    payload-provided `api_url`, through the core ledger's
    `CORE_DETAIL_FALLBACK_ALLOWANCE` (40/hour). No identifier is ever turned into a
    constructed detail URL; the polling allocation is never touched.
-4. **Dual ledgers.** `github_api_budget` (core, hourly: 12 poll + 4 detail + 8 reserve
-   ≤ 60, remainder deliberately unspent) and `github_search_budget` (search, per-minute:
+4. **Dual ledgers.** `github_api_budget` (core, hourly: 12 poll + 40 detail + 8 reserve
+   = 60) and `github_search_budget` (search, per-minute:
    ceiling 10, reserve 2, 6-second pacing, header-less window roll) — each reconciled
    only against headers naming its own resource, both behind the one global request gate.
 5. **Observations and projections split.** Every raw item is an append-only
@@ -76,7 +76,7 @@ What this buys:
   (8 spendable search requests/minute × batches of 10) — stated as a **capacity
   hypothesis**, since misses, fallback, retries, and pacing all subtract from it.
 - Core polling is better protected than before: normal-path enrichment no longer
-  competes on core at all, and the detail lane is capped at 4 rather than 40.
+  competes on core at all, and the detail lane remains capped at 40.
 - Every enrichment claim is auditable from durable state: what was asked, what came
   back, what validated, what was applied, and which raw evidence supports the current
   projection.
