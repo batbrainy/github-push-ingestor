@@ -95,37 +95,36 @@ module Github
 
       private
 
-      # §11's "pending_actor_count / pending_repository_count / skipped_actor_count /
-      # skipped_repository_count", and the reason all five statuses are published rather
-      # than those two.
-      #
-      # §11 lists pending_* beside skipped_*, and skipped_budget is a value of
-      # Enrichable::ENRICHMENT_STATUSES — so its sibling is the status value too, and
-      # `pending` here means enrichment_status = 'pending' exactly.
-      # Github::Ingestion::StateSummary uses the same *name* for a different number: the
-      # enrichment_candidates scope, which is pending **plus** retryable_failure and is
-      # what "still to enrich" means when the question is how much work is left. Both are
-      # right for their own question, and publishing one of them under a name the other
-      # also uses is how two numbers silently become one. So this block names both:
-      # every status by its own name, and the scope as `candidates`.
+      # Each entity class exposes the durable backlog separately from its raw status
+      # counts. A backlog row may be temporarily deferred by retry backoff, so this number
+      # intentionally differs from claimable_now. Queue depth is not published:
+      # jobs are bounded wake-up hints and entity rows are the source of truth.
       def enrichment_payload
-        { actors: entity_counts(enrichment.actor_counts),
-          repositories: entity_counts(enrichment.repository_counts),
+        { actors: entity_counts(enrichment.actor_counts,
+                                backlog_count: enrichment.actor_backlog_count,
+                                oldest_pending_at: enrichment.actor_oldest_pending_at,
+                                oldest_pending_age_seconds:
+                                  enrichment.actor_oldest_pending_age_seconds),
+          repositories: entity_counts(
+            enrichment.repository_counts,
+            backlog_count: enrichment.repository_backlog_count,
+            oldest_pending_at: enrichment.repository_oldest_pending_at,
+            oldest_pending_age_seconds: enrichment.repository_oldest_pending_age_seconds
+          ),
           claimable_now: enrichment.claimable_now,
           next_enrichment_at: Ingestion::Report.timestamp(enrichment.next_enrichment_at) }
       end
 
-      # fetch(status, 0) because GROUP BY returns no key for a status with no rows, and an
-      # absent key here would be the missing-key shape the payload rule forbids. These
+      # fetch(status, 0) because GROUP BY returns no key for a status with no rows. These
       # zeros are counted, not fabricated: the table was read and held nothing.
-      def entity_counts(counts)
-        Enrichable::ENRICHMENT_STATUSES.index_with { |status| counts.fetch(status, 0) }
-                                       .symbolize_keys
-                                       .merge(candidates: candidates(counts))
-      end
-
-      def candidates(counts)
-        Enrichable::CANDIDATE_STATUSES.sum { |status| counts.fetch(status, 0) }
+      def entity_counts(counts, backlog_count:, oldest_pending_at:,
+                        oldest_pending_age_seconds:)
+        Enrichable::ENRICHMENT_STATUSES
+          .index_with { |status| counts.fetch(status, 0) }
+          .symbolize_keys
+          .merge(backlog_count: backlog_count,
+                 oldest_pending_at: Ingestion::Report.timestamp(oldest_pending_at),
+                 oldest_pending_age_seconds: oldest_pending_age_seconds)
       end
     end
   end

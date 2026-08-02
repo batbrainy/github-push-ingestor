@@ -116,15 +116,39 @@ RSpec.describe Github::Enrichment::Dispatch do
     end
   end
 
-  # A clean checkout has no ledger row: nothing seeds it, and only a reservation inside the
-  # request gate creates one. Reading a schedule must not.
+  # A clean checkout has no ledger row: the first enrichment reservation would create an
+  # uninitialized row and be denied until a poll supplies authoritative headers. Dispatch
+  # avoids enqueueing that known-no-op while remaining read-only.
   describe "before the first window exists" do
-    it "enqueues without creating the ledger row" do
+    it "does not enqueue or create the ledger row" do
       GithubApiBudget.delete_all
       actor
 
-      expect { dispatch.call(reason: "ingestion") }.to have_enqueued_job(EnrichActorJob)
+      expect { dispatch.call(reason: "ingestion") }.not_to have_enqueued_job
       expect(GithubApiBudget.count).to eq(0)
+      expect(dispatch.call(reason: "reconcile")).to include(blocked_by: :window_uninitialized)
+    end
+
+    it "does not enqueue when an uninitialized ledger row already exists" do
+      GithubApiBudget.delete_all
+      Github::BudgetLedger.new.bootstrap!(now: frozen_time)
+      actor
+
+      expect { dispatch.call(reason: "reconcile") }.not_to have_enqueued_job
+      expect(dispatch.call(reason: "reconcile")).to include(blocked_by: :window_uninitialized)
+    end
+
+    [ 0, 40 ].each do |used|
+      it "does not enqueue after an old window elapses with #{used} enrichment attempts used" do
+        active_budget_window(now: frozen_time - 3600, reset_at: frozen_time - 1,
+                             enrichment_used: used,
+                             actor_share_used: used / 2,
+                             repository_share_used: used / 2)
+        actor
+
+        expect { dispatch.call(reason: "reconcile") }.not_to have_enqueued_job
+        expect(dispatch.call(reason: "reconcile")).to include(blocked_by: :window_elapsed)
+      end
     end
   end
 

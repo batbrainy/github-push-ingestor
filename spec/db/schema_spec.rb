@@ -85,11 +85,14 @@ RSpec.describe "Core data model schema" do
     it "each carry the same enrichment state columns" do
       enrichment_columns = %w[
         enrichment_status enrichment_attempts next_retry_at last_error fetched_at
-        first_seen_at last_seen_at latest_event_at skipped_at
+        first_seen_at last_seen_at latest_event_at
       ]
 
       %w[github_actors github_repositories].each do |table|
-        expect(connection.columns(table).map(&:name)).to include(*enrichment_columns)
+        column_names = connection.columns(table).map(&:name)
+
+        expect(column_names).to include(*enrichment_columns)
+        expect(column_names).not_to include("skipped_at")
       end
     end
 

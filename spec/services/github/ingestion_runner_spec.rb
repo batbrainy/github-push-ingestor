@@ -84,9 +84,9 @@ RSpec.describe Github::IngestionRunner do
     end
   end
 
-  # §12: "Duplicate poll results (fixture replay) — duplicates skipped and no entity
-  # reactivation occurs." A second transport instance restarts the scripted sequence, which
-  # is a faithful model of a second one-shot process.
+  # A second transport instance restarts the scripted sequence, which is a faithful model
+  # of a second one-shot process. Duplicate event writes are absorbed without registering
+  # new entity activity.
   describe "replaying the same page" do
     # Past the 300-second cadence the first run wrote, so the replay is genuinely due
     # rather than deferred. §12's "duplicate poll results (fixture replay)" is about the
@@ -100,8 +100,9 @@ RSpec.describe Github::IngestionRunner do
       # assignment on EXCLUDED.updated_at >= the stored value, so a wall-clock touch here
       # would block the refresh and the example would pass for the wrong reason.
       GithubActor.where(github_id: 583_231)
-                 .update_all(login: "stale-login", enrichment_status: "skipped_budget",
-                             skipped_at: frozen_time, updated_at: frozen_time)
+                 .update_all(login: "stale-login", enrichment_status: "retryable_failure",
+                             next_retry_at: later + 3600, last_error: "GitHub unavailable",
+                             updated_at: frozen_time)
     end
 
     let!(:replay) { ingest(fixture_runner(transport: fixture_transport, now: later)) }
@@ -117,10 +118,10 @@ RSpec.describe Github::IngestionRunner do
       expect(GithubActor.find_by(github_id: 583_231).login).to eq("octocat")
     end
 
-    # §7 merge rules 3 and 4, and Appendix D item 5's reason for the gate.
-    it "registers no new activity and cannot reactivate a budget-skipped entity" do
+    it "registers no new activity and preserves retry state" do
       expect(GithubActor.find_by(github_id: 583_231)).to have_attributes(
-        last_seen_at: frozen_time, enrichment_status: "skipped_budget", skipped_at: frozen_time
+        last_seen_at: frozen_time, enrichment_status: "retryable_failure",
+        next_retry_at: later + 3600, last_error: "GitHub unavailable"
       )
     end
 
@@ -459,9 +460,8 @@ RSpec.describe Github::IngestionRunner do
         .and have_enqueued_job(EnrichRepositoryJob).exactly(:once)
     end
 
-    # §7 merge rule 4's boundary, at the queue: a replay refreshes identity and reactivates
-    # nothing, so there is no new work to schedule. Anything still pending from the first run
-    # is ReconcilePendingEnrichmentsJob's business, not this run's.
+    # A replay refreshes identity but creates no event row, so there is no new work hint to
+    # schedule. Anything still pending from the first run is the reconciler's business.
     it "enqueues nothing for a replay that created no events" do
       ingest
 

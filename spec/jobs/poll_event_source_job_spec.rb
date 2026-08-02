@@ -15,6 +15,10 @@ RSpec.describe PollEventSourceJob do
 
   before { allow(Github::IngestionRunner).to receive(:new).and_return(runner) }
 
+  it "runs on the polling queue, isolated from backlog work" do
+    expect(described_class.new.queue_name).to eq("polling")
+  end
+
   def poll!(job = described_class.new)
     job.perform_now
     job

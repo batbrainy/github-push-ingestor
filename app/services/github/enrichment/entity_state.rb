@@ -126,12 +126,11 @@ module Github
       # next_retry_at is cleared because the next event for this row is a *refresh*, gated
       # by fetched_at + the TTL rather than by a retry instant; leaving the lease in place
       # would delay it by ten minutes and conflate two meanings on one column. last_error
-      # and skipped_at are cleared for PollState#success's reason — a stale error or skip
-      # instant on a successful row is a permanent lie.
+      # is cleared because a stale error on a successful row is a permanent lie.
       def complete(lease, document, now:)
         write(lease, {
           enrichment_status: "complete", enrichment_attempts: 0, next_retry_at: nil,
-          last_error: nil, skipped_at: nil, fetched_at: now, updated_at: now
+          last_error: nil, fetched_at: now, updated_at: now
         }.merge(document.attributes), outcome: "enriched")
       end
 

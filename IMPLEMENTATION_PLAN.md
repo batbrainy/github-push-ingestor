@@ -1,6 +1,6 @@
 # GitHub Push Event Ingestion Service — Implementation Plan
 
-> **This plan was finalized through four pre-implementation review rounds**: an adversarial multi-lens design review with live probes of the unauthenticated GitHub API (**Appendix A**), an independent validation pass against official GitHub, PostgreSQL, and Rails/Solid Queue documentation (**Appendix B**), an implementation-readiness re-check that corrected locking, scheduling, Compose, and PR-ordering defects (**Appendix C**), and a freeze-readiness pass that corrected lock scoping, class-level blocking, bootstrap, restart, and reactivation semantics (**Appendix D**). The initial plan (V1) and the full revision trail are preserved in Git history; the appendices record what changed and why. The one section added during revision is numbered **2A** to keep the original numbering stable.
+> **This plan was finalized through four pre-implementation review rounds**: an adversarial multi-lens design review with live probes of the unauthenticated GitHub API (**Appendix A**), an independent validation pass against official GitHub, PostgreSQL, and Rails/Solid Queue documentation (**Appendix B**), an implementation-readiness re-check that corrected locking, scheduling, Compose, and PR-ordering defects (**Appendix C**), and a freeze-readiness pass that corrected lock scoping, class-level blocking, bootstrap, restart, and entity-activity semantics (**Appendix D**). The initial plan (V1) and the full revision trail are preserved in Git history; the appendices record what changed and why. Appendix F supersedes the original enrichment load-shedding policy with the durable-backlog design adopted on 2026-08-02. The one section added during revision is numbered **2A** to keep the original numbering stable.
 >
 > File locations: this plan lives at the repository root. `DESIGN_BRIEF.md` and the ADRs live under `docs/`.
 
@@ -32,7 +32,7 @@ The delivered implementation will satisfy the required public-events source whil
 - `PushEvent` filtering and processing
 - Raw event payload retention (semantic retention via `jsonb` — see Section 7)
 - Structured push-event fields
-- Actor and repository enrichment (**budget-bounded, best-effort sampling with per-class fairness** — see Section 10)
+- Actor and repository enrichment (**durable, quota-paced FIFO backlog with per-class fairness** — see Section 10)
 - Duplicate-safe `push_events` persistence
 - Pagination via the `Link` response header
 - ETag and `304 Not Modified` handling (bandwidth/correctness measure, scoped to the canonical first-page request — see Sections 9–10)
@@ -64,7 +64,7 @@ The delivered implementation will satisfy the required public-events source whil
 - GitHub authentication
 - Private repository ingestion
 - Complete event capture — not guaranteed by the bounded, delayed Events polling API (see Section 10)
-- Complete enrichment coverage — not sustainable under the observed global-feed demand and the unauthenticated 60-request hourly budget (see Section 10)
+- Bounded-time enrichment completion — sustained unique-entity arrivals can exceed the unauthenticated backlog service rate (see Section 10)
 - Event processors beyond `PushEvent`
 - Object storage (Extension C — deliberately not attempted; rationale in the design brief)
 - Production cloud deployment
@@ -204,9 +204,9 @@ Child issues:
 4. Fetch repository data from payload-provided URLs (validated — Section 10)
 5. Add freshness-based durable caching (entity `fetched_at` + refresh TTLs)
 6. Prevent duplicate concurrent enrichment (keyed by entity row)
-7. Enforce the hourly enrichment allowance with **per-class fairness shares and borrowing**, the `skipped_budget` state, and the distinct-event reactivation rule
+7. Enforce the hourly enrichment allowance with **per-class fairness shares and borrowing**, durable FIFO pending work, and quota deferral without termination
 8. Add pending-work reconciliation (entity-scoped scan)
-9. Test failed, repeated, skipped, reactivated, replay-non-reactivated, and starved-class enrichment
+9. Test failed, repeated, quota-deferred, FIFO, durable-backlog, refresh-priority, and starved-class enrichment
 
 ### Story 4 — Operability and Observability
 
@@ -216,7 +216,8 @@ Child issues:
 2. Add ingestion-run correlation IDs (`run_id` UUID)
 3. Add GitHub event IDs and job IDs to logs
 4. Add `/health/live` and `/health/ready` endpoints (no GitHub calls, no budget consumption)
-5. Add ingestion status endpoint (per-class budget state, defined coverage formulas, pending/skipped counts)
+5. Add ingestion status endpoint (per-class budget state, defined coverage formulas,
+   backlog size and oldest pending timestamp/age; no unsupported drain ETA)
 6. Add malformed-payload quarantine handling
 7. Add retry and failure logging
 8. Add container health checks
@@ -248,7 +249,7 @@ Child issues:
 5. Preserve pending work in business tables
 6. Reconcile work not enqueued before a crash
 7. Add crash-safe source ownership (session advisory lock; verify release on session death)
-8. Bound the enrichment backlog via the eligibility window and `skipped_budget` state (no unbounded growth)
+8. Preserve never-enriched entity rows as durable backlog work across quota windows; select FIFO oldest-first and report unbounded growth honestly
 9. Add Docker restart policies; test API-stop and main-process-crash paths separately
 10. Document processing guarantees
 
@@ -263,13 +264,13 @@ Child issues:
 1. Add deterministic GitHub fixtures (static JSON corpus + fixture source + fixture transport)
 2. Test `PushEvent` filtering and tolerant parsing
 3. Test raw and structured persistence
-4. Test duplicate ingestion (including replay-does-not-reactivate)
+4. Test duplicate ingestion (including replay-does-not-register-activity)
 5. Test pagination stopping conditions (cap / allowance / no-next-link / empty page)
 6. Test ETag scoping and `304` behavior (including quota accounting)
 7. Test budget-ledger reservation, the allowance formula, fairness rounding/borrowing, per-window bootstrap, and exhaustion (global vs class blocking)
 8. Test transient retries
 9. Test the canonical fingerprint algorithm and quarantine occurrence counting
-10. Test enrichment caching, terminal skip, and distinct-event reactivation
+10. Test enrichment caching, durable quota deferral, FIFO selection, and refresh suppression while backlog exists
 11. Test pending-work recovery and advisory-lock release on session death
 12. Add Docker-based end-to-end verification (fixture mode, fail-closed) and container-kill recovery checks
 
@@ -541,15 +542,14 @@ Malformed-event taxonomy:
 - `avatar_url`
 - `raw_payload` (full document after enrichment; `NULL` on stubs)
 - **Enrichment state machine (entity-level, V2):**
-  - `enrichment_status` — `pending | complete | retryable_failure | permanent_failure | skipped_budget`
+  - `enrichment_status` — `pending | complete | retryable_failure | permanent_failure`
   - `enrichment_attempts`
   - `next_retry_at`
   - `last_error`
   - `fetched_at`
   - `first_seen_at` — first time a **distinct persisted** push referenced this entity
-  - `last_seen_at` — most recent local observation of a **distinct persisted** push; drives the newest-first policy
+  - `last_seen_at` — most recent local observation of a **distinct persisted** push
   - `latest_event_at` — greatest GitHub event `created_at` among distinct persisted pushes
-  - `skipped_at`
 - timestamps
 
 Envelope-to-stub field mapping (explicit — the envelope and the enriched document are different shapes):
@@ -566,22 +566,28 @@ actor.avatar_url    → avatar_url
 
 1. Upsert entity identity stubs — envelope values may refresh identity fields (login, display_login, API URL, avatar URL) on any observation, including duplicates; an envelope upsert never clears a previously stored enrichment payload or `name`.
 2. `INSERT push_events … ON CONFLICT DO NOTHING RETURNING id`.
-3. **Only when RETURNING produces a row** (a genuinely new event): update `last_seen_at` and `latest_event_at`, set `first_seen_at` if unset, and apply `skipped_budget` reactivation.
-4. A duplicate event replay may refresh harmless identity fields but **can never reactivate enrichment** — otherwise a re-polled window would resurrect skipped entities with no new activity.
+3. **Only when RETURNING produces a row** (a genuinely new event): update `last_seen_at` and `latest_event_at`, and set `first_seen_at` if unset.
+4. A duplicate event replay may refresh harmless identity fields but **can never register new entity activity**.
 
-A `complete` enrichment is not reset to `pending` by any duplicate; it returns to `pending` only when missing, explicitly stale (past its refresh TTL), or reactivated after a budget skip.
+A `complete` enrichment is not reset to `pending` by any duplicate. Staleness is a derived
+refresh predicate over a complete row, not a destructive status transition.
 
-**Reactivation rule:** `skipped_budget` is terminal for the entity’s current eligibility window, not forever. A **newly persisted** push event referencing the entity updates its activity fields and may transition it back to `pending` when its enrichment is missing or stale. This also handles delayed-but-new events correctly: even with an old `created_at` (documented 30s–6h latency), a distinct event ID proves new activity. Partial enrichment is expected by design; pending work is bounded — candidates that age beyond the configured eligibility window transition to `skipped_budget`.
+**Durable backlog rule:** a never-enriched entity remains `pending` or
+`retryable_failure` until a real enrichment response produces a success or
+entity-specific terminal failure. Quota exhaustion and fairness-share denial leave the row
+actionable for a later window. Candidate selection is FIFO by immutable, non-null
+`created_at ASC, id ASC`; `first_seen_at` can be null, so it is activity metadata rather
+than the queue key. Sustained new arrivals therefore cannot starve old work.
 
 Partial index matching the reconciler’s exact predicate:
 
 ```sql
-(next_retry_at, last_seen_at) WHERE enrichment_status IN ('pending', 'retryable_failure')
+(created_at, id) WHERE enrichment_status IN ('pending', 'retryable_failure')
 ```
 
 ### `github_repositories`
 
-- `id`, `github_id` (`bigint`, unique), `name`, `full_name`, `api_url`, `description`, `language`, `owner_github_id`, `raw_payload`, plus the identical enrichment state machine, merge rules, distinct-event activity gating, reactivation rule, partial index, and timestamps.
+- `id`, `github_id` (`bigint`, unique), `name`, `full_name`, `api_url`, `description`, `language`, `owner_github_id`, `raw_payload`, plus the identical enrichment state machine, merge rules, distinct-event activity gating, durable-backlog rule, partial index, and timestamps.
 
 Envelope-to-stub field mapping — the envelope’s `repo.name` is the qualified `owner/repository` form; it is **not** silently equated with the enriched `name`:
 
@@ -607,7 +613,7 @@ A GitHub event is considered accepted only after its `push_events` row is commit
 5. Normalize required attributes tolerantly; route failures to `quarantined_events`.
 6. Upsert stub actor and repository rows (identity fields only).
 7. Insert the raw and structured event row with conflict skipping (`RETURNING id`).
-8. For rows actually inserted: apply entity activity updates and reactivation (Section 7).
+8. For rows actually inserted: apply entity activity updates (Section 7).
 9. Commit the PostgreSQL transaction (short-lived — the advisory lock, not the transaction, spans the HTTP work).
 10. Enqueue enrichment after commit — Solid Queue lives in its own database, so same-transaction enqueue is not available; the committed entity state is the durable record of pending work (outbox-style recovery, per Section 2A).
 11. Reconcile entities whose enrichment was not scheduled or completed.
@@ -638,7 +644,7 @@ prevent duplicate entity rows, but execution and operational side effects may re
 
 Repeated observation and job delivery are expected. The system enforces two narrower
 invariants: a duplicate GitHub event ID cannot create another `push_events` row, and that
-duplicate cannot register entity activity or reactivate a `skipped_budget` entity. A
+duplicate cannot register entity activity. A
 duplicate may refresh permitted identity fields. Executions, `ingestion_runs`, quarantine
 occurrence counts, budget debits, and logs may repeat or change. The system does not claim
 exactly-once execution or universal idempotency of persisted state.
@@ -798,10 +804,19 @@ Consequence, stated honestly: one observed live page of `/events` held ~92–95 
 ```text
 89 actors + 92 repositories = 181 entity requests/page (cold)
 181 × 12 polls/hour ≈ 2,172 requests/hour of cold demand
-40 available enrichments/hour ≈ 1.8% theoretical cold coverage
+40 available enrichments/hour ≈ 1.8% same-hour service ratio under the all-cold assumption
 ```
 
-**Enrichment is best-effort sampling by design**, and it must be **fair across classes**: repository candidates alone exceed the entire hourly allowance, so a naive repo-first policy would starve actor enrichment to zero indefinitely — violating Story 3, which requires both. Fairness policy with explicit rounding:
+This is a cold-demand pressure scenario, not a measured arrival rate: it assumes every
+poll contains entirely new identities, while entity rows deduplicate repeated actors and
+repositories across events and overlapping pages. The actual unique arrival rate must be
+measured against the 40-attempt service rate.
+
+**Enrichment is a durable, quota-paced backlog**, and it must be **fair across classes**:
+repository candidates alone exceed the entire hourly allowance, so a naive repo-first
+policy would starve actor enrichment indefinitely — violating Story 3, which requires both.
+The default ledger reserves 12 attempts for polling, 40 for draining never-enriched work,
+and 8 as a safety reserve. Fairness policy with explicit rounding:
 
 ```text
 actor_guarantee      = floor(enrichment_allowance × ACTOR_ENRICHMENT_SHARE)
@@ -810,15 +825,22 @@ repository_guarantee = enrichment_allowance − actor_guarantee
 Defaults: ACTOR_ENRICHMENT_SHARE = 0.50 → 20 actor / 20 repository
 
 Borrowing: a class may borrow the other’s unused capacity only when the
-other class has no CURRENTLY ELIGIBLE candidate (not merely no rows).
+other class has no CURRENTLY CLAIMABLE backlog candidate (not merely no rows).
 ```
 
-Within each class, never-enriched `pending` candidates always precede TTL-stale refreshes — a refresh spends budget only when no pending candidate is currently eligible. Among pending candidates the service enriches newest-first (`last_seen_at`); candidates that age beyond the eligibility window transition to `skipped_budget`, and entities referenced by newly persisted events reactivate (Section 7). The backlog is therefore bounded, `skipped_budget` is a normal documented outcome, and `/status` reports per-class usage and coverage so an operator sees the sampling rate instead of a mysteriously growing queue.
+Within each class, never-enriched candidates are served FIFO by `created_at ASC, id ASC`.
+Their entity rows remain durable across quota exhaustion,
+window rollover, process restart, and lost enqueue hints. A denied reservation defers the
+candidate; it never terminates it. A TTL-stale refresh receives no request while either
+class has any never-enriched backlog work. If unique arrivals continuously exceed 40
+attempts per hour, the backlog can grow without a bounded completion estimate; `/status`
+therefore reports backlog size, oldest pending timestamp/age, and reserved allowance usage.
+It does not report a drain ETA because no durable outcome history exists from which to
+derive an honest service rate.
 
 Timing configuration (pinned defaults; tunable):
 
 ```text
-ENRICHMENT_ELIGIBILITY_WINDOW_SECONDS = 3600
 ACTOR_REFRESH_TTL_SECONDS             = 86400
 REPOSITORY_REFRESH_TTL_SECONDS        = 86400
 ENRICHMENT_COVERAGE_WINDOW_SECONDS    = 86400
@@ -895,7 +917,7 @@ Never disable the event source because one enrichment target disappeared.
 
 1. Polling for new events (from `poll_attempt_allowance`)
 2. Actor and repository enrichment (from `enrichment_allowance`, under the fairness guarantees — neither class can starve the other)
-3. Refreshing stale enrichment (within each class’s share, and only when no never-enriched pending candidate is eligible)
+3. Refreshing stale enrichment (within each class’s share, and only when neither entity class has any never-enriched backlog work)
 
 Polling receives priority because raw-event capture is more time-sensitive than enrichment — and the enrichment slice is guaranteed by its own allowance rather than starved by priority alone.
 
@@ -905,7 +927,7 @@ Polling receives priority because raw-event capture is more time-sensitive than 
 
 Structured JSON to stdout/stderr, with a `LOG_LEVEL` env (default `info`).
 
-- **INFO**: ingestion run started/completed with summary counts (persisted, duplicates, quarantined, ignored non-push), enrichment completed/failed/skipped/reactivated, retry scheduled, budget state transitions (window initialized, `global_blocked_until` set/cleared, class exhaustion), source lock acquired/busy, reconciliation summaries
+- **INFO**: ingestion run started/completed with summary counts (persisted, duplicates, quarantined, ignored non-push), enrichment completed/failed/deferred, retry scheduled, budget state transitions (window initialized, `global_blocked_until` set/cleared, class exhaustion), source lock acquired/busy, reconciliation summaries
 - **DEBUG**: per-request and per-page lines (GitHub request/response, page processed, `304` received)
 
 Rails and ActiveJob framework logging is routed through the same JSON formatter so `docker compose logs -f` stays one coherent stream — the INFO stream is sized so the events Story 4 asks reviewers to see are not buried.
@@ -933,7 +955,8 @@ events_with_both_entities_enriched_pct =
   ÷ all distinct persisted push events in the window
 ```
 
-  - `pending_actor_count`, `pending_repository_count`, `skipped_actor_count`, `skipped_repository_count`
+  - per-class backlog size and oldest pending timestamp/age, alongside reserved allowance
+    usage; no drain ETA without durable outcome history
 - `GET /api/push_events`
 - `GET /api/push_events/:id`
 
@@ -956,10 +979,11 @@ Testing focuses on correctness boundaries rather than exhaustive framework behav
 - Retry and error-context classification (source vs entity)
 - Ledger accounting: class reservation, the allowance formula and startup validation, `304` debits, failure-stays-spent, monotonic reconciliation, per-window bootstrap and counter reset, global vs class blocking derivation
 - `effective_poll_time` / `effective_enrichment_time` (components independent; `global_blocked_until` only for global conditions; `--force` bypasses cadence + ETag only)
-- Fairness rounding (floor/remainder) and eligibility-aware borrowing
+- Fairness rounding (floor/remainder) and claimability-aware borrowing
 - Enrichment URL policy (reject non-HTTPS, wrong host, userinfo, ports, IP literals, unbounded redirects)
 - Pagination stop logic (`Link`-header driven; cap / allowance / no-next / empty)
-- Enrichment state machine transitions, including distinct-event reactivation and replay-non-reactivation
+- Enrichment state machine transitions, including durable quota deferral, FIFO ordering,
+  and duplicate replay without new activity
 
 ### Persistence tests
 
@@ -974,12 +998,15 @@ Testing focuses on correctness boundaries rather than exhaustive framework behav
 
 - Public-event response ingestion
 - Non-push events ignored and counted
-- Duplicate poll results (fixture replay) — duplicates skipped **and no entity reactivation occurs**
+- Duplicate poll results (fixture replay) — duplicates skipped **and no new entity activity occurs**
 - Multiple-page ingestion via `Link` headers; full-page processing with duplicates absorbed by uniqueness (no known-event stop)
 - Actor and repository enrichment via stub → `complete` transitions
 - Reuse of fresh enriched records; TTL-driven staleness
-- Enrichment allowance exhaustion → deferred → `skipped_budget` → reactivation only via a genuinely new event
-- Class fairness: repository flood cannot starve actors (and vice versa); borrowing only when the other class has no eligible candidate
+- Enrichment allowance exhaustion defers durable backlog work across window rollover without
+  changing it to a terminal state
+- FIFO selection by `created_at ASC, id ASC` under sustained arrivals
+- Refresh suppression while any never-enriched actor or repository work remains
+- Class fairness: repository flood cannot starve actors (and vice versa); borrowing only when the other class has no claimable backlog candidate
 - Poll allowance protected from enrichment demand — and vice versa (class-blocking isolation: one class exhausted, the other proceeds)
 - Rate-limit exhaustion (`403` + headers → `global_blocked_until`); routine `reset_at` never defers; secondary limit blocks globally including enrichment
 - Per-window bootstrap: new window → counters reset → enrichment ineligible until the first poll initializes it
@@ -1024,7 +1051,11 @@ Processor registry; tolerant `PushEvent` processor; quarantine taxonomy + canoni
 Poll-attempt allowance enforcement; `Link`-header pagination with budget-bounded stops (no known-event stop, ETag scoped to page 1); corrected `304` debit; `effective_poll_time` with independent components; `global_blocked_until` vs derived class blocking; secondary-limit global handling; `Retry-After` handling; persisted poll state; **committed dated live-probe transcript for the 304 finding (required validation gate)**
 
 ### PR 7 — Enrichment budget and fairness
-Actor/repository enrichment against the entity state machine; fairness guarantees (floor/remainder rounding) with eligibility-aware borrowing; newest-first eligibility; `skipped_budget` + distinct-event reactivation; freshness cache + refresh TTLs; error-context classification (entity vs source); `effective_enrichment_time`
+Actor/repository enrichment against the entity state machine; fairness guarantees
+(floor/remainder rounding) with claimability-aware borrowing; durable FIFO selection by
+`created_at ASC, id ASC`; quota deferral without termination; freshness cache with refreshes
+suppressed while never-enriched work remains; refresh TTLs; error-context classification
+(entity vs source); `effective_enrichment_time`
 
 ### PR 8 — Background processing and recovery
 Solid Queue setup (own database in the same Postgres container); worker container; recurring polling task; enrichment jobs; post-commit enqueue; entity-scoped reconciler; recovery tests (including advisory-lock release on session death)
@@ -1056,7 +1087,9 @@ File locations: `IMPLEMENTATION_PLAN.md` at the repository root; `DESIGN_BRIEF.m
 
 Must include:
 
-- Pointer to `IMPLEMENTATION_PLAN.md`, noting its revision history lives in Git and Appendices A–D
+- Pointer to `IMPLEMENTATION_PLAN.md`, noting pre-implementation history in Git and
+  Appendices A–D, execution deltas in Appendix E, and the durable-backlog correction in
+  Appendix F
 - Problem overview
 - Architecture summary
 - Requirements
@@ -1073,7 +1106,7 @@ Must include:
 - Rate-limit behavior: the allowance formula, the budget table, global-vs-class blocking, and per-window bootstrap
 - Separate API-stop and main-process-crash verification steps (Section 15)
 - Reset instructions
-- Known limitations (sampling-based enrichment coverage; no guaranteed complete capture; shared-IP budget interference)
+- Known limitations (unbounded enrichment drain time under sustained arrivals; no guaranteed complete capture; shared-IP budget interference)
 
 Required reviewer commands:
 
@@ -1093,16 +1126,23 @@ Keep within one to two pages — the brief is the reviewer’s primary architect
 - Data model
 - Durability boundary
 - **The request-budget formula and table, and the unauthenticated `304` finding** — worded precisely: the endpoint documentation contains a general statement that `304` responses do not affect the rate limit, while the REST best-practices documentation limits that exemption to correctly authorized requests; dated unauthenticated probes showed `x-ratelimit-used` increasing across a `304`; this implementation therefore budgets unauthenticated conditional requests as one request
-- **Enrichment as bounded best-effort sampling with per-class fairness; eligibility windows, `skipped_budget`, and distinct-event reactivation as the answer to unbounded growth**
+- **Enrichment as a durable FIFO backlog with per-class fairness; quota exhaustion defers
+  without terminating, refresh waits for the never-enriched pool to empty, and unbounded
+  growth is reported rather than hidden**
 - Duplicate-safe event persistence and restart recovery (advisory-lock ownership; outbox-style recovery; Docker restart policies)
 - Enrichment strategy and the SSRF boundary
 - Tradeoffs and assumptions (including `jsonb` semantic retention)
 - Intentional omissions (Extension C; authentication; complete capture)
-- Future scaling path (a larger authenticated allowance could materially increase feasible coverage without guaranteeing capture or enrichment; API-version upgrade to `2026-03-10` after payload re-verification)
+- Future scaling path (a larger authenticated allowance could materially increase backlog
+  throughput without guaranteeing upstream capture or a bounded drain time; API-version
+  upgrade to `2026-03-10` after payload re-verification)
 
 ### Plan history
 
-The plan’s pre-implementation revision history is preserved in Git history and summarized in Appendices A–D — the review-driven revision rounds are themselves submission-worthy evidence of process. At completion, add a short execution summary describing what changed from this plan during the build and why.
+The plan’s pre-implementation revision history is preserved in Git history and summarized
+in Appendices A–D — the review-driven revision rounds are themselves submission-worthy
+evidence of process. Appendix E records execution deltas and Appendix F the durable-backlog
+correction.
 
 ### Architecture Decision Records (`docs/adr/`)
 
@@ -1112,7 +1152,8 @@ Short ADRs for:
 - Session advisory locks for source ownership and the global request gate (vs `FOR UPDATE` row claims; lock-order invariant)
 - Repeated execution with duplicate-safe event writes and distinct-event activity gating
 - Event-source adapter and transport seams, each with a shipped fixture implementation
-- Class-aware budget ledger, allowance formula, global-vs-class blocking, and the enrichment fairness/sampling policy
+- Class-aware budget ledger, allowance formula, global-vs-class blocking, and the durable
+  enrichment backlog/fairness policy
 - `jsonb` semantic retention (not byte-exact)
 - Pinned API version `2022-11-28` (evidence gathered under it) with the `2026-03-10` upgrade path
 - Why Kafka was not selected
@@ -1127,7 +1168,10 @@ The README must provide exact steps to:
 4. Follow application and worker logs.
 5. Query persisted push events.
 6. Inspect PostgreSQL record counts.
-7. Run the fixture replay scenario and confirm `duplicates_skipped > 0` in the summary — and that no skipped entity was reactivated by the replay. (Live re-runs are not relied upon to demonstrate dedup: probe-dated observations showed little or no overlap between consecutive live polls.)
+7. Run the fixture replay scenario and confirm `duplicates_skipped > 0` in the summary —
+   and that entity activity timestamps do not move. (Live re-runs are not relied upon to
+   demonstrate dedup: probe-dated observations showed little or no overlap between
+   consecutive live polls.)
 8. **Verify operator-stop semantics and restart-policy crash recovery as separate paths:**
 
 ```bash
@@ -1156,7 +1200,7 @@ evidence for the other.
 - Required fields are structured, typed, and `NOT NULL`; unknown payload fields tolerated; 40- and 64-char SHAs accepted
 - Raw payload is retained (semantic retention, documented)
 - **Both actor and repository enrichment demonstrably occur** within their fairness guarantees
-- Duplicate event IDs cannot create another `push_events` row, and duplicate replays never reactivate skipped entities
+- Duplicate event IDs cannot create another `push_events` row, and duplicate replays never register new entity activity
 - `Link`-header pagination is handled; every fetched page fully processed
 - Rate-limit behavior is demonstrated: `304` quota accounting, class-aware ledger enforcement, global-vs-class blocking, per-window bootstrap, scheduling rules
 - Malformed data is quarantined durably per the taxonomy (canonical fingerprints, occurrence-counted) and does not terminate the batch
@@ -1172,14 +1216,19 @@ evidence for the other.
 - Advisory locks provably release on session death (tested)
 - The covered enrichment redelivery cannot create another entity row
 - Reconciliation recovers missing enrichment scheduling
-- The enrichment backlog is bounded (eligibility window + `skipped_budget` + distinct-event reactivation)
+- Never-enriched entity rows remain durable across quota exhaustion and window rollover;
+  FIFO selection prevents newer arrivals from starving older work
+- A selection that observes either class has never-enriched backlog work does not choose a
+  refresh; a concurrent insert after that read can cross at most one one-request runner cycle
 
 ### Operability
 
 - Logs are readable through `docker compose logs -f` at the default level
 - Correlation fields (`run_id`, job ID) are present
 - `/health/live` and `/health/ready` are meaningful and never consume budget
-- `/status` reports window status, poll state, per-class ledger state, pending/skipped counts, and coverage percentages computed by the defined formulas — without initiating GitHub requests
+- `/status` reports window status, poll state, per-class ledger state, backlog size, oldest
+  pending timestamp/age, reserved allowance usage, and coverage percentages computed by the
+  defined formulas — without initiating GitHub requests or fabricating a drain ETA
 - Retry behavior is visible
 - Failures contain actionable context
 
@@ -1216,7 +1265,8 @@ The target is a system that is:
 - Complete enough to trust
 - Extensible without being speculative
 - Durable across normal container and process failures
-- Honest about the limitations of the GitHub polling source — including the arithmetic that makes enrichment a bounded sample
+- Honest about the limitations of the GitHub polling source and the arithmetic that can
+  make the durable enrichment backlog grow without a bounded drain time
 
 ---
 
@@ -1230,7 +1280,7 @@ Each change came out of a multi-lens adversarial review with independent verific
 |---|---|---|
 | 1 | **304 handling corrected: unauthenticated 304s consume quota.** V1’s 304 branch scheduled the next poll from `X-Poll-Interval`, which only makes sense if 304s were free. | Two independent live probes: conditional `If-None-Match` request to `/events` returned HTTP 304 with `x-ratelimit-used` incremented (one transcript: used 4→5, remaining 56→55). Best-practices doc scopes the 304 exemption to requests “correctly authorized with an Authorization header”; the events page carries a broader unqualified statement |
 | 2 | **Request-budget arithmetic added, cadence derived from budget.** V1 had mechanisms but no numbers: polling at `X-Poll-Interval` (60s) = 60 req/hr = 100% of the budget at 1 page (300% at 3 pages), starving required Story 3 enrichment. | Rate-limits doc: 60 req/hr unauthenticated, IP-keyed; live headers: `x-ratelimit-limit: 60`, `x-poll-interval: 60` on both 200 and 304, `x-ratelimit-resource: core` shared across `/events`, `/users/*`, `/repos/*`; `Link` header `rel="last"` page=3 at `per_page=100` |
-| 3 | **Enrichment declared bounded best-effort sampling** with a budget-skip state (refined by Appendices B–D). | One live page: ~92–95 PushEvents, ~89 distinct actors, ~92 distinct repos ≈ 181 cold entity requests/page ≈ 2,172/hr at default cadence vs 40/hr supply ≈ 1.8% theoretical cold coverage |
+| 3 | The initial review introduced terminal budget load shedding; Appendix F supersedes it with durable FIFO backlog work. | One live page: ~92–95 PushEvents, ~89 distinct actors, ~92 distinct repos ≈ 181 cold entity requests/page, or ≈2,172/hr only if every poll contains new identities — a pressure scenario, not a measured deduplicated arrival rate and not justification for discarding work |
 | 4 | **Enrichment state moved from `push_events` to entity tables, with stub upserts in the ingest transaction.** | Review verdict (upheld): shape defect on V1 Section 7’s seven per-event enrichment columns |
 | 5 | **Stack decisions pinned (Section 2A).** V1 named no versions, job backend, HTTP client, test tooling, recurring-poll mechanism, or compose topology. | Verified absence in V1 |
 | 6 | **Post-commit enqueue + reconciler kept** (critique refuted). | Solid Queue defaults to a separate queue database and documents `enqueue_after_transaction_commit` |
@@ -1256,7 +1306,7 @@ A second, independent validation pass approved the direction and required these 
 | 2 | Poll scheduling decomposed (cadence vs server floor vs deferrals) | Section 9 |
 | 3 | `--force` restricted to cadence + stored ETag | Section 9 |
 | 4 | Global live-request gate (serial outbound concurrency of one) | Sections 2A, 5, 10 |
-| 5 | Enrichment state machine completed with reactivation rule and labeled coverage metrics | Sections 7, 10, 11 |
+| 5 | Enrichment state machine completed with labeled coverage metrics (backlog behavior later superseded by Appendix F) | Sections 7, 10, 11 |
 | 6 | Stub upsert merge rules; reconciler partial index matches the real predicate | Section 7 |
 | 7 | Quarantine keyed by SHA-256 payload fingerprint; malformed-event taxonomy | Section 7 |
 | 8 | Fixture source vs transport resolved; fail-closed; VCR rationale reworded | Sections 2A, 5, 6, 12 |
@@ -1277,7 +1327,7 @@ A third review round conditionally approved V2 and required eight substantive co
 | 2 | `reset_at` removed from routine scheduling; blocking timestamp added; scheduling components persisted separately | Sections 7, 9, 10 |
 | 3 | **Compose profiles** for `ingest`/`test` + one-shot `setup` service (unprofiled services all start on `up`; concurrent `db:prepare` raced) | Section 2A |
 | 4 | **PR order made dependency-consistent** (gate + ledger cores in PR 4, before budget-spending PRs) | Section 13 |
-| 5 | **Enrichment fairness shares** with borrowing; per-class `/status`; pinned eligibility/TTL envs | Sections 7, 10, 11 |
+| 5 | **Enrichment fairness shares** with borrowing; per-class `/status`; pinned refresh-TTL envs | Sections 7, 10, 11 |
 | 6 | **Stop-on-known-event removed for the live source; ETag scoped to page 1**; overlap claim softened to probe-dated observation | Sections 9, 12, 15 |
 | 7 | **One authoritative allowance formula** with startup validation; “request-attempt” naming; fresh-install bootstrap concept | Sections 7, 10 |
 | 8 | **Schema completed**: actor `display_login`/`name` + envelope mappings; repo `full_name` mapping; typed columns; canonical fingerprint + occurrence counting | Section 7 |
@@ -1293,7 +1343,7 @@ A fourth review round validated the external facts (GitHub, Rails, Ruby, Solid Q
 | 2 | **Global vs class blocking split**: `global_blocked_until` stores only truly global conditions (primary exhaustion, reserve reached, secondary limits); class blocking derived from counters (`poll_used >= poll_allowance ? reset_at : nil`); separate `effective_enrichment_time`; **secondary limits block globally** (they can arise on enrichment requests, which have no source row) | One timestamp could not defer “only that class”: enrichment exhaustion would have stopped polling and vice versa — a direct contradiction in the C-round text | Sections 7, 9, 10 |
 | 3 | **Bootstrap = the first real poll of every window**, not an extra discovery request: window lifecycle (`uninitialized → active → globally_blocked`), counters reset per window, enrichment ineligible until initialized from authoritative headers | An extra quota-discovery request wastes budget; per-window (not just fresh-install) matters because IP co-tenants may spend immediately after each reset | Sections 7, 10 |
 | 4 | **Docker restart policies added** (`unless-stopped` for `db`/`web`/`worker`, `stop_grace_period: 30s` on worker, `no` for one-shots), with the recovery runbook later corrected by Appendix E's API-stop/process-crash distinction | Docker’s default restart policy is `no` — the durability story silently assumed restarts that would never happen | Sections 2A, 8, 15, 16 |
-| 5 | **Entity activity gated on distinct events**: `last_seen_at`/`latest_event_at`/reactivation update only when `INSERT … RETURNING id` produces a row; duplicate replays may refresh identity fields but never reactivate | “Every observed event updates `last_seen_at`” let a replayed duplicate resurrect a `skipped_budget` entity with no new activity | Sections 5, 7, 8, 12 |
+| 5 | **Entity activity gated on distinct events**: `last_seen_at`/`latest_event_at` update only when `INSERT … RETURNING id` produces a row; duplicate replays may refresh identity fields but never register activity | “Every observed event updates `last_seen_at`” let a replayed duplicate falsely look like new activity | Sections 5, 7, 8, 12 |
 | 6 | **SHA columns widened to `varchar(64)`** accepting 40- or 64-char hex | Git object names are 40 hex (SHA-1) or 64 hex (SHA-256); hard-coding 40 contradicted the tolerant-parser goal | Section 7 |
 | 7 | **Quarantine identity made unambiguous**: `payload_fingerprint` is the sole unique key (`github_event_id` indexed, not unique); one canonicalization definition (SHA-256 of compact UTF-8 JSON with recursively sorted keys) | Dual unique keys left an unhandled conflict path (same event ID, different malformed payload); “or equivalently normalized `jsonb`” specified two algorithms | Section 7 |
 | 8 | Precision edits: `ingest` depends on `setup`, `test` depends only on `db` and self-prepares; **Ruby switched to 3.4.10** (3.3 is security-maintenance-only — weaker greenfield signal; 3.4.10 verified current, released 2026-06-30); “Rails 8 bundles Solid Queue” reworded to “default Active Job backend in new Rails 8 applications”; `X-RateLimit-Resource` added to processed headers with a `core` verification; fairness rounding defined (floor/remainder); borrowing requires no *currently eligible* candidate; operational defaults pinned (HTTP timeouts, retries, redirects, lock wait); `/status` coverage formulas defined | Accuracy and reviewer experience | Sections 2A, 10, 11 |
@@ -1313,7 +1363,7 @@ is the plan meeting a fact it could not have known in advance.
 
 | What the plan said | What was built | Why | Record |
 |---|---|---|---|
-| Section 8 used a broad persisted-outcome equivalence and implied every uncommitted event would return on the next poll | The documented guarantee is limited to one `push_events` row per GitHub event ID and no activity/reactivation from duplicate observations; pre-commit recovery depends on the event remaining in a later sliding-feed response | Quarantine counters, run summaries, budget debits, executions, and logs may repeat, while the upstream window can advance past an uncommitted event. The old shorthand overstated both persistence and source-delivery guarantees; this is a wording correction, not an architecture change | ADR 0005; Section 8 amendment |
+| Section 8 used a broad persisted-outcome equivalence and implied every uncommitted event would return on the next poll | The documented guarantee is limited to one `push_events` row per GitHub event ID and no new entity activity from duplicate observations; pre-commit recovery depends on the event remaining in a later sliding-feed response | Quarantine counters, run summaries, budget debits, executions, and logs may repeat, while the upstream window can advance past an uncommitted event. The old shorthand overstated both persistence and source-delivery guarantees; this is a wording correction, not an architecture change | ADR 0005; Section 8 amendment |
 | Section 16 gates on “plain `docker compose up --build` starts exactly `db`, `setup`, `web`, `worker`” | `web` and `worker` no longer declare a `build:`; `setup` builds the shared image and they wait on it, while the `tools` one-shots keep their own build plus `pull_policy: build` | **The clean-checkout verification found the gate was false.** Compose Bake — on by default in Docker Desktop — makes every service with a `build:` its own bake target, and targets exporting the same `image:` tag race. From a cold image the reviewer's first command failed with `image "github-push-ingestor-app:latest": already exists` and started **zero** containers. It reproduces only when the image is absent, so every prior run on a warm machine passed. This is the defect the deliverable exists to catch | `docker-compose.yml`, `spec/docker_compose_spec.rb` |
 | Section 15 step 8 originally treated `docker kill` as restart-policy verification | `script/verify_recovery.sh` performs **both** the documented API stop and a host-PID-namespace main-process crash, and reports both outcomes separately | `docker kill` is an API stop, and `restart: unless-stopped` skips a container the daemon recorded as manually stopped. Only the independently observed process-crash path exercises automatic restart; substituting that path without recording the distinction would hide the original defect | [`docs/evidence/2026-07-31-container-kill-recovery.md`](docs/evidence/2026-07-31-container-kill-recovery.md), README “Crash recovery verification” |
 | `ENABLED_LIVE_SOURCE_COUNT` is the allowance formula's source-count input | Demoted to a **fallback**. The formula counts enabled, in-service `event_sources` rows of the running mode at window initialization and rollover, and logs `budget.source_allocation_drift` when the two disagree | A configured count that drifts from the table silently mis-sizes every allowance. Boot validation still reads no database, so the refuse-to-boot check is unchanged | ADR 0009 |
@@ -1328,3 +1378,35 @@ Two things worth stating after hardening:
 
 - **Guarantee wording now names only proved invariants.** Broad outcome shorthand was removed; any reference to exactly-once behavior or complete capture/enrichment is a negation or limitation.
 - **The 304 finding survived first-party re-verification.** PR 6's required gate re-ran the probe under `X-GitHub-Api-Version: 2022-11-28` and committed a dated transcript; `x-ratelimit-used` incremented across an unauthenticated `304`, exactly as the review-supplied evidence in Appendix A had reported. The budget arithmetic that rests on it did not have to change.
+
+## Appendix F — Durable enrichment backlog correction (2026-08-02)
+
+The original plan treated enrichment demand above the hourly allowance as grounds for
+terminating old candidates. That conflated a rate limit with a business outcome. The entity
+tables already provide durable, deduplicated work records, so quota scarcity should control
+throughput rather than delete intent.
+
+This amendment supersedes every earlier backlog-discarding statement in the plan:
+
+- Never-enriched actor and repository rows remain `pending` or `retryable_failure` until a
+  real enrichment response produces success or an entity-specific terminal failure.
+- The migration restores legacy budget-dropped rows to `pending` or `retryable_failure`
+  from their attempt history, removes the obsolete timestamp column and status constraint
+  value, and replaces the candidate indexes with partial `(created_at, id)` FIFO indexes.
+- Quota, reserve, and fairness denials defer the row without changing its business state.
+- The default hourly ledger reserves 12 requests for polling, 40 for the enrichment class,
+  and 8 for safety. Durable backlog has priority within the 40, which carry 20/20
+  actor/repository guarantees with borrowing when the other class has no currently
+  claimable backlog candidate.
+- Each class selects FIFO by immutable, non-null `created_at ASC, id ASC`.
+- A selection that observes never-enriched work in either class does not choose refresh.
+  Ingestion can commit a row after that read; because one runner cycle issues at most one
+  request, at most one refresh crosses the boundary before the next selection suppresses it.
+- `/status` reports backlog size, oldest pending timestamp/age, and reserved allowance
+  usage. It intentionally omits a drain ETA because no durable outcome history supports an
+  honest completion rate.
+
+The arithmetic in Appendix A still matters, but its conclusion changes: if unique arrivals
+continue above the 40-attempt service rate, backlog size and oldest pending age can grow
+without a bounded completion estimate. That is an operational fact to expose and capacity
+to revisit, not permission to discard durable work.

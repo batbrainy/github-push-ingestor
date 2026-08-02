@@ -21,8 +21,8 @@ The arithmetic:
   envelopes an hour** before filtering, still bounded by upstream quota rather than by
   anything downstream.
 - Enrichment is bounded by the same 60-request ceiling — around 40 requests an hour after
-  the poll allowance and reserve, which §10 states plainly is a *sample* of demand rather
-  than coverage of it.
+  the poll allowance and reserve. Those attempts are the service rate for a durable FIFO
+  entity backlog; demand beyond that rate is deferred across windows rather than dropped.
 
 Nothing in that profile is throughput-constrained. The bottleneck is a third party's rate
 limit, and no amount of broker capacity moves it.

@@ -10,12 +10,10 @@ module Github
     # simply expires.
     #
     # Leasing on next_retry_at rather than on a new column is the decision this class
-    # rests on, and its payoff is elsewhere: Github::Enrichment::CandidateSelector's two
-    # pools and Github::Enrichment::AgeOut's sweep all spell the same
+    # rests on, and its payoff is elsewhere: both candidate pools spell the same
     # "next_retry_at IS NULL OR next_retry_at <= now" clause, so one predicate excludes
-    # in-flight rows from all four queries at once. A separate leased_until column would
-    # need every one of them to carry a second condition, and the first that forgot would
-    # either skip an entity mid-flight or hand it to a second worker.
+    # in-flight rows consistently. A separate leased_until column would need every query
+    # to carry a second condition, and the first that forgot could hand work to two workers.
     #
     # Holds no executor and no transport, so a GitHub request cannot be issued from
     # inside a claim.
@@ -115,7 +113,7 @@ module Github
       private
 
       # The candidate CTE is Github::Enrichment::CandidateSelector's own scope, so the
-      # eligibility window, the TTL, and §10's two ordering rules are defined in exactly
+      # FIFO order, the TTL, and the two pool rules are defined in exactly
       # one place and this statement cannot drift from the pool it claims out of.
       #
       # Three details carry the correctness:

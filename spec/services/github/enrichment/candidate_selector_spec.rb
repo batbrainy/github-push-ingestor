@@ -8,7 +8,6 @@ RSpec.describe Github::Enrichment::CandidateSelector do
   let(:actor_type) { Github::Enrichment::EntityType.fetch(:actor) }
   let(:repository_type) { Github::Enrichment::EntityType.fetch(:repository) }
 
-  # Inside the pinned 3600-second eligibility window, and safely clear of its edge.
   def pending_actor(github_id:, last_seen_at: now - 60, **overrides)
     create_actor(github_id: github_id, last_seen_at: last_seen_at, **overrides)
   end
@@ -22,22 +21,21 @@ RSpec.describe Github::Enrichment::CandidateSelector do
   end
 
   describe "the pending pool" do
-    # §10: "Among pending candidates the service enriches newest-first (last_seen_at)."
-    it "enriches newest-first, because the freshest activity is the most worth sampling" do
-      pending_actor(github_id: 1, last_seen_at: now - 600)
-      newest = pending_actor(github_id: 2, last_seen_at: now - 10)
+    it "enriches oldest-created first, so every durable backlog row advances toward service" do
+      oldest = pending_actor(github_id: 1, created_at: now - 600)
+      pending_actor(github_id: 2, created_at: now - 10)
 
-      expect(next_pending).to eq(newest)
+      expect(next_pending).to eq(oldest)
     end
 
-    # PageWriter stamps one received_at for a whole page, so every entity on a page shares
-    # an identical last_seen_at. Without a second key the order is plan-dependent and every
-    # example below would be flaky rather than wrong.
-    it "breaks a tie deterministically, because one page gives every entity the same last_seen_at" do
-      pending_actor(github_id: 1, last_seen_at: now - 60)
-      tied = pending_actor(github_id: 2, last_seen_at: now - 60)
+    # PageWriter creates many stubs in one page with one timestamp. The ascending id tie
+    # break preserves insertion order rather than letting PostgreSQL choose a plan-dependent
+    # winner on every reconciliation tick.
+    it "breaks a created-at tie by ascending id" do
+      first = pending_actor(github_id: 1, created_at: now - 60)
+      pending_actor(github_id: 2, created_at: now - 60)
 
-      expect(next_pending).to eq(tied)
+      expect(next_pending).to eq(first)
     end
 
     it "offers a retryable failure alongside a pending row, which is what the index predicate says" do
@@ -58,45 +56,33 @@ RSpec.describe Github::Enrichment::CandidateSelector do
       expect(next_pending).to eq(due)
     end
 
-    it "excludes a candidate whose activity aged past the eligibility window" do
-      pending_actor(github_id: 1, last_seen_at: now - 3601)
+    it "keeps an old candidate claimable until it is eventually enriched" do
+      old = pending_actor(github_id: 1, last_seen_at: now - 100_000,
+                          created_at: now - 100_000)
 
-      expect(next_pending).to be_nil
+      expect(next_pending).to eq(old)
     end
 
     it "excludes a terminal status, which no amount of budget would help" do
       pending_actor(github_id: 1, enrichment_status: "permanent_failure")
-      pending_actor(github_id: 2, enrichment_status: "skipped_budget")
 
       expect(next_pending).to be_nil
     end
 
     # A stub can be created with a NULL last_seen_at: PageWriter upserts the stub, the
     # push_events insert returns nil on a duplicate, and the transaction still commits.
-    # Without COALESCE such a row is neither eligible (NULL > floor is NULL) nor ageable,
-    # and it would sit pending forever — which is exactly what B8 forbids.
-    it "keeps a stub with no last_seen_at eligible for one window after it was created" do
-      stub = create_actor(github_id: 1, last_seen_at: nil)
+    # created_at is total and immutable, so the durable FIFO can still order this work.
+    it "keeps a stub with no last_seen_at claimable regardless of age" do
+      stub = create_actor(github_id: 1, last_seen_at: nil, created_at: now - 100_000)
 
       expect(next_pending).to eq(stub)
     end
 
-    it "ages a stub with no last_seen_at out one window after it was created" do
-      create_actor(github_id: 1, last_seen_at: nil, created_at: now - 3601)
+    it "orders solely by durable insertion time, not later activity" do
+      oldest = pending_actor(github_id: 1, created_at: now - 600, last_seen_at: now - 10)
+      pending_actor(github_id: 2, created_at: now - 300, last_seen_at: now - 200)
 
-      expect(next_pending).to be_nil
-      expect(selector.expired_scope(actor_type, now: now).count).to eq(1)
-    end
-
-    # created_at is safe in the *bound*, where it can only shorten a row's life, and unsafe
-    # in the *order*, where it means "we saw an envelope" — which a duplicate replay also
-    # produces. §10 pins the ordering key by name to last_seen_at, the only column that
-    # means proven distinct activity.
-    it "orders a stub with no last_seen_at behind every candidate that has one" do
-      create_actor(github_id: 1, last_seen_at: nil)
-      proven = pending_actor(github_id: 2, last_seen_at: now - 3000)
-
-      expect(next_pending).to eq(proven)
+      expect(next_pending).to eq(oldest)
     end
 
     it "keeps the two classes apart, so a repository backlog never appears as actor work" do
@@ -125,9 +111,8 @@ RSpec.describe Github::Enrichment::CandidateSelector do
       expect(next_refresh).to eq(stale)
     end
 
-    # Oldest-fetched first is the rule that terminates: a monotone queue cannot starve a
-    # complete row behind a hotter neighbour. §10's newest-first is scoped by its own words
-    # to "Among pending candidates".
+    # Oldest-fetched first is the rule that terminates: a monotone refresh queue cannot
+    # starve a complete row behind a hotter neighbour.
     it "refreshes the most stale record first, so no complete row can be starved" do
       complete_actor(github_id: 1, fetched_at: now - 90_000)
       oldest = complete_actor(github_id: 2, fetched_at: now - 200_000)
@@ -150,9 +135,7 @@ RSpec.describe Github::Enrichment::CandidateSelector do
       expect(next_refresh(repository_type)).to be_nil
     end
 
-    # A refresh candidate is not subject to the eligibility window: it has a document
-    # already, and §10's window bounds the *backlog* of never-enriched work.
-    it "offers a refresh whose activity has long since aged out, because it is not backlog" do
+    it "offers a refresh regardless of how long ago the entity was referenced" do
       stale = complete_actor(github_id: 1, fetched_at: now - 90_000, last_seen_at: now - 100_000)
 
       expect(next_refresh).to eq(stale)
@@ -160,13 +143,11 @@ RSpec.describe Github::Enrichment::CandidateSelector do
   end
 
   describe "#pending_available?" do
-    # §10's borrowing condition, verbatim: "the other class has no CURRENTLY ELIGIBLE
-    # candidate (not merely no rows)".
-    it "answers false for a class whose only rows are ineligible, not merely for an empty table" do
-      pending_actor(github_id: 1, last_seen_at: now - 3601)
+    it "answers true for old durable work rather than treating age as ineligibility" do
+      pending_actor(github_id: 1, last_seen_at: now - 100_000, created_at: now - 100_000)
 
       expect(GithubActor.count).to eq(1)
-      expect(selector.pending_available?(actor_type, now: now)).to be(false)
+      expect(selector.pending_available?(actor_type, now: now)).to be(true)
     end
 
     it "answers true while one eligible candidate remains" do
@@ -182,6 +163,30 @@ RSpec.describe Github::Enrichment::CandidateSelector do
       create_actor(github_id: 1, enrichment_status: "complete", fetched_at: now - 90_000)
 
       expect(selector.pending_available?(actor_type, now: now)).to be(false)
+    end
+  end
+
+  describe "#pending_backlog?" do
+    it "sees never-enriched work even while its retry is deferred" do
+      pending_actor(github_id: 1, enrichment_status: "retryable_failure",
+                    next_retry_at: now + 3600)
+
+      expect(selector.pending_available?(actor_type, now: now)).to be(false)
+      expect(selector.pending_backlog?(actor_type)).to be(true)
+    end
+
+    it "does not count complete or permanently failed rows as never-enriched backlog" do
+      create_actor(github_id: 1, enrichment_status: "complete", fetched_at: now)
+      create_actor(github_id: 2, enrichment_status: "permanent_failure")
+
+      expect(selector.pending_backlog?(actor_type)).to be(false)
+    end
+
+    it "keeps entity classes independent" do
+      create_repository(github_id: 1)
+
+      expect(selector.pending_backlog?(actor_type)).to be(false)
+      expect(selector.pending_backlog?(repository_type)).to be(true)
     end
   end
 
@@ -227,12 +232,11 @@ RSpec.describe Github::Enrichment::CandidateSelector do
       expect(selector.earliest_pending_at(actor_type, now: now)).to be_nil
     end
 
-    # It will be swept into skipped_budget rather than enriched, so naming its retry
-    # instant would promise an enrichment that is never going to happen.
-    it "ignores a candidate that has aged out, which will never become claimable" do
-      pending_actor(github_id: 1, next_retry_at: now + 60, last_seen_at: now - 3601)
+    it "names the retry instant even for a very old candidate" do
+      pending_actor(github_id: 1, next_retry_at: now + 60,
+                    last_seen_at: now - 100_000, created_at: now - 100_000)
 
-      expect(selector.earliest_pending_at(actor_type, now: now)).to be_nil
+      expect(selector.earliest_pending_at(actor_type, now: now)).to eq(now + 60)
     end
   end
 
@@ -293,11 +297,11 @@ RSpec.describe Github::Enrichment::CandidateSelector do
   end
 
   describe "#earliest_claimable_at" do
-    it "takes whichever pool comes back first" do
+    it "keeps refresh timing subordinate to the deferred first-time backlog" do
       pending_actor(github_id: 1, next_retry_at: now + 300)
       create_actor(github_id: 2, enrichment_status: "complete", fetched_at: now - 86_340)
 
-      expect(selector.earliest_claimable_at(actor_type, now: now)).to eq(now + 60)
+      expect(selector.earliest_claimable_at(actor_type, now: now)).to eq(now + 300)
     end
 
     it "falls back to the refresh pool when nothing is pending at all" do
@@ -308,24 +312,6 @@ RSpec.describe Github::Enrichment::CandidateSelector do
 
     it "is nil for a class with nothing at all in either pool" do
       expect(selector.earliest_claimable_at(actor_type, now: now)).to be_nil
-    end
-  end
-
-  describe "#expired_scope" do
-    it "is exactly the complement of the pending pool among due candidates" do
-      inside = pending_actor(github_id: 1, last_seen_at: now - 3599)
-      outside = pending_actor(github_id: 2, last_seen_at: now - 3601)
-
-      expect(selector.scope(actor_type, pool: :pending, now: now).to_a).to eq([ inside ])
-      expect(selector.expired_scope(actor_type, now: now).to_a).to eq([ outside ])
-    end
-
-    # The same due predicate both pools use, which is what keeps a leased row out of the
-    # sweep without a second condition anywhere.
-    it "excludes a row another worker holds, because its lease sits in the future" do
-      pending_actor(github_id: 1, last_seen_at: now - 3601, next_retry_at: now + 600)
-
-      expect(selector.expired_scope(actor_type, now: now)).to be_empty
     end
   end
 

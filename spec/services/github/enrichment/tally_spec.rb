@@ -1,8 +1,8 @@
 require "rails_helper"
 
 RSpec.describe Github::Enrichment::Tally do
-  def result(status:, aged_out: 0)
-    Github::EnrichmentRunner::Result.new(status: status, aged_out: aged_out)
+  def result(status:)
+    Github::EnrichmentRunner::Result.new(status: status)
   end
 
   it "starts at zero on every counter" do
@@ -16,14 +16,6 @@ RSpec.describe Github::Enrichment::Tally do
                            .record(result(status: "deferred"))
 
     expect(tally).to have_attributes(cycles: 3, enriched: 1, failed: 1, deferred: 1, idle: 0)
-  end
-
-  it "accumulates the candidates each cycle aged out" do
-    tally = described_class.empty
-                           .record(result(status: "idle", aged_out: 4))
-                           .record(result(status: "idle", aged_out: 2))
-
-    expect(tally.aged_out).to eq(6)
   end
 
   # Immutable, like Github::Ingestion::Tally: a partially accumulated count can never be
@@ -40,13 +32,14 @@ RSpec.describe Github::Enrichment::Tally do
   end
 
   it "refuses an unknown status rather than dropping it" do
-    expect { described_class.empty.record(Struct.new(:status, :aged_out).new("invented", 0)) }
+    expect { described_class.empty.record(Struct.new(:status).new("invented")) }
       .to raise_error(ArgumentError, /invented/)
   end
 
-  it "prints the counters an operator reads the sampling rate from" do
-    rendered = described_class.empty.record(result(status: "enriched", aged_out: 1_234)).to_s
+  it "prints cycle outcomes without a discarded-work counter" do
+    rendered = described_class.empty.record(result(status: "enriched")).to_s
 
-    expect(rendered).to include("Entities enriched", "Candidates skipped (budget)", "1,234")
+    expect(rendered).to include("Entities enriched", "Cycles deferred", "Cycles with nothing eligible")
+    expect(rendered).not_to include("skipped")
   end
 end

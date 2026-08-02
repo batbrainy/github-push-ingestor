@@ -25,7 +25,6 @@ RSpec.describe Github::Configuration do
         # §10's enrichment block. Rational("0.50") == 0.5, so the literal reads naturally
         # while the arithmetic stays exact.
         actor_enrichment_share: 0.5,
-        enrichment_eligibility_window_seconds: 3600,
         actor_refresh_ttl_seconds: 86_400,
         repository_refresh_ttl_seconds: 86_400,
         # §11's coverage window, pinned at 86400 by §10. It arrives with the rich /status
@@ -41,7 +40,6 @@ RSpec.describe Github::Configuration do
     it "reports through the coverage window without scheduling, reserving or deferring on it" do
       expect(configuration(ENRICHMENT_COVERAGE_WINDOW_SECONDS: "60"))
         .to have_attributes(enrichment_coverage_window_seconds: 60,
-                            enrichment_eligibility_window_seconds: 3600,
                             poll_interval_seconds: 300)
     end
 
@@ -144,11 +142,6 @@ RSpec.describe Github::Configuration do
 
     it "parses the share exactly, so a two-decimal fraction floors to the number on the page" do
       expect(configuration(ACTOR_ENRICHMENT_SHARE: "0.29").actor_enrichment_share).to eq(Rational(29, 100))
-    end
-
-    it "rejects a non-positive eligibility window, which would skip every candidate on sight" do
-      expect { configuration(ENRICHMENT_ELIGIBILITY_WINDOW_SECONDS: "0").validate! }
-        .to raise_error(Github::Errors::ConfigurationError, /ENRICHMENT_ELIGIBILITY_WINDOW_SECONDS/)
     end
 
     it "rejects a zero refresh TTL, which would turn the freshness cache off from a number alone" do

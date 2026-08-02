@@ -203,46 +203,30 @@ RSpec.describe "enrichment fairness under a flood", type: :integration do
     end
   end
 
-  # Extension B's eighth bullet — "bound the enrichment backlog via the eligibility window and
-  # skipped_budget (no unbounded growth)" — at flood scale. spec/services/github/enrichment/
-  # age_out_spec.rb tests the predicate and the batch bound on a handful of rows; the fact
-  # asserted here is the interaction: a class starved by *budget* is still bounded by *time*,
-  # so the two mechanisms compose rather than each assuming the other is doing the work.
-  describe "the backlog stays bounded under a flood" do
-    let(:age_out) { Github::Enrichment::AgeOut.new(configuration: configuration, selector: selector) }
-    let(:past_window) { frozen_time + configuration.enrichment_eligibility_window_seconds + 1 }
+  describe "the backlog remains durable under a flood" do
+    let(:next_window) { frozen_time + 7200 }
 
     before do
       flood_repositories(60)
       flood_actors(3)
-      drain!
+      active_budget_window(now: frozen_time, enrichment_used: 40)
     end
 
-    # Sixty-three rows, comfortably under AgeOut's batch of 1,000, so this measures the
-    # eligibility window and not the batch bound.
-    it "ages the surviving flood into skipped_budget rather than letting it grow" do
-      age_out.call(now: past_window)
-
-      expect(GithubRepository.where(enrichment_status: "pending")).to be_empty
-      expect(GithubRepository.where(enrichment_status: "skipped_budget").count).to eq(60)
+    it "keeps every entity pending after the exhausted window has passed" do
+      expect(GithubRepository.where(enrichment_status: "pending").count).to eq(60)
+      expect(GithubActor.where(enrichment_status: "pending").count).to eq(3)
     end
 
-    it "charges the skipped rows no attempt, because nothing was ever tried on them" do
-      age_out.call(now: past_window)
-
-      skipped = GithubRepository.where(enrichment_status: "skipped_budget")
-
-      expect(skipped.pluck(:enrichment_attempts).uniq).to eq([ 0 ])
-      expect(skipped.pluck(:skipped_at).compact.size).to eq(60)
+    it "charges no entity attempt when quota exhaustion prevented every request" do
+      expect(GithubRepository.distinct.pluck(:enrichment_attempts)).to eq([ 0 ])
+      expect(GithubActor.distinct.pluck(:enrichment_attempts)).to eq([ 0 ])
     end
 
-    it "leaves nothing eligible once the window has passed" do
-      age_out.call(now: past_window)
+    it "makes the old flood claimable when a later quota window opens" do
+      active_budget_window(now: next_window, poll_used: 0, enrichment_used: 0,
+                           actor_share_used: 0, repository_share_used: 0)
 
-      expect(selector.pending_available?(Github::Enrichment::EntityType.fetch(:repository), now: past_window))
-        .to be(false)
-      expect(selector.pending_available?(Github::Enrichment::EntityType.fetch(:actor), now: past_window))
-        .to be(false)
+      expect(fairness.choose(now: next_window)).to be_chosen
     end
   end
 end

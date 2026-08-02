@@ -116,9 +116,7 @@ RSpec.describe "enrichment end to end", type: :integration do
     end
   end
 
-  # §12's named sequence, in one example each: "Enrichment allowance exhaustion → deferred →
-  # skipped_budget → reactivation only via a genuinely new event."
-  describe "exhaustion, skip and reactivation" do
+  describe "durable backlog across quota windows" do
     let(:actor) { GithubActor.find_by(github_id: 583_231) }
 
     before { ingest! }
@@ -131,35 +129,17 @@ RSpec.describe "enrichment end to end", type: :integration do
       expect(actor.reload.attributes).to eq(before)
     end
 
-    it "skips the entity once its activity ages past the eligibility window" do
-      later = now + 3601
-      fixture_enrichment_runner(transport: transport, now: later).call
+    it "eventually enriches work that waited beyond one quota window" do
+      active_budget_window(now: now, enrichment_used: 40)
+      expect(runner.call.status).to eq("deferred")
 
-      expect(actor.reload).to have_attributes(enrichment_status: "skipped_budget", skipped_at: later)
-    end
+      next_window = now + 7200
+      active_budget_window(now: next_window, poll_used: 0, enrichment_used: 0,
+                           actor_share_used: 0, repository_share_used: 0)
+      result = fixture_enrichment_runner(transport: transport, now: next_window).call
 
-    it "reactivates a skipped entity when a genuinely new event references it" do
-      GithubActor.where(github_id: 583_231)
-                 .update_all(enrichment_status: "skipped_budget", skipped_at: now)
-
-      Github::Ingestion::PageWriter.new(clock: -> { now + 60 }).write(
-        [ well_formed_envelope("id" => "58000000099", "payload" => { "push_id" => 27_500_000_099 }) ],
-        run_id: "reactivation"
-      )
-
-      expect(actor.reload).to have_attributes(enrichment_status: "pending", skipped_at: nil)
-    end
-
-    # §7 rule 4, and the README's Phase B replay check: a duplicate replay must emit no
-    # enrichment.reactivated event.
-    it "never reactivates a skipped entity on a duplicate replay" do
-      GithubActor.where(github_id: 583_231)
-                 .update_all(enrichment_status: "skipped_budget", skipped_at: now)
-
-      Github::Ingestion::PageWriter.new(clock: -> { now + 60 })
-                                   .write([ well_formed_envelope ], run_id: "replay")
-
-      expect(actor.reload).to have_attributes(enrichment_status: "skipped_budget", skipped_at: now)
+      expect(result).to have_attributes(status: "enriched", github_id: actor.github_id)
+      expect(actor.reload.enrichment_status).to eq("complete")
     end
   end
 

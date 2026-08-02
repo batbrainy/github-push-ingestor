@@ -1,6 +1,6 @@
 # Design brief — github-push-ingestor
 
-This Rails 8.1 API service samples GitHub's public Events API, stores `PushEvent`
+This Rails 8.1 API service polls GitHub's public Events API, stores `PushEvent`
 records and their raw payloads in PostgreSQL, and enriches referenced actors and
 repositories without a token. The README is the runbook; the [ADRs](adr/) and
 [`IMPLEMENTATION_PLAN.md`](../IMPLEMENTATION_PLAN.md) hold the detailed arguments and
@@ -12,8 +12,9 @@ The assignment asks for durable ingestion, enrichment, and restart safety. The d
 constraint is the source: `/events` is a sliding window with documented delivery latency,
 and unauthenticated callers share 60 requests per hour per outbound IP — an event can
 leave the window unobserved, and enrichment demand can exceed the remaining budget by
-orders of magnitude. The product is therefore an observable, bounded sampler, not a
-mirror, with no guarantee of complete upstream capture or complete enrichment.
+orders of magnitude. Event capture is therefore an observable, bounded sample rather than
+a mirror. Enrichment is different: every never-enriched entity remains durable work, even
+when the backlog cannot drain within a bounded time.
 
 ## Architecture, data, and durability
 
@@ -49,8 +50,8 @@ SHA-256, since malformed data may lack a usable event ID.
 
 Acceptance occurs when a `push_events` row commits. Inserts use
 `ON CONFLICT (github_event_id) DO NOTHING RETURNING id`. A duplicate observation cannot
-create a second event row, and entity activity or `skipped_budget` reactivation occurs only
-when `RETURNING` yields a new row. A replay may still refresh permitted identity fields.
+create a second event row, and entity activity is updated only when `RETURNING` yields a
+new row. A replay may still refresh permitted identity fields.
 These invariants are deliberately narrow: executions, runs, quarantine counts, budget
 debits, and logs can repeat.
 
@@ -87,19 +88,22 @@ unauthenticated [probe](evidence/2026-07-30-unauthenticated-304-quota-probe.md) 
 request: ETags save bandwidth, not budget. The asymmetry decides it — a wrongly-free `304`
 can exhaust the shared window, while a wrongly-charged one costs only local opportunity.
 
-## Bounded, fair, and safe enrichment
+## Durable, fair, and safe enrichment
 
-One observed page held roughly 180 distinct actors and repositories — cold lookups
-competing for 40 hourly attempts. Candidates therefore age from `pending` to the
-terminal `skipped_budget` state after an eligibility window, and only a newly inserted
-push event can reactivate a skipped entity. This bounds actionable backlog, and
-`/status` reports the sampled proportions.
+One observed page held roughly 180 distinct entities — a cold-demand pressure scenario,
+not a measured unique arrival rate, because identities deduplicate into shared rows.
+Defaults reserve 12 attempts for polls, 40 for the enrichment class, and 8 for safety;
+durable FIFO backlog has priority over refresh within the 40. Quota exhaustion only defers
+rows. If unique arrivals exceed service, backlog size and age can grow without a bounded
+completion time.
 
-Each entity class receives a guaranteed share. A class may borrow beyond it only when the
-other has no currently eligible candidate; the ledger independently refuses invalid
-reservations. Never-enriched candidates precede stale refreshes, and selection plus
-leases prevent concurrent duplicate work, so a repository-heavy feed cannot starve actor
-enrichment ([ADR 0007](adr/0007-enrichment-fairness-shares-and-borrowing.md)).
+`/status` exposes per-class count, oldest pending timestamp/age, and allowance usage; it
+omits an ETA because there is no durable outcome history for an honest rate. The 40 attempts
+carry 20/20 actor/repository guarantees with borrowing when the other class has no
+claimable work. A selection that observes a never-enriched row suppresses refresh; one
+concurrent insert can cross a one-request decision/debit window before the next selection
+self-corrects. Selection and leases prevent duplicate work
+([ADR 0007](adr/0007-enrichment-fairness-shares-and-borrowing.md)).
 
 Payload, pagination, and redirect URLs are attacker-influenceable, so the SSRF boundary
 allows only HTTPS URLs whose host is exactly `api.github.com` — no userinfo, non-default
@@ -117,7 +121,7 @@ throughput and fan-out.
 
 Authentication, object storage, extra entity APIs, Kafka, and a frontend were omitted to
 keep the submission focused on correctness at the stated quota. The bottleneck is
-upstream allowance, not local throughput: an authenticated budget would raise coverage
-but not make capture or enrichment complete. Queue capacity and database contention
-should be measured before any broker, and the pinned `2022-11-28` API version
+upstream allowance, not local throughput: an authenticated budget would drain the durable
+backlog faster but would not make upstream event capture complete. Queue capacity and
+database contention should be measured before any broker, and the pinned `2022-11-28` API version
 revalidated before upgrade.

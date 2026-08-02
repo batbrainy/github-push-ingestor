@@ -68,15 +68,14 @@ RSpec.describe "docker-compose.yml" do
     end
 
     # ACTOR_ENRICHMENT_SHARE decides how the ledger splits the enrichment allowance under
-    # its row lock, and the three timings decide which candidates are *currently eligible*
-    # — which is the input to the borrow decision the ledger then acts on. Two processes
-    # reading different values would enforce different policies against one row.
-    it "forwards §10's fairness share and enrichment timings, so one ledger sees one policy" do
+    # its row lock, and the two refresh timings decide when complete rows are eligible for
+    # another fetch. Two processes reading different values would enforce different
+    # policies against one row.
+    it "forwards the fairness share and refresh timings, so one ledger sees one policy" do
       environment = ingest.fetch("environment")
 
       expect(environment).to include(
         "ACTOR_ENRICHMENT_SHARE" => "${ACTOR_ENRICHMENT_SHARE:-0.50}",
-        "ENRICHMENT_ELIGIBILITY_WINDOW_SECONDS" => "${ENRICHMENT_ELIGIBILITY_WINDOW_SECONDS:-3600}",
         "ACTOR_REFRESH_TTL_SECONDS" => "${ACTOR_REFRESH_TTL_SECONDS:-86400}",
         "REPOSITORY_REFRESH_TTL_SECONDS" => "${REPOSITORY_REFRESH_TTL_SECONDS:-86400}"
       )

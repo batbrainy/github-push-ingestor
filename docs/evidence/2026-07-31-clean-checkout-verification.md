@@ -2,7 +2,15 @@
 
 Date: 2026-07-31
 
-Status: First-party observation
+Status: Historical first-party observation; enrichment policy superseded
+
+> [!IMPORTANT]
+> This transcript verifies revision `6eab84c` and preserves its then-current
+> `skipped_budget`/`enrichment.reactivated` assertions as historical evidence. They are not
+> current acceptance gates. The 2026-08-02 durable-backlog correction removes that terminal
+> state, restores affected rows, and makes quota exhaustion a deferral; see
+> [`IMPLEMENTATION_PLAN.md` Appendix F](../../IMPLEMENTATION_PLAN.md) and
+> [ADR 0007](../adr/0007-enrichment-fairness-shares-and-borrowing.md).
 
 Revision verified: `6eab84c6ce6b0660cc124b7b2d1c4012fc127222`
 (branch `issue-22-reviewer-documentation`; the post-merge run against the default branch is

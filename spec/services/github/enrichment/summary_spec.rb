@@ -4,15 +4,23 @@ RSpec.describe Github::Enrichment::Summary do
   let(:now) { frozen_time }
 
   describe ".capture" do
-    it "counts each class by status, which is what a sampling rate looks like" do
+    it "reports raw statuses and the durable backlog separately" do
       create_actor(github_id: 1, enrichment_status: "complete", fetched_at: now)
-      create_actor(github_id: 2, enrichment_status: "skipped_budget", skipped_at: now)
-      create_repository(github_id: 3)
+      create_actor(github_id: 2, enrichment_status: "retryable_failure",
+                   next_retry_at: now + 3600, created_at: now - 600)
+      create_repository(github_id: 3, created_at: now - 300)
 
       summary = described_class.capture(now: now)
 
-      expect(summary.actor_counts).to eq("complete" => 1, "skipped_budget" => 1)
+      expect(summary.actor_counts).to eq("complete" => 1, "retryable_failure" => 1)
       expect(summary.repository_counts).to eq("pending" => 1)
+      expect(summary).to have_attributes(
+        actor_backlog_count: 1, repository_backlog_count: 1,
+        actor_oldest_pending_at: now - 600,
+        repository_oldest_pending_at: now - 300,
+        actor_oldest_pending_age_seconds: 600,
+        repository_oldest_pending_age_seconds: 300
+      )
     end
 
     it "reports the per-class share usage against the guarantees the ledger enforces" do
@@ -44,6 +52,49 @@ RSpec.describe Github::Enrichment::Summary do
 
     it "does not create the ledger row it reads, which only a reservation may" do
       expect { described_class.capture(now: now) }.not_to change(GithubApiBudget, :count).from(0)
+    end
+
+    it "does not claim enrichment can run before a poll initializes the window" do
+      create_actor(github_id: 1)
+
+      summary = described_class.capture(now: now)
+
+      expect(summary).to have_attributes(claimable_now: false, next_enrichment_at: nil)
+      expect(summary.to_s).to include(described_class::WAITING_FOR_WINDOW)
+    end
+
+    it "still says nothing is waiting on an empty clean checkout" do
+      summary = described_class.capture(now: now)
+
+      expect(summary).to have_attributes(work_waiting: false, claimable_now: false,
+                                         next_enrichment_at: nil)
+      expect(summary.to_s).to include(described_class::NOTHING_WAITING)
+      expect(summary.to_s).not_to include(described_class::WAITING_FOR_WINDOW)
+    end
+
+    it "treats an existing uninitialized ledger the same way" do
+      Github::BudgetLedger.new.bootstrap!(now: now)
+      create_actor(github_id: 1)
+
+      expect(described_class.capture(now: now))
+        .to have_attributes(window_status: "uninitialized", claimable_now: false,
+                            next_enrichment_at: nil)
+    end
+
+    [ 0, 40 ].each do |used|
+      it "waits for a poll after an old window elapses with #{used} enrichment attempts used" do
+        active_budget_window(now: now - 3600, reset_at: now - 1,
+                             enrichment_used: used,
+                             actor_share_used: used / 2,
+                             repository_share_used: used / 2)
+        create_actor(github_id: 1)
+
+        summary = described_class.capture(now: now)
+
+        expect(summary).to have_attributes(window_ready: false, work_waiting: true,
+                                           claimable_now: false, next_enrichment_at: nil)
+        expect(summary.to_s).to include(described_class::WAITING_FOR_WINDOW)
+      end
     end
   end
 
@@ -99,6 +150,16 @@ RSpec.describe Github::Enrichment::Summary do
       expect(described_class.capture(now: now).next_enrichment_at).to be_nil
     end
 
+    it "does not report a refresh due while first-time backlog is backed off" do
+      active_budget_window(now: now)
+      create_actor(github_id: 1, enrichment_status: "complete", fetched_at: now - 90_000)
+      create_repository(github_id: 2, enrichment_status: "retryable_failure",
+                        next_retry_at: now + 300)
+
+      expect(described_class.capture(now: now))
+        .to have_attributes(claimable_now: false, next_enrichment_at: now + 300)
+    end
+
     it "takes the earliest across both classes" do
       active_budget_window(now: now)
       create_actor(github_id: 1, enrichment_status: "complete", fetched_at: now)
@@ -137,12 +198,14 @@ RSpec.describe Github::Enrichment::Summary do
       end
     end
 
-    it "prints each class as pending, complete and skipped" do
-      create_actor(github_id: 1)
+    it "prints each class's backlog and oldest wait" do
+      create_actor(github_id: 1, created_at: now - 300)
       create_actor(github_id: 2, enrichment_status: "complete", fetched_at: now)
       active_budget_window(now: now)
 
-      expect(described_class.capture(now: now).to_s).to include("Actors pending/complete/skipped:", "1 / 1 / 0")
+      expect(described_class.capture(now: now).to_s).to include(
+        "Actor backlog:", "1", "Oldest actor pending:", "300s old"
+      )
     end
 
     it "says due now when a candidate is actually claimable" do

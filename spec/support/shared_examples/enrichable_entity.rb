@@ -1,10 +1,8 @@
 # github_actors and github_repositories carry an identical enrichment state machine
 # (IMPLEMENTATION_PLAN.md §7), so its data-level guarantees are asserted once here.
 #
-# Scope note: this covers the two transitions the *ingest* path owns — the activity
-# effect and §7 merge rule 3's reactivation. Every other transition is a fetch outcome
-# and belongs to Github::Enrichment::EntityState, Github::Enrichment::AgeOut, and
-# Github::Enrichment::Claim, each with its own spec.
+# Scope note: activity is the transition the ingest path owns. Fetch outcomes belong to
+# Github::Enrichment::EntityState, and leasing belongs to Github::Enrichment::Claim.
 #
 # The host group must provide `valid_attributes`.
 RSpec.shared_examples "an enrichable entity" do
@@ -38,6 +36,17 @@ RSpec.shared_examples "an enrichable entity" do
       end
     end
 
+    it "rejects the removed budget-skip status at both the model and database levels" do
+      record = described_class.create!(valid_attributes)
+
+      expect(record.update(enrichment_status: "skipped_budget")).to be(false)
+      expect(record.errors[:enrichment_status]).to be_present
+
+      expect_violation(ActiveRecord::CheckViolation) do
+        described_class.where(id: record.id).update_all(enrichment_status: "skipped_budget")
+      end
+    end
+
     it "rejects a negative attempt count at the database level" do
       record = described_class.create!(valid_attributes)
 
@@ -64,7 +73,7 @@ RSpec.shared_examples "an enrichable entity" do
                              .find { |i| i.name == candidate_index_name }
 
       expect(index).not_to be_nil
-      expect(index.columns).to eq(%w[next_retry_at last_seen_at])
+      expect(index.columns).to eq(%w[created_at id])
 
       # Assert semantically, not textually: PostgreSQL rewrites `IN (...)` into
       # `= ANY (ARRAY[...])`, so the stored predicate never matches the migration's
@@ -129,8 +138,8 @@ RSpec.shared_examples "an enrichable entity" do
     end
 
     # A delayed event carries an older created_at (documented 30s-6h latency), and
-    # sources commit independently. An older observation must never move newest-first
-    # enrichment ordering backwards.
+    # sources commit independently. Activity timestamps must remain monotone even though
+    # durable FIFO selection is based on the entity row's immutable created_at.
     it "never regresses an activity timestamp for an older observation" do
       described_class.touch_activity!(github_id: record.github_id,
                                       seen_at: frozen_time + 300,
@@ -154,80 +163,8 @@ RSpec.shared_examples "an enrichable entity" do
 
       expect(record.reload.first_seen_at).to eq(frozen_time)
     end
-
-    # The two halves of §7 merge rule 3 are separate statements, and this is the one that
-    # keeps them honest: an activity update is not a state transition. Reactivation is
-    # .reactivate_skipped!'s single job, and separating them is what lets that method's row
-    # count be exactly the number §11 asks to see logged.
-    it "does not change enrichment status, which reactivation is separately responsible for" do
-      described_class.where(id: record.id)
-                     .update_all(enrichment_status: "skipped_budget", skipped_at: frozen_time)
-
-      described_class.touch_activity!(github_id: record.github_id,
-                                      seen_at: frozen_time + 600,
-                                      event_occurred_at: frozen_time + 600)
-
-      record.reload
-      expect(record.enrichment_status).to eq("skipped_budget")
-      expect(record.skipped_at).to eq(frozen_time)
-    end
   end
 
-  # §7's reactivation rule: "skipped_budget is terminal for the entity's current
-  # eligibility window, not forever." Rule 4 — a duplicate replay can never reactivate — is
-  # held by the *call site*, so it is asserted in page_writer_spec.rb rather than here.
-  describe ".reactivate_skipped!" do
-    let!(:record) { described_class.create!(valid_attributes) }
-
-    def skip!(**overrides)
-      described_class.where(id: record.id)
-                     .update_all({ enrichment_status: "skipped_budget", skipped_at: frozen_time }.merge(overrides))
-    end
-
-    it "returns a skipped entity to pending, because a distinct persisted event proves new activity" do
-      skip!
-
-      expect(described_class.reactivate_skipped!(github_id: record.github_id, now: frozen_time + 600)).to eq(1)
-      expect(record.reload).to have_attributes(enrichment_status: "pending", skipped_at: nil)
-    end
-
-    # §7 line 572: "An entity in the complete state is not reset to pending by a duplicate."
-    it "leaves every other status alone, so no enriched or terminally failed row is disturbed" do
-      (Enrichable::ENRICHMENT_STATUSES - [ "skipped_budget" ]).each do |status|
-        described_class.where(id: record.id).update_all(enrichment_status: status)
-
-        expect(described_class.reactivate_skipped!(github_id: record.github_id, now: frozen_time)).to eq(0)
-        expect(record.reload.enrichment_status).to eq(status)
-      end
-    end
-
-    # enrichment_attempts and last_error are records of *fetches*, and an inbound envelope
-    # is not a fetch. next_retry_at is left because Github::Enrichment::AgeOut never skips a
-    # row whose retry is in the future, so a reactivated row is provably due immediately.
-    it "keeps the failure history a reactivated entity carries, because no fetch just happened" do
-      skip!(enrichment_attempts: 3, last_error: "boom", next_retry_at: frozen_time - 60)
-
-      described_class.reactivate_skipped!(github_id: record.github_id, now: frozen_time)
-
-      expect(record.reload).to have_attributes(enrichment_attempts: 3, last_error: "boom",
-                                               next_retry_at: frozen_time - 60)
-    end
-
-    # Two representations of "skipped" is two things that can disagree, which is the drift
-    # EventSource's own comment names.
-    it "never leaves a skipped instant on a row that is no longer skipped" do
-      skip!
-      described_class.reactivate_skipped!(github_id: record.github_id, now: frozen_time)
-
-      expect(described_class.where.not(enrichment_status: "skipped_budget").where.not(skipped_at: nil))
-        .to be_empty
-    end
-  end
-
-  # The derived invariant Enrichable#reactivate_skipped! relies on to need no
-  # "missing or stale" sub-predicate: skipped_budget implies missing enrichment, because
-  # AgeOut only ever skips rows in CANDIDATE_STATUSES and no row in those two statuses has
-  # ever completed a fetch.
   describe "the candidate-status invariant" do
     it "never leaves a candidate carrying a fetched document" do
       Enrichable::CANDIDATE_STATUSES.each_with_index do |status, index|

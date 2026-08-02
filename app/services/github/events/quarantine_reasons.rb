@@ -59,7 +59,7 @@ module Github
       INVALID_REPOSITORY_REFERENCE = "invalid_repository_reference".freeze
 
       # `created_at` absent, blank, or not parseable as ISO 8601. push_events.occurred_at
-      # is NOT NULL and drives the newest-first enrichment ordering.
+      # is NOT NULL and preserves the event's upstream time.
       INVALID_OCCURRED_AT = "invalid_occurred_at".freeze
 
       # `payload` is not an object, or one of §7's five documented required fields —

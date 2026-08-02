@@ -14,9 +14,8 @@ module Github
     # ## The window is measured on created_at, not occurred_at
     #
     # Coverage grades *this application's* enrichment pipeline, and that pipeline runs on
-    # this application's clock throughout: eligibility is
-    # COALESCE(last_seen_at, created_at) > floor (Github::Enrichment::CandidateSelector),
-    # staleness is fetched_at + TTL, and the budget refills on a wall-clock rate-limit
+    # this application's clock throughout: FIFO backlog insertion uses created_at,
+    # staleness uses fetched_at + TTL, and the budget refills on a wall-clock rate-limit
     # window. A denominator defined by GitHub's event clock would mix two clocks inside one
     # ratio. §11's own wording — "distinct **persisted** push events in the coverage
     # window" — reads the same way, and after downtime created_at is the basis that answers
@@ -54,14 +53,12 @@ module Github
       ACTOR_COMPLETE = "github_actors.enrichment_status = '#{COMPLETE}'".freeze
       REPOSITORY_COMPLETE = "github_repositories.enrichment_status = '#{COMPLETE}'".freeze
 
-      # `>` rather than `>=`, matching CandidateSelector's eligibility floor — one window
-      # convention in this codebase, not two. The table qualifier is mandatory rather than
-      # tidy: all three joined tables carry created_at, so an unqualified column is
-      # ambiguous and PostgreSQL rejects the statement.
+      # `>` gives this reporting window an unambiguous open lower bound. The table
+      # qualifier is mandatory rather than tidy: all three joined tables carry created_at,
+      # so an unqualified column is ambiguous and PostgreSQL rejects the statement.
       #
       # No upper bound. A future-dated row is clock skew, and excluding it would remove the
-      # same row from the numerator and the denominator together — the eligibility window
-      # has none either, for the same reason.
+      # same row from the numerator and the denominator together.
       WINDOW_CLAUSE = "push_events.created_at > :floor".freeze
 
       # §11's three formulas, as six counts taken in one pass.
@@ -85,9 +82,8 @@ module Github
           "COUNT(*) FILTER (WHERE #{ACTOR_COMPLETE} AND #{REPOSITORY_COMPLETE})"
       }.freeze
 
-      # Two decimals. §10 sizes the honest steady state at a low single-digit percentage, so
-      # the second decimal is the one that moves; a fourth would read as precision the
-      # sampling rate does not have.
+      # Two decimals are enough for an operational completion ratio; more would imply
+      # precision that the rolling window does not have.
       PRECISION = 2
 
       # The basis, published so a consumer never has to guess which clock bounds the window.

@@ -11,12 +11,10 @@ module Github
     #     observed on the live feed. Entities have no X-Poll-Interval. Sixty is chosen
     #     here because it matches Github::RateLimitPolicy::MIN_BLOCK_SECONDS and sits well
     #     below the ~90-second mean interval between enrichment requests at the default
-    #     40/hour allowance: long enough for a blip to clear, short enough that the
-    #     backoff is never the reason an entity ages out.
-    #   * MAX_SECONDS is one rate-limit window, which does transfer, and gains a second
-    #     enrichment-specific justification: it equals the pinned
-    #     ENRICHMENT_ELIGIBILITY_WINDOW_SECONDS, so a backoff can never outlast the window
-    #     that would age the row into skipped_budget. The cap is never what strands a row.
+    #     40/hour allowance: long enough for a blip to clear without monopolising the
+    #     durable backlog.
+    #   * MAX_SECONDS is one rate-limit window. A repeatedly failing entity yields to
+    #     other due backlog entries for at most an hour before it becomes eligible again.
     #   * The counting unit differs. PollBackoff counts polls of one source; this counts
     #     fetch attempts against one entity, since the last success.
     #

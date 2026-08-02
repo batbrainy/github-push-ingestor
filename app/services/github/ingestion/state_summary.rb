@@ -29,8 +29,8 @@ module Github
     # question. pending_actor_count here is the enrichment_candidates scope — pending *plus*
     # retryable_failure, which is what "still to enrich" means for the operator about to run
     # bin/enrich. /status reports the literal status under that name and publishes the scope
-    # beside it as `candidates`, because a JSON consumer has no §9 context to disambiguate
-    # from.
+    # beside it as `backlog_count`, because a JSON consumer has no §9 context to disambiguate
+    # from it.
     class StateSummary < Data.define(
       :latest_run_at, :latest_run_id, :push_event_count,
       :pending_actor_count, :pending_repository_count,
@@ -54,9 +54,9 @@ module Github
           push_event_count: PushEvent.count,
           # The scope whose WHERE clause matches index_*_on_enrichment_candidates exactly, so
           # both counts are partial-index counts. It counts pending *and* retryable_failure,
-          # which is what "still to enrich" means; Github::Enrichment::Summary prints the
-          # per-status split that bin/enrich needs, and §11's coverage percentages arrive
-          # with PR 10's /status.
+          # which is what "still to enrich" means; Github::Enrichment::Summary prints this
+          # backlog with its oldest wait and reserved allowance use, while /status adds the
+          # literal per-status split and §11's coverage percentages.
           pending_actor_count: GithubActor.enrichment_candidates.count,
           pending_repository_count: GithubRepository.enrichment_candidates.count,
           budget_resource: budget&.resource, budget_remaining: budget&.remaining,

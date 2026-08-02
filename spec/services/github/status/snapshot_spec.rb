@@ -23,24 +23,25 @@ RSpec.describe Github::Status::Snapshot do
   end
 
   describe "the enrichment counts (plan §11)" do
-    # The example that keeps two numbers from silently becoming one. §11's
-    # pending_actor_count sits beside skipped_actor_count, so it means the *status*;
-    # Github::Ingestion::StateSummary uses the same name for the enrichment_candidates
-    # scope, which is pending plus retryable_failure. Both are right for their own
-    # question. Publishing both under distinct names is what makes them checkable.
-    it "reports pending as the status and the candidate scope under its own name" do
-      create_actor(github_id: 1)
-      create_actor(github_id: 2, login: "two", enrichment_status: "retryable_failure")
+    it "reports raw statuses and the durable backlog under distinct names" do
+      create_actor(github_id: 1, created_at: now - 600)
+      create_actor(github_id: 2, login: "two", enrichment_status: "retryable_failure",
+                   next_retry_at: now + 3600, created_at: now - 300)
 
       actors = payload.dig(:enrichment, :actors)
 
-      expect(actors).to include(pending: 1, retryable_failure: 1, candidates: 2)
+      expect(actors).to include(
+        pending: 1, retryable_failure: 1, backlog_count: 2,
+        oldest_pending_at: (now - 600).utc.iso8601,
+        oldest_pending_age_seconds: 600
+      )
       expect(GithubActor.enrichment_candidates.count).to eq(2)
       expect(Github::Ingestion::StateSummary.capture(now: now).pending_actor_count).to eq(2)
     end
 
     it "names every status including the ones with no rows" do
-      expected = Enrichable::ENRICHMENT_STATUSES.map(&:to_sym) + [ :candidates ]
+      expected = Enrichable::ENRICHMENT_STATUSES.map(&:to_sym) +
+                 %i[backlog_count oldest_pending_at oldest_pending_age_seconds]
 
       expect(payload.dig(:enrichment, :actors).keys).to eq(expected)
       expect(payload.dig(:enrichment, :repositories).keys).to eq(expected)
@@ -48,10 +49,12 @@ RSpec.describe Github::Status::Snapshot do
 
     it "counts each class separately, so one cannot mask the other" do
       create_actor(github_id: 1)
-      create_repository(github_id: 2, enrichment_status: "skipped_budget")
+      create_repository(github_id: 2, enrichment_status: "permanent_failure")
 
-      expect(payload.dig(:enrichment, :actors)).to include(pending: 1, skipped_budget: 0)
-      expect(payload.dig(:enrichment, :repositories)).to include(pending: 0, skipped_budget: 1)
+      expect(payload.dig(:enrichment, :actors)).to include(pending: 1, permanent_failure: 0,
+                                                           backlog_count: 1)
+      expect(payload.dig(:enrichment, :repositories)).to include(pending: 0, permanent_failure: 1,
+                                                                 backlog_count: 0)
     end
   end
 

@@ -1,19 +1,11 @@
 module Github
-  # One enrichment cycle (IMPLEMENTATION_PLAN.md §13's PR 7), in the order §10 and §12
-  # require:
+  # One enrichment cycle (IMPLEMENTATION_PLAN.md §13's PR 7):
   #
-  #   1. age candidates past their eligibility window into skipped_budget — for both
-  #      classes, on every invocation, before anything else
-  #   2. ask §10's fairness policy which class works next, from which pool, and whether it
+  #   1. ask §10's fairness policy which class works next, from which pool, and whether it
   #      may borrow
-  #   3. lease that entity row, so a second worker cannot take it
-  #   4. fetch it through Github.executor — the one and only network call
-  #   5. record the global rate-limit consequence, then the entity outcome
-  #
-  # Step 1 comes first deliberately. §12's sequence is "exhaustion → deferred →
-  # skipped_budget → reactivation", which requires skipping to keep happening *while* the
-  # budget is exhausted — precisely when boundedness matters. Behind the fairness decision
-  # it would stop exactly then, and the backlog would grow without limit.
+  #   2. lease that entity row, so a second worker cannot take it
+  #   3. fetch it through Github.executor — the one and only network call
+  #   4. record the global rate-limit consequence, then the entity outcome
   #
   # **At most one entity per call.** §5 names EnrichActorJob and EnrichRepositoryJob, and one
   # entity is what each of them performs; batching is the caller's loop, which
@@ -45,14 +37,10 @@ module Github
     #   lease_lost the outcome arrived after another worker had claimed the row
     class Result < Data.define(:status, :entity_type, :github_id, :pool, :borrow,
                                :classification, :enrichment_status, :last_error,
-                               :error_code, :deferral_reason, :next_retry_at, :aged_out,
+                               :error_code, :deferral_reason, :next_retry_at,
                                :duration_ms, :enrichment_attempt)
       STATUSES = %w[ enriched failed deferred idle lease_lost ].freeze
 
-      # §11 names the INFO events "enrichment completed/failed/skipped/reactivated", so the
-      # log vocabulary is the plan's rather than this object's. "skipped" is
-      # Github::Enrichment::AgeOut's line and "reactivated" is the ingest path's; the five
-      # here are the outcomes of one cycle.
       EVENTS = {
         "enriched" => "enrichment.completed", "failed" => "enrichment.failed",
         "deferred" => "enrichment.deferred", "idle" => "enrichment.idle",
@@ -62,7 +50,7 @@ module Github
       def initialize(status:, entity_type: nil, github_id: nil, pool: nil, borrow: false,
                      classification: nil, enrichment_status: nil, last_error: nil,
                      error_code: nil, deferral_reason: nil, next_retry_at: nil,
-                     aged_out: 0, duration_ms: nil, enrichment_attempt: nil)
+                     duration_ms: nil, enrichment_attempt: nil)
         raise ArgumentError, "unknown status #{status.inspect}" unless STATUSES.include?(status)
 
         super
@@ -84,7 +72,7 @@ module Github
           error_code: error_code,
           error_message: last_error, deferral_reason: deferral_reason,
           next_retry_at: next_retry_at&.utc&.iso8601,
-          aged_out: (aged_out if aged_out.positive?), duration_ms: duration_ms }.compact
+          duration_ms: duration_ms }.compact
       end
     end
 
@@ -93,7 +81,7 @@ module Github
                    clock: -> { Time.current },
                    monotonic: MONOTONIC,
                    rate_limit_policy: RateLimitPolicy.new,
-                   selector: nil, fairness: nil, claim: nil, age_out: nil, entity_state: nil)
+                   selector: nil, fairness: nil, claim: nil, entity_state: nil)
       @executor = executor
       @configuration = configuration
       @clock = clock
@@ -102,7 +90,6 @@ module Github
       @selector = selector || Enrichment::CandidateSelector.new(configuration: configuration)
       @fairness = fairness || Enrichment::Fairness.new(configuration: configuration, selector: @selector)
       @claim = claim || Enrichment::Claim.new(configuration: configuration, selector: @selector)
-      @age_out = age_out || Enrichment::AgeOut.new(configuration: configuration, selector: @selector)
       @entity_state = entity_state || Enrichment::EntityState.new
     end
 
@@ -113,22 +100,21 @@ module Github
     def call(entity_class: nil)
       now = @clock.call
       started = @monotonic.call
-      aged = @age_out.call(now: now).values.sum
 
       choice = @fairness.choose(entity_class: entity_class, now: now)
-      return idle(choice, aged: aged, started: started) unless choice.chosen?
+      return idle(choice, started: started) unless choice.chosen?
 
       lease = @claim.acquire(choice.entity_type, pool: choice.pool, now: now)
       # A lost race, or a row that moved between the query and the claim. Nothing is
       # wrong, and there is nothing to report about an entity we never held.
-      return idle(Enrichment::Fairness::Choice.none(reason: "no_candidate"), aged: aged, started: started) if lease.nil?
+      return idle(Enrichment::Fairness::Choice.none(reason: "no_candidate"), started: started) if lease.nil?
 
-      enrich(choice, lease, aged: aged, started: started)
+      enrich(choice, lease, started: started)
     end
 
     private
 
-    def enrich(choice, lease, aged:, started:)
+    def enrich(choice, lease, started:)
       fetched = @executor.call(request_for(choice, lease))
       # Before the entity write: a rate limit is a fact about the IP, the global block has
       # to be recorded first, and the secondary-limit branch of the write matrix reads the
@@ -140,7 +126,7 @@ module Github
                                       decision: decision, now: @clock.call)
       @claim.release!(lease) if written.lease_held
 
-      complete(choice, lease, fetched, written, aged: aged, started: started)
+      complete(choice, lease, fetched, written, started: started)
     rescue Errors::FixtureMiss
       # §6 requires a corpus gap to be raised rather than laundered into a failed fetch.
       # The lease goes back untouched: an authoring bug is not an entity outcome and must
@@ -187,7 +173,7 @@ module Github
       )
     end
 
-    def complete(choice, lease, fetched, written, aged:, started:)
+    def complete(choice, lease, fetched, written, started:)
       result = Result.new(
         status: written.outcome, entity_type: choice.entity_type.key,
         github_id: lease.github_id, pool: choice.pool, borrow: choice.borrow,
@@ -199,7 +185,7 @@ module Github
         enrichment_attempt: lease.enrichment_attempts + 1,
         last_error: written.last_error, error_code: written.error_code,
         deferral_reason: (fetched.classification.to_s if written.deferred?),
-        next_retry_at: written.next_retry_at, aged_out: aged,
+        next_retry_at: written.next_retry_at,
         duration_ms: elapsed_ms(started)
       )
 
@@ -207,7 +193,7 @@ module Github
       result
     end
 
-    def idle(choice, aged:, started:)
+    def idle(choice, started:)
       # A deferral the ledger would have refused is reported as such; genuinely having
       # nothing to do is idle. IngestionRunner draws the same line between "not due" and
       # "deferred", and for the same reason: they are different facts and an operator acts
@@ -215,14 +201,13 @@ module Github
       deferred = choice.reason != "no_candidate"
 
       result = Result.new(status: deferred ? "deferred" : "idle",
-                          deferral_reason: choice.reason, aged_out: aged,
+                          deferral_reason: choice.reason,
                           duration_ms: elapsed_ms(started))
       log(result)
       result
     end
 
-    # §11 lists "enrichment completed/failed/skipped/reactivated, retry scheduled" among
-    # the INFO events. A deferral or an idle cycle is DEBUG: under PR 8's recurring task
+    # A completed attempt is INFO. A deferral or an idle cycle is DEBUG: under the recurring task
     # an exhausted window would otherwise emit a line a minute for the rest of the hour,
     # which is the volume argument Github::BudgetLedger#log_class_exhausted already makes.
     def log(result)

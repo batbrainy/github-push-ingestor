@@ -85,14 +85,14 @@ RSpec.describe Github::Enrichment::Coverage do
                                          events_with_both_entities_enriched_pct: 0.0)
     end
 
-    it "counts only complete, not the other four statuses" do
-      %w[pending retryable_failure permanent_failure skipped_budget].each_with_index do |status, n|
+    it "counts only complete, not the other three statuses" do
+      %w[pending retryable_failure permanent_failure].each_with_index do |status, n|
         other = create_actor(github_id: 3000 + n, login: "user#{n}")
         other.update!(enrichment_status: status)
         event("4000000010#{n}", actor: other, repository: repository)
       end
 
-      expect(capture).to have_attributes(actor_count: 4, complete_actor_count: 0,
+      expect(capture).to have_attributes(actor_count: 3, complete_actor_count: 0,
                                          actor_coverage_pct: 0.0)
     end
 

@@ -43,6 +43,13 @@ RSpec.describe "Solid Queue configuration" do
       end
     end
 
+    it "routes every recurring task onto a queue with a configured consumer" do
+      expect(recurring.fetch("production").transform_values { _1.fetch("queue") })
+        .to eq("poll_event_sources" => "polling",
+               "reconcile_pending_enrichments" => "control",
+               "clear_solid_queue_finished_jobs" => "control")
+    end
+
     # Solid Queue's recurring uniqueness guarantee — the unique index on (task_key, run_at) —
     # holds "as long as you keep the jobs around", so preserve_finished_jobs stays at its
     # default and the installer's hourly cleanup is what bounds the table instead.
@@ -61,16 +68,22 @@ RSpec.describe "Solid Queue configuration" do
     end
 
     # A job enqueued into a queue no worker polls is a silent, total failure, and nothing else
-    # in the suite would catch it. Every job here uses the default queue, so one worker on "*"
-    # is the whole guarantee.
+    # in the suite would catch it.
     it "works every queue this application enqueues into" do
-      # Through an instance: Active Job's default queue name is a lambda until a job resolves
-      # it.
       queues = [ PollEventSourceJob, EnrichActorJob, EnrichRepositoryJob,
-                 ReconcilePendingEnrichmentsJob ].map { _1.new.queue_name }.uniq
+                 ReconcilePendingEnrichmentsJob ].map { _1.new.queue_name }.uniq.sort
+      configured = queue_config.dig("production", "workers")
+                               .flat_map { _1.fetch("queues").split(",") }.uniq.sort
 
-      expect(queues).to eq([ "default" ])
-      expect(queue_config.dig("production", "workers").map { _1["queues"] }).to all(eq("*"))
+      expect(queues).to eq(%w[control enrichment polling])
+      expect(configured).to eq(queues)
+    end
+
+    it "isolates the durable enrichment backlog from polling and control work" do
+      workers = queue_config.dig("production", "workers").index_by { _1.fetch("queues") }
+
+      expect(workers.keys).to contain_exactly("polling,control", "enrichment")
+      expect(workers.values).to all(include("threads" => 1, "processes" => 1))
     end
 
     # §5's request gate makes outbound concurrency exactly one application-wide, so extra

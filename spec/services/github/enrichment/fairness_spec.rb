@@ -116,9 +116,9 @@ RSpec.describe Github::Enrichment::Fairness do
                                         borrow: false)
     end
 
-    it "borrows when the other class has rows that are merely ineligible, which is the plan's distinction" do
+    it "borrows when the other class's durable backlog is not currently due" do
       pending_actor
-      create_repository(github_id: 2, last_seen_at: now - 3601)
+      pending_repository(github_id: 2, next_retry_at: now + 300)
 
       expect(choose).to have_attributes(borrow: true, reason: "borrowed_pending")
     end
@@ -148,9 +148,7 @@ RSpec.describe Github::Enrichment::Fairness do
                    last_seen_at: now - 60)
     end
 
-    # §10: "Within each class, never-enriched pending candidates always precede TTL-stale
-    # refreshes — a refresh spends budget only when no pending candidate is currently
-    # eligible."
+    # The durable first-time backlog always precedes TTL refreshes.
     it "prefers a pending candidate over a stale refresh" do
       stale_actor
       pending_repository
@@ -172,6 +170,14 @@ RSpec.describe Github::Enrichment::Fairness do
       pending_repository
 
       expect(choose(entity_class: :actor)).to have_attributes(chosen?: false, reason: "no_candidate")
+    end
+
+    it "does not promote a refresh while the only never-enriched row is backed off" do
+      stale_actor
+      pending_repository(enrichment_status: "retryable_failure",
+                         next_retry_at: now + 3600)
+
+      expect(choose).to have_attributes(chosen?: false, reason: "no_candidate")
     end
 
     # The other class has no refresh of its own to do, so nothing is starved by lending

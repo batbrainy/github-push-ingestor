@@ -48,10 +48,14 @@ What it does, running:
 - **Recovers** on its own: advisory locks die with their session, entity leases expire by
   arithmetic, and a 60-second reconciler rebuilds pending work from committed rows.
 
-**Enrichment is bounded best-effort sampling, and says so.** Against roughly 2,172 cold
-entity requests an hour of demand and 40 available, partial coverage is the design rather
-than a shortfall — `skipped_budget` is a normal documented outcome, and `/status` publishes
-the real sampling rate. See [Known limitations](#known-limitations).
+**Enrichment is a durable, quota-paced backlog.** With the defaults, the hourly ledger
+reserves 12 requests for polling, 40 for the enrichment class, and 8 as a safety reserve.
+Durable backlog work has priority over refreshes within those 40 attempts, which carry
+20/20 actor/repository guarantees with borrowing. Entity
+rows remain actionable until a real enrichment response produces success or an
+entity-specific terminal failure: quota exhaustion defers them to a later window, FIFO
+oldest-first, and never converts delay into a terminal outcome. See [Known
+limitations](#known-limitations) for what happens when arrivals outpace that service rate.
 
 **With the default `GITHUB_MODE=live`, `docker compose up` starts spending real
 unauthenticated quota** — twelve poll requests an hour at the default cadence, plus
@@ -59,8 +63,8 @@ enrichment inside its allowance. That is the intended runtime behaviour (plan §
 `GITHUB_MODE=fixture docker compose up --build` runs the same flow entirely offline.
 
 Poll observations and job deliveries may repeat. The proven write invariant is narrower:
-observing the same valid event again cannot add another `push_events` row or reactivate an
-entity that was skipped for budget. Executions, ingestion-run rows, quarantine occurrence
+observing the same valid event again cannot add another `push_events` row or register new
+entity activity. Executions, ingestion-run rows, quarantine occurrence
 counters, budget use, and logs may repeat. This system does not claim exactly-once execution. See
 [Processing guarantees](#processing-guarantees).
 
@@ -68,7 +72,7 @@ counters, budget use, and logs may repeat. This system does not claim exactly-on
 best place to start. The authoritative execution plan is
 [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) — its pre-implementation revision history
 lives in Git and in its Appendices A–D, and Appendix E records how the build diverged from
-it. Delivery is tracked on the
+it. Appendix F records the durable-enrichment-backlog correction. Delivery is tracked on the
 [GitHub Push Ingestor Delivery project](https://github.com/users/batbrainy/projects/1).
 
 ## Requirements
@@ -244,13 +248,22 @@ output too. The removed one-shot container cannot be queried with `docker compos
 
 ```bash
 sleep 60
+activity_before="$(docker compose exec -T db psql -U postgres \
+  -d github_push_ingestor_development -Atc \
+  "SELECT md5(string_agg(row_to_json(entities)::text, ',' ORDER BY kind, github_id))
+     FROM (SELECT 'actor' AS kind, github_id, first_seen_at, last_seen_at, latest_event_at FROM github_actors
+           UNION ALL
+           SELECT 'repository', github_id, first_seen_at, last_seen_at, latest_event_at FROM github_repositories) entities;")"
 fixture_replay_output="$(mktemp)"
 GITHUB_MODE=fixture docker compose run --rm ingest --force 2>&1 | tee "$fixture_replay_output"
 grep -E 'Duplicates skipped:[[:space:]]+4' "$fixture_replay_output"
-if grep -q 'enrichment.reactivated' "$fixture_replay_output"; then
-  echo "duplicate replay reactivated an entity" >&2
-  exit 1
-fi
+activity_after="$(docker compose exec -T db psql -U postgres \
+  -d github_push_ingestor_development -Atc \
+  "SELECT md5(string_agg(row_to_json(entities)::text, ',' ORDER BY kind, github_id))
+     FROM (SELECT 'actor' AS kind, github_id, first_seen_at, last_seen_at, latest_event_at FROM github_actors
+           UNION ALL
+           SELECT 'repository', github_id, first_seen_at, last_seen_at, latest_event_at FROM github_repositories) entities;")"
+test "$activity_before" = "$activity_after"
 rm -f "$fixture_ingest_output" "$fixture_replay_output"
 ```
 
@@ -434,10 +447,9 @@ bypasses this application's cadence, never GitHub's floor.
 
 Once past it, nothing is created: the same page is absorbed as **4 duplicates**, the
 three quarantine rows stay three rows with their occurrence counts at 2, and no
-entity's activity moves — and **no skipped entity is reactivated**, which is the
-half of plan §7's merge rules a re-polled window would otherwise break. Re-running
-ingestion cannot duplicate accepted event rows or reactivate a skipped entity from the
-same event ID; run summaries, quarantine counters, budget use, and logs may still change. See
+entity's activity moves. Re-running ingestion cannot duplicate accepted event rows or
+register new entity activity from the same event ID; run summaries, quarantine counters,
+budget use, and logs may still change. See
 [ADR 0005](docs/adr/0005-at-least-once-with-idempotent-writes.md).
 
 ### Enrichment, offline
@@ -522,7 +534,7 @@ bypass, so allow a minute between successive ingestion scenarios.
 | Scenario | Command | What it shows | Cleanup |
 |---|---|---|---|
 | `default` | `GITHUB_MODE=fixture docker compose run --rm ingest` | 4 push events, 3 actors, 3 repositories, 3 quarantined | none |
-| `default` (replay) | `… run --rm ingest --force` after 60s | `duplicates_skipped > 0`, occurrence counts climb, no skipped entity reactivated | none |
+| `default` (replay) | `… run --rm ingest --force` after 60s | `duplicates_skipped > 0`, occurrence counts climb, entity activity does not move | none |
 | `default` (enrich) | `… run --rm enrich --limit 6` | both classes enrich within their fairness shares | none |
 | `paginated` | `GITHUB_FIXTURE_SCENARIO=paginated MAX_PAGES_PER_POLL=3 … ingest` | `Link`-driven walk over 3 pages | none |
 | `paginated_final_page` | `GITHUB_FIXTURE_SCENARIO=paginated_final_page … ingest` | the walk stops when no `next` link exists | none |
@@ -553,7 +565,8 @@ curl -s http://localhost:3000/api/push_events/<github_event_id> | jq .data.raw_p
 
 Reports persisted state only: the poll schedule per event source (all five of §9's
 components, plus which one is binding), the per-class ledger state, §11's three
-enrichment coverage percentages, and the per-status entity counts.
+enrichment coverage percentages, the per-status entity counts, and durable-backlog
+telemetry: per-class size, oldest pending timestamp/age, and reserved allowance usage.
 
 Three conventions in the response body are worth knowing before reading one:
 
@@ -567,18 +580,21 @@ Three conventions in the response body are worth knowing before reading one:
   so you can check it.
 - **The coverage window is measured on `created_at`** — when *this application*
   persisted the event, not GitHub's `occurred_at`. Coverage grades this
-  application's enrichment pipeline, and that pipeline's own eligibility and
-  freshness rules already run on this clock. The basis is published as
+  application's enrichment pipeline and uses the same local clock as backlog and
+  freshness reporting. The basis is published as
   `coverage.basis` so the choice is visible rather than assumed. Widen
   `ENRICHMENT_COVERAGE_WINDOW_SECONDS` when reviewing a fixture corpus that has aged.
 - **`actor_requests.available` is a floor, not a ceiling.** §10 lets one class
-  borrow the other's unspent capacity when the other has no eligible candidate, so a
+  borrow the other's unspent capacity when the other has no claimable backlog candidate, so a
   class does not stop at zero available. The real ceiling is the `enrichment` pair
   beside it.
 
 `pending` in the entity counts means `enrichment_status = 'pending'` exactly. The
-`candidates` figure beside it is pending **plus** `retryable_failure` — the "how much
-work is left" number `bin/ingest` prints. Two questions, two names, deliberately.
+`backlog_count` beside it is pending **plus** `retryable_failure` — the "how much work is
+left" number the command summary prints. That work has no age cutoff. `/status`
+deliberately does not publish a drain ETA: the schema has no durable outcome history from
+which to calculate an honest service rate, and sustained arrivals can make the backlog grow
+indefinitely.
 
 ### `GET /api/push_events` and `GET /api/push_events/:id`
 
@@ -721,11 +737,10 @@ not claimed to be reconstructible. See
 | Column | Type | The rule it encodes |
 |---|---|---|
 | `github_id` | `bigint` **unique** | Identity. The stub upsert conflicts on this |
-| `enrichment_status` | `text`, check-constrained | Five legal values; see below |
+| `enrichment_status` | `text`, check-constrained | Four legal values; see below |
 | `first_seen_at`, `last_seen_at`, `latest_event_at` | `timestamp` | Activity. Updated **only** when a `push_events` insert actually returned a row |
-| `next_retry_at` | `timestamp` | Double duty: the backoff instant *and* the enrichment lease. One column, one predicate, so the candidate query, the age-out sweep and the claim cannot drift apart |
+| `next_retry_at` | `timestamp` | Double duty: the backoff instant *and* the enrichment lease. One column, one predicate, so candidate selection and claiming cannot drift apart |
 | `fetched_at` | `timestamp` | When enrichment last succeeded — the input to the refresh TTL |
-| `skipped_at` | `timestamp` | When the eligibility window expired and the row became `skipped_budget` |
 | `raw_payload` | `jsonb` nullable | The enrichment response. Null until a fetch succeeds |
 
 **`event_sources`** — five independent scheduling columns, never one collapsed timestamp:
@@ -751,15 +766,14 @@ limits are IP-scoped rather than window-scoped
 
 | Status | Entered when | Left when | Spends budget |
 |---|---|---|---|
-| `pending` | A stub row is created by ingestion | Enrichment succeeds, fails, or ages out | Yes — it is the candidate pool |
-| `complete` | An enrichment fetch succeeded | The refresh TTL expires, making it a refresh candidate | Only on refresh |
+| `pending` | A stub row is created by ingestion | Enrichment succeeds or reaches a failure outcome | Yes, when allowance is available |
+| `complete` | An enrichment fetch succeeded | Remains complete; after the TTL it may be refreshed in place once a selection observes the never-enriched backlog empty | Only on refresh |
 | `retryable_failure` | A `5xx`, timeout, or transport error | The backoff expires and a retry runs | Yes — it stays a candidate |
-| `permanent_failure` | A `404` or other permanent `4xx` on the entity URL | Never, automatically | No |
-| `skipped_budget` | The eligibility window expired before budget was available | **Only** a genuinely new push event reactivates it | No |
+| `permanent_failure` | A `404` or other permanent `4xx` on the entity URL | Never, automatically | Yes for the HTTP outcome; no future retries |
 
-`skipped_budget` is what bounds the backlog. A duplicate replay refreshes identity fields
-but never reactivates a skipped entity — that is the half of §7's merge rules a re-polled
-window would otherwise break.
+`pending` and `retryable_failure` rows are the durable backlog. They are selected FIFO,
+oldest first, and quota exhaustion only defers them to a later window. A duplicate replay
+may refresh identity fields but does not register new activity or change backlog priority.
 
 ### Replay behavior by table
 
@@ -768,7 +782,7 @@ window would otherwise break.
 | `push_events` | `INSERT … ON CONFLICT (github_event_id) DO NOTHING RETURNING id` | No-op; the accepted raw event is never mutated |
 | `github_actors`, `github_repositories` | `INSERT … ON CONFLICT (github_id) DO UPDATE` on identity fields only | Identity refreshed; enrichment payload untouched |
 | `quarantined_events` | `INSERT … ON CONFLICT (payload_fingerprint) DO UPDATE` | `occurrence_count` increments; the first classification is permanent |
-| Entity activity fields | Gated on the `push_events` insert returning a row | No activity registered, no reactivation |
+| Entity activity fields | Gated on the `push_events` insert returning a row | No activity registered |
 
 Transactions are **one per event**, not one per page, so a single malformed envelope can
 never discard the events persisted beside it. Quarantine writes stand outside any
@@ -781,13 +795,14 @@ planner scans only rows that could possibly qualify:
 
 - `index_event_sources_on_poll_due` on `(source_type, next_poll_at)`
   `WHERE enabled AND status = 'idle'` — the tick's due-source scan.
-- `index_github_{actors,repositories}_on_enrichment_candidates` on
-  `(next_retry_at, last_seen_at)` `WHERE enrichment_status IN ('pending','retryable_failure')`
-  — the candidate pool.
+- `index_github_{actors,repositories}_on_enrichment_candidates` on the oldest-first keys
+  `(created_at, id)`,
+  `WHERE enrichment_status IN ('pending','retryable_failure')` — the durable FIFO
+  candidate pool. `created_at` is immutable and non-null; `first_seen_at` can be null.
 - `index_github_{actors,repositories}_on_enrichment_refresh` on `(fetched_at, next_retry_at)`
   `WHERE enrichment_status = 'complete'` — the TTL refresh pool.
 
-[`db/schema.rb`](db/schema.rb) is authoritative (version `2026_07_31_120000`). For live
+[`db/schema.rb`](db/schema.rb) is authoritative (version `2026_08_02_000000`). For live
 truth:
 
 ```bash
@@ -831,8 +846,9 @@ environment or timestamp:
 
 ### Sample stream
 
-Captured verbatim from a fixture-mode run against an empty database, so you can reproduce
-the same shapes offline:
+Representative, intentionally abridged excerpts from a fixture-mode run against an empty
+database, with queue and backlog fields updated to the current routing. Fields omitted from
+the excerpts remain present in the actual structured logs. You can reproduce them offline:
 
 ```bash
 GITHUB_MODE=fixture docker compose up --build -d
@@ -853,7 +869,7 @@ Boot, then a poll that created four events and quarantined three:
 {"timestamp":"2026-07-31T15:50:49.924Z","level":"info","service":"github-push-ingestor","environment":"development","event":"budget.window_initialized","limit":60,"reserve":8,"poll_allowance":12,"enrichment_allowance":40,"actor_guarantee":20,"repository_guarantee":20,"rate_limit_resource":"core","rate_limit_limit":60,"rate_limit_remaining":59,"rate_limit_used":1,"rate_limit_reset_at":"2026-07-31T16:50:49Z","poll_used":1}
 {"timestamp":"2026-07-31T15:50:49.965Z","level":"info","service":"github-push-ingestor","environment":"development","event":"ingestion.event_quarantined","run_id":"099d562d-1261-488d-9003-cb0c443cdb55","github_event_id":"58000000006","event_type":"PushEvent","error_code":"invalid_field_format","error_message":"payload.head is \"not-a-valid-object-name\", not 40 or 64 hexadecimal characters","payload_fingerprint":"a8ad67ca97a4c48049f5fa447d5d88ae10c58c514e0129546e18b5ff22368020"}
 {"timestamp":"2026-07-31T15:50:49.973Z","level":"info","service":"github-push-ingestor","environment":"development","event":"ingestion.run_completed","run_id":"099d562d-1261-488d-9003-cb0c443cdb55","event_source_id":1,"duration_ms":100.7,"next_poll_at":"2026-07-31T15:55:49Z","consecutive_failures":0,"run_status":"completed","classification":"ok","stop_reason":"no_next_link","pages_fetched":1,"events_received":8,"push_events_seen":6,"events_created":4,"duplicates_skipped":0,"events_quarantined":3,"events_ignored":1,"events_failed":0}
-{"timestamp":"2026-07-31T15:50:50.024Z","level":"info","service":"github-push-ingestor","environment":"development","event":"enrichment.dispatched","actor_enqueued":1,"repository_enqueued":1,"reason":"ingestion","actor_counts":{"pending":3},"repository_counts":{"pending":3},"actor_share_used":0,"repository_share_used":0,"actor_guarantee":20,"repository_guarantee":20,"enrichment_used":0,"enrichment_allowance":40,"window_status":"active","claimable_now":true}
+{"timestamp":"2026-07-31T15:50:50.024Z","level":"info","service":"github-push-ingestor","environment":"development","event":"enrichment.dispatched","actor_enqueued":1,"repository_enqueued":1,"reason":"ingestion","actor_counts":{"pending":3},"repository_counts":{"pending":3},"actor_backlog_count":3,"repository_backlog_count":3,"actor_oldest_pending_age_seconds":0,"repository_oldest_pending_age_seconds":0,"actor_share_used":0,"repository_share_used":0,"actor_guarantee":20,"repository_guarantee":20,"enrichment_used":0,"enrichment_allowance":40,"window_status":"active","claimable_now":true}
 ```
 
 A second run inside the cadence window makes no request at all, and names the component
@@ -867,7 +883,7 @@ From the worker — a job, its enrichment outcome, and the deliberate `404` the 
 so a dead target fails the *entity* rather than the source:
 
 ```text
-{"timestamp":"2026-07-31T15:50:50.780Z","level":"info","service":"github-push-ingestor","environment":"development","event":"job.completed","job_id":"58a1e78d-f473-4440-aee0-fe0bbb22027f","job_class":"EnrichActorJob","queue":"default","attempt":1,"duration_ms":74.6,"entity_type":"actor","github_actor_id":7700421,"enrichment_outcome":"failed"}
+{"timestamp":"2026-07-31T15:50:50.780Z","level":"info","service":"github-push-ingestor","environment":"development","event":"job.completed","job_id":"58a1e78d-f473-4440-aee0-fe0bbb22027f","job_class":"EnrichActorJob","queue":"enrichment","attempt":1,"duration_ms":74.6,"entity_type":"actor","github_actor_id":7700421,"enrichment_outcome":"failed"}
 {"timestamp":"2026-07-31T15:50:50.780Z","level":"info","service":"github-push-ingestor","environment":"development","enrichment_outcome":"failed","entity_type":"actor","github_id":7700421,"pool":"pending","classification":"not_found","entity_status":"permanent_failure","enrichment_attempt":1,"error_message":"GitHub returned 404 (not_found)","duration_ms":56.6,"event":"enrichment.failed"}
 {"timestamp":"2026-07-31T15:51:00.949Z","level":"info","service":"github-push-ingestor","environment":"development","enrichment_outcome":"enriched","entity_type":"actor","github_id":1024025,"pool":"pending","classification":"ok","entity_status":"complete","enrichment_attempt":1,"duration_ms":27.3,"event":"enrichment.completed"}
 ```
@@ -914,10 +930,9 @@ more request attempts per poll than the whole poll allowance.
 
 Enrichment adds `enrichment.completed` and `enrichment.failed`, each carrying the
 entity type, its GitHub id, the response classification, the resulting entity status
-and the attempt number; `enrichment.aged_out`, one summary line per class per sweep
-rather than one per row; `enrichment.reactivated` when a genuinely new push event
-brings a `skipped_budget` entity back; `enrichment.lease_lost` at warning level when
-an outcome arrived after another worker had claimed the row; and
+and the attempt number; budget/class-exhaustion and reconciliation summaries show when
+durable backlog work is waiting for a later quota window; `enrichment.lease_lost` appears
+at warning level when an outcome arrived after another worker had claimed the row; and
 `enrichment.cycle_failed` at error level when an exception escapes a cycle entirely,
 carrying the lease it released and the error class.
 
@@ -1019,7 +1034,7 @@ At limit 60, reserve 8, cadence 300s, one source — the only variable is page d
 | 4 | 48 | 4 | 2 | 2 |
 | 5 | 60 | — | — | **refuses to boot** |
 
-Capture depth is bought with enrichment coverage, at a fixed exchange rate, and the
+Capture depth is bought with backlog-drain capacity, at a fixed exchange rate, and the
 formula tells you the price before you pay it.
 
 ### Global blocks versus class exhaustion
@@ -1102,9 +1117,8 @@ is [`.env.example`](.env.example).
 | `MAX_PAGES_PER_POLL` | `1` | How many `Link`-followed pages one poll may fetch, and an allowance-formula input. Raising it trades enrichment allowance for capture depth — see [the budget table](#the-budget-table) (plan §9, §10) |
 | `ENABLED_LIVE_SOURCE_COUNT` | `1` | Allowance-formula input: live sources sharing one per-IP budget. **A fallback rather than the authority** — at window initialization and rollover the formula counts the enabled, in-service `event_sources` rows of the running mode and uses that instead, falling back to this value only when there are none yet. A disagreement is logged as `budget.source_allocation_drift` (plan §10, [ADR 0009](docs/adr/0009-runtime-source-allocation-and-shared-ip-observability.md)) |
 | `RATE_LIMIT_RESERVE` | `8` | Requests per hour left deliberately unspent (plan §10) |
-| `ACTOR_ENRICHMENT_SHARE` | `0.50` | How the enrichment allowance splits between actors and repositories: `floor(allowance x this)` guarantees actors, the remainder goes to repositories. A guarantee, not a cap — either class may borrow the other's unused capacity when the other has no *currently eligible* candidate. Both ends of `[0, 1]` are legal (plan §10) |
-| `ENRICHMENT_ELIGIBILITY_WINDOW_SECONDS` | `3600` | How long a candidate stays worth enriching. Past it, the entity transitions to `skipped_budget` — which is what bounds the backlog — until a genuinely new push event reactivates it (plan §10, B8) |
-| `ACTOR_REFRESH_TTL_SECONDS` | `86400` | How long an enriched actor is reused before it is re-fetched. Never-enriched candidates always take priority over refreshes (plan §10) |
+| `ACTOR_ENRICHMENT_SHARE` | `0.50` | How the enrichment allowance splits between actors and repositories: `floor(allowance x this)` guarantees actors, the remainder goes to repositories. A guarantee, not a cap — either class may borrow the other's unused capacity when the other has no *currently claimable* backlog candidate. Both ends of `[0, 1]` are legal (plan §10) |
+| `ACTOR_REFRESH_TTL_SECONDS` | `86400` | Minimum reuse time before an enriched actor may be re-fetched. At each selection decision, refreshes are suppressed when either class has never-enriched backlog work (plan §10); see limitation 7 for the bounded concurrent-insert window |
 | `REPOSITORY_REFRESH_TTL_SECONDS` | `86400` | The same, for repositories |
 | `ENRICHMENT_COVERAGE_WINDOW_SECONDS` | `86400` | How far back `GET /status` looks when computing §11's three coverage percentages, measured on `push_events.created_at`. The only knob here that changes what the system *reports* rather than what it *does* |
 
@@ -1130,14 +1144,14 @@ IngestionRunner ──► SourceLock ──► PollSchedule (due? — five compo
                                  │
                                  ├──► PageLoop ──► RequestExecutor ──► RequestGate
 EnrichmentRunner ────────────────┘      │ ▲                        ──► BudgetLedger.reserve!
-  AgeOut → skipped_budget               │ │                        ──► UrlPolicy
-  Fairness → class, pool, borrow        │ └── LinkHeader.next_url  ──► Transport (Faraday | Fixture)
+  FIFO backlog → class, borrow          │ │                        ──► UrlPolicy
+  Refresh only when backlog empty       │ └── LinkHeader.next_url  ──► Transport (Faraday | Fixture)
   Claim → lease on next_retry_at        │                                   │
   (never a SourceLock, §8 step 1)       │                                   ▼
                                         │                  PageWriter: one transaction per event
                                         │                  stub upserts → INSERT … ON CONFLICT
-                                        │                  DO NOTHING RETURNING id → activity
-                                        │                  updates and reactivation only when
+                                        │                  DO NOTHING RETURNING id → entity
+                                        │                  activity updates only when
                                         │                  a row returned
                                         ▼
                               RateLimitPolicy ──► BudgetLedger#block_globally!
@@ -1197,25 +1211,24 @@ EnrichmentRunner ────────────────┘      │ �
   actually happened, so a budget denial or a held gate can neither advance the cadence nor
   burn a healthy source's failure count.
 - **`Github::EnrichmentRunner`** owns one enrichment cycle and enriches at most one
-  entity: it ages overdue candidates into `skipped_budget` first — unconditionally, because
-  §12's sequence needs skipping to keep happening precisely while the budget is exhausted —
-  then asks fairness which class works next, leases that row, fetches through the same
-  chain, and writes one outcome. It never takes a source lock and opens no transaction
+  entity: it asks fairness which class works next, claims the oldest row in that class,
+  fetches through the same chain, and writes one outcome. A denied reservation leaves the
+  row durable for a later window. It never takes a source lock and opens no transaction
   across the request.
 - **`Github::Enrichment::Fairness`** applies §10's ladder: a never-enriched candidate in a
-  class still inside its guarantee, then the same borrowing when the other class has no
-  *currently eligible* candidate, then a TTL-stale refresh only when no pending candidate
-  is eligible anywhere. The refresh pool allocates by the same two steps — prefer a class
-  with room, borrow only from a class with nothing to refresh — so neither pool can starve a
-  class. It decides; the ledger enforces, so a wrong answer produces a refused reservation
-  rather than an overspend
+  class still inside its guarantee, then borrowing when the other class has no
+  *currently claimable* backlog candidate, then a TTL-stale refresh only when the selection
+  observes no never-enriched work in either class. Once refresh is allowed, it uses the same
+  two steps — prefer a class with room, then borrow only from a class with nothing to
+  refresh — so one refresh class cannot starve the other. Fairness decides; the ledger
+  enforces, so a wrong answer produces a refused reservation rather than an overspend
   ([ADR 0007](docs/adr/0007-enrichment-fairness-shares-and-borrowing.md),
   [ADR 0010](docs/adr/0010-secondary-limit-escalation-and-refresh-pool-fairness.md)).
 - **`Github::Enrichment::Claim`** prevents two workers enriching one entity by leasing the
   row — a conditional `UPDATE` that pushes `next_retry_at` forward. One column, one
   meaning: the same predicate excludes leases, backoffs and secondary-limit deferrals from
-  both candidate pools and from the age-out sweep, so the four queries cannot drift apart.
-  A crashed worker leaves nothing to clean up; the lease expires.
+  candidate selection, so the queries cannot drift apart. A crashed worker leaves nothing
+  to clean up; the lease expires.
 - **`Github::Enrichment::EntityState`** is §10's response behaviour resolved onto one
   entity row, and `PollState`'s twin. Its rules: an attempt is counted only for an outcome
   that says something about *this entity* — a rate limit is a fact about the IP — and a
@@ -1293,7 +1306,7 @@ schedules one cycle per class as soon as its rows are committed and its advisory
 lock is released. That enqueue is a *hint*: the durable record of pending work is the
 entity rows themselves, so `ReconcilePendingEnrichmentsJob` sweeps them every 60
 seconds and schedules a cycle for any class that has claimable work and is not
-blocked by the ledger. If a crash loses an enrichment-dispatch hint, the committed eligible
+blocked by the ledger. If a crash loses an enrichment-dispatch hint, the committed
 entity state remains discoverable on a later successful scheduled tick without a special
 cleanup job or queue inspection (plan §8,
 [ADR 0008](docs/adr/0008-post-commit-enqueue-and-entity-scoped-reconciliation.md)).
@@ -1301,7 +1314,9 @@ cleanup job or queue inspection (plan §8,
 Each cycle enriches at most one entity, chosen by §10's fairness policy under a
 lease, so a backlog of ninety pending actors is one queued job rather than ninety.
 Steady state at the defaults: twelve polls an hour, and at most forty enrichment
-requests an hour split between the two classes.
+requests an hour split into 20/20 actor/repository guarantees with borrowing. Within each
+class the oldest never-enriched entity is selected first; a selection considers refresh
+work only after observing the entire never-enriched backlog empty.
 
 ## Processing guarantees
 
@@ -1311,8 +1326,8 @@ before its commit is recoverable only while the event remains in a later GitHub 
 pending enrichment can be reconstructed from committed entity state.
 
 The demonstrated invariant is deliberately specific: a duplicate observation of a valid
-event cannot create another `push_events` row, and cannot reactivate an entity already in
-`skipped_budget`. That does not make the surrounding execution singular. A retry may create
+event cannot create another `push_events` row or register new entity activity. That does
+not make the surrounding execution singular. A retry may create
 another ingestion-run row, increment a malformed payload's occurrence counter, spend another
 budget reservation, execute another job, or emit another log line, depending on its crash
 boundary.
@@ -1323,8 +1338,9 @@ boundary.
   activity update are replay-safe; execution records, counters, budget use, and logs may repeat.
 - **Not complete upstream capture.** The feed is a sliding window with hours of latency;
   see [Known limitations](#known-limitations).
-- **Not complete enrichment coverage.** Demand exceeds the hourly budget by roughly fifty
-  to one; see [Known limitations](#known-limitations).
+- **Not bounded-time enrichment completion.** Durable work is not discarded, but sustained
+  arrivals can exceed the 40-request hourly service rate; see [Known
+  limitations](#known-limitations).
 
 ### The four crash cases
 
@@ -1338,8 +1354,8 @@ boundary.
 ### The mechanisms
 
 - `INSERT … ON CONFLICT (github_event_id) DO NOTHING RETURNING id` — the deduplication gate.
-- Activity updates gated on that `RETURNING` — so a replay refreshes identity but never
-  reactivates a `skipped_budget` entity.
+- Activity updates gated on that `RETURNING` — so a replay may refresh identity but cannot
+  register new activity or change FIFO backlog age.
 - `payload_fingerprint` uniqueness on quarantine — one row per distinct malformed payload,
   occurrence-counted.
 - The entity lease is a `next_retry_at` timestamp that **expires by arithmetic**, so a
@@ -1529,15 +1545,18 @@ newest ~100 events, and the feed moves considerably faster than that. **This ser
 samples the public feed rather than mirroring it.**
 
 The nine limitations that follow are consequences of that, of the 60-request hourly
-ceiling, and of deliberate scope decisions. None is a gap to be closed later; each is a
-stated boundary.
+ceiling, and of deliberate scope decisions. Each is a stated operational boundary.
 
-**1. Enrichment is sampled, not exhaustive.** One observed live page held ~92–95
+**1. Enrichment has no bounded completion time.** One observed live page held ~92–95
 `PushEvent` records with ~89 distinct actors and ~92 distinct repositories — 181 cold
-entity requests per page, ~2,172 an hour at twelve polls, against 40 available. That is
-roughly 1.8% theoretical cold coverage. `skipped_budget` is a normal documented outcome,
-and `/status` publishes the three coverage percentages with every denominator so the real
-sampling rate is visible rather than inferred.
+entity requests per page, or ~2,172 an hour if every poll contained entirely new entities,
+against 40 available. That extrapolation is a pressure scenario, not the measured
+deduplicated arrival rate: repeated actors, repositories, and overlapping pages collapse to
+shared rows. Entity rows nevertheless remain durable FIFO backlog work; quota exhaustion
+defers them to later windows and never terminates them. If measured unique arrivals remain
+above 40 attempts per hour, backlog size and oldest pending age grow and no
+finite drain estimate is honest. `/status` publishes backlog count, oldest pending age,
+and the reserved allowance's usage; it does not fabricate an ETA from incomplete history.
 
 **2. There is no guarantee of complete upstream capture.** Pagination deepens a single
 poll within the budget; it does not backfill. Events that rolled out of the feed's window
@@ -1558,14 +1577,21 @@ count, but a second *live* source is a documented seam rather than shipped behav
 key order, and duplicate keys are lost; array order is preserved because it is meaningful
 ([ADR 0001](docs/adr/0001-jsonb-semantic-retention.md)).
 
-**6. No authentication.** A larger authenticated budget could materially increase feasible
-coverage, but would not make upstream capture or enrichment complete. The unauthenticated
+**6. No authentication.** A larger authenticated budget could drain the durable enrichment
+backlog faster, but would not make upstream event capture complete. The unauthenticated
 constraint is deliberate, not an oversight. See the scaling path in
 [`docs/DESIGN_BRIEF.md`](docs/DESIGN_BRIEF.md).
 
-**7. An enriched entity can be up to 24 hours stale.** `ACTOR_REFRESH_TTL_SECONDS` and
-`REPOSITORY_REFRESH_TTL_SECONDS` default to 86400, and a refresh only spends budget when
-no never-enriched candidate is eligible anywhere.
+**7. Enriched entities can remain stale while backlog exists.**
+`ACTOR_REFRESH_TTL_SECONDS` and `REPOSITORY_REFRESH_TTL_SECONDS` default to 86400, but a
+selection that observes never-enriched work does not choose a refresh. Under sustained
+backlog pressure, staleness can therefore exceed the TTL; the TTL is an earliest refresh
+time, not a deadline. There is one bounded concurrency window: ingestion can commit a new
+candidate after fairness has observed both tables empty but before the chosen refresh is
+debited. Because a runner cycle issues at most one entity request, at most one refresh can
+cross that boundary; the next selection sees the backlog and suppresses refreshes. The race
+cannot discard or terminally mark backlog work, and the ledger still enforces the 40-request
+enrichment cap.
 
 **8. Extension C (object storage) was deliberately not attempted.** A decision with a
 stated reason, not an omission — the remaining budget went to rate-limit correctness,
@@ -1579,13 +1605,14 @@ verification](#crash-recovery-verification); Extension D (testing strategy) is
 [Deterministic fixture verification](#deterministic-fixture-verification) and the suite
 described there.
 
-**9. Business tables grow without bound, by design.** `push_events`, `ingestion_runs`,
-and `quarantined_events` are append-only — this service is the system of record, and
-retention, pruning, and archival were deliberately not built. The 60-request hourly
-ceiling bounds the worst case: twelve poll attempts an hour at up to ~100 events each
-is at most ~1,200 rows an hour, fewer after duplicate skips. The only shipped pruning
-is Solid Queue's finished-job cleanup in the queue database, which holds no business
-data.
+**9. Business tables and the enrichment backlog can grow without bound.** `push_events`,
+`ingestion_runs`, and `quarantined_events` are append-only, and never-enriched actor and
+repository rows remain actionable until attempted — this service is the system of record,
+and retention, pruning, and archival were deliberately not built. Twelve poll attempts an
+hour at up to ~100 events each can add roughly 1,200 event rows and as many as 2,400 entity
+references an hour before deduplication, while only 40 enrichment attempts drain the
+backlog. The only shipped pruning is Solid Queue's finished-job cleanup in the queue
+database, which holds no business data.
 
 ## Development
 
@@ -1599,7 +1626,7 @@ AI-assisted development guidance for this repository lives in
 - [`docs/SUBMISSION_CHECKLIST.md`](docs/SUBMISSION_CHECKLIST.md) — the §16 quality gates as
   a pre-flight checklist.
 - [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) — the execution plan; Appendix E
-  records how the build diverged from it.
+  records build-time divergence and Appendix F the durable-backlog correction.
 
 ## License
 

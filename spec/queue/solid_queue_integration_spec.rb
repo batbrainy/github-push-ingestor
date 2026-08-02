@@ -16,7 +16,7 @@ RSpec.describe "Solid Queue", :queue do
 
       job = SolidQueue::Job.last
       expect(job.class_name).to eq("EnrichActorJob")
-      expect(job.queue_name).to eq("default")
+      expect(job.queue_name).to eq("enrichment")
       expect(SolidQueue::ReadyExecution.where(job_id: job.id)).to exist
     end
 
@@ -70,8 +70,15 @@ RSpec.describe "Solid Queue", :queue do
       expect(configuration).to be_valid, -> { configuration.errors.full_messages.join("; ") }
     end
 
-    it "configures the three processes the worker container runs" do
-      expect(configuration.configured_processes.map(&:kind)).to contain_exactly(:dispatcher, :worker, :scheduler)
+    it "configures a dispatcher, scheduler, and isolated control and enrichment workers" do
+      expect(configuration.configured_processes.map(&:kind))
+        .to contain_exactly(:dispatcher, :worker, :worker, :scheduler)
+
+      worker_queues = configuration.configured_processes
+                                   .select { |process| process.kind == :worker }
+                                   .map { |process| process.attributes.fetch(:queues) }
+
+      expect(worker_queues).to contain_exactly("polling,control", "enrichment")
     end
 
     it "hands the scheduler this application's two ticks" do

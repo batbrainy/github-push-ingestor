@@ -6,6 +6,10 @@
 # It takes no repository id, for the reason EnrichActorJob's comment gives: the entity is
 # chosen by §10's fairness policy under a lease, not by the caller.
 class EnrichRepositoryJob < ApplicationJob
+  # Shares one bounded worker with actor enrichment. Entity rows, not queued job count, are
+  # the backlog; each delivery is only a wake-up that asks the runner to claim one row.
+  queue_as :enrichment
+
   def perform
     result = Github::EnrichmentRunner.new.call(entity_class: GithubRepository)
 

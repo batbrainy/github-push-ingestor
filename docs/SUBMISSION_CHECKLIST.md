@@ -112,18 +112,28 @@ globally named `github-push-ingestor_pgdata` volume.
         SELECT 'repository', enrichment_status, COUNT(*) FROM github_repositories GROUP BY 2;"
       ```
 
-- [ ] After the 60-second poll floor, capture `ingest --force`; require 4 duplicates and no
-      `enrichment.reactivated` line in that captured output:
+- [ ] Before replay, record entity activity; after the 60-second poll floor, capture
+      `ingest --force`, require 4 duplicates, and prove the duplicate registered no new
+      entity activity:
 
       ```bash
       sleep 60
+      activity_before="$(docker compose exec -T db psql -U postgres \
+        -d github_push_ingestor_development -Atc \
+        "SELECT md5(string_agg(row_to_json(entities)::text, ',' ORDER BY kind, github_id))
+           FROM (SELECT 'actor' AS kind, github_id, first_seen_at, last_seen_at, latest_event_at FROM github_actors
+                 UNION ALL
+                 SELECT 'repository', github_id, first_seen_at, last_seen_at, latest_event_at FROM github_repositories) entities;")"
       fixture_replay_output="$(mktemp)"
       GITHUB_MODE=fixture docker compose run --rm ingest --force 2>&1 | tee "$fixture_replay_output"
       grep -E 'Duplicates skipped:[[:space:]]+4' "$fixture_replay_output"
-      if grep -q 'enrichment.reactivated' "$fixture_replay_output"; then
-        echo "duplicate replay reactivated an entity" >&2
-        exit 1
-      fi
+      activity_after="$(docker compose exec -T db psql -U postgres \
+        -d github_push_ingestor_development -Atc \
+        "SELECT md5(string_agg(row_to_json(entities)::text, ',' ORDER BY kind, github_id))
+           FROM (SELECT 'actor' AS kind, github_id, first_seen_at, last_seen_at, latest_event_at FROM github_actors
+                 UNION ALL
+                 SELECT 'repository', github_id, first_seen_at, last_seen_at, latest_event_at FROM github_repositories) entities;")"
+      test "$activity_before" = "$activity_after"
       rm -f "$fixture_ingest_output" "$fixture_replay_output"
       ```
 
@@ -187,8 +197,8 @@ particular, read the erratum atop
 - [ ] **Both** actor and repository enrichment demonstrably occur within their fairness
       guarantees — `spec/services/github/enrichment/end_to_end_spec.rb`; fixture run gives
       `complete 2 / permanent_failure 1` per class
-- [ ] A duplicate event ID cannot add another `push_events` row or reactivate a skipped entity
-      — fixture replay: 4 duplicates absorbed, no `enrichment.reactivated`
+- [ ] A duplicate event ID cannot add another `push_events` row or register new entity
+      activity — fixture replay: 4 duplicates absorbed, activity hash unchanged
 - [ ] `Link`-header pagination is handled; every fetched page fully processed —
       `spec/services/github/ingestion/page_loop_spec.rb`; `paginated` scenario
 - [ ] Rate-limit behavior demonstrated: `304` quota accounting, class-aware ledger
@@ -219,8 +229,13 @@ particular, read the erratum atop
       idempotency of persisted state
 - [ ] Reconciliation recovers missing enrichment scheduling —
       `spec/recovery/pending_enrichment_recovery_spec.rb`
-- [ ] The enrichment backlog is bounded (eligibility window + `skipped_budget` +
-      distinct-event reactivation) — `spec/services/github/enrichment/age_out_spec.rb`
+- [ ] Never-enriched actor and repository rows remain durable backlog work across quota
+      exhaustion and window rollover; candidates are selected FIFO oldest-first —
+      `spec/services/github/enrichment/candidate_selector_spec.rb`,
+      `spec/recovery/pending_enrichment_recovery_spec.rb`
+- [ ] A selection that observes either entity class has never-enriched backlog work does
+      not choose a refresh; the documented concurrent-insert window is bounded to one
+      runner request — `spec/services/github/enrichment/fairness_spec.rb`
 
 ---
 
@@ -232,9 +247,10 @@ particular, read the erratum atop
       trace is one hop
 - [ ] `/health/live` and `/health/ready` are meaningful and never consume budget —
       `spec/requests/health_spec.rb`
-- [ ] `/status` reports window status, poll state, per-class ledger state, pending/skipped
-      counts, and coverage percentages by the defined formulas — without initiating GitHub
-      requests — `spec/requests/status_spec.rb`, `Github::Enrichment::Coverage`
+- [ ] `/status` reports window status, poll state, per-class ledger state, backlog size,
+      oldest pending timestamp/age, reserved allowance usage, and coverage percentages by
+      the defined formulas — without initiating GitHub requests or fabricating a drain ETA
+      — `spec/requests/status_spec.rb`, `Github::Enrichment::Coverage`
 - [ ] During §1's empty-volume fixture phase, while the worker has never been started, hash
       the complete budget row and record all request counters. Call `/health/live`,
       `/health/ready`, and `/status` repeatedly, then require the hash and counters to be

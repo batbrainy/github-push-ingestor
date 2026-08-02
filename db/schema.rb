@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_07_31_120000) do
+ActiveRecord::Schema[8.1].define(version: 2026_08_02_000000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -52,13 +52,12 @@ ActiveRecord::Schema[8.1].define(version: 2026_07_31_120000) do
     t.text "name"
     t.datetime "next_retry_at"
     t.jsonb "raw_payload"
-    t.datetime "skipped_at"
     t.datetime "updated_at", null: false
+    t.index ["created_at", "id"], name: "index_github_actors_on_enrichment_candidates", where: "(enrichment_status = ANY (ARRAY['pending'::text, 'retryable_failure'::text]))"
     t.index ["fetched_at", "next_retry_at"], name: "index_github_actors_on_enrichment_refresh", where: "(enrichment_status = 'complete'::text)"
     t.index ["github_id"], name: "index_github_actors_on_github_id", unique: true
-    t.index ["next_retry_at", "last_seen_at"], name: "index_github_actors_on_enrichment_candidates", where: "(enrichment_status = ANY (ARRAY['pending'::text, 'retryable_failure'::text]))"
     t.check_constraint "enrichment_attempts >= 0", name: "github_actors_enrichment_attempts_nonnegative"
-    t.check_constraint "enrichment_status = ANY (ARRAY['pending'::text, 'complete'::text, 'retryable_failure'::text, 'permanent_failure'::text, 'skipped_budget'::text])", name: "github_actors_enrichment_status_check"
+    t.check_constraint "enrichment_status = ANY (ARRAY['pending'::text, 'complete'::text, 'retryable_failure'::text, 'permanent_failure'::text])", name: "github_actors_enrichment_status_check"
   end
 
   create_table "github_api_budget", id: :integer, default: 1, force: :cascade do |t|
@@ -105,13 +104,12 @@ ActiveRecord::Schema[8.1].define(version: 2026_07_31_120000) do
     t.datetime "next_retry_at"
     t.bigint "owner_github_id"
     t.jsonb "raw_payload"
-    t.datetime "skipped_at"
     t.datetime "updated_at", null: false
+    t.index ["created_at", "id"], name: "index_github_repositories_on_enrichment_candidates", where: "(enrichment_status = ANY (ARRAY['pending'::text, 'retryable_failure'::text]))"
     t.index ["fetched_at", "next_retry_at"], name: "index_github_repositories_on_enrichment_refresh", where: "(enrichment_status = 'complete'::text)"
     t.index ["github_id"], name: "index_github_repositories_on_github_id", unique: true
-    t.index ["next_retry_at", "last_seen_at"], name: "index_github_repositories_on_enrichment_candidates", where: "(enrichment_status = ANY (ARRAY['pending'::text, 'retryable_failure'::text]))"
     t.check_constraint "enrichment_attempts >= 0", name: "github_repositories_enrichment_attempts_nonnegative"
-    t.check_constraint "enrichment_status = ANY (ARRAY['pending'::text, 'complete'::text, 'retryable_failure'::text, 'permanent_failure'::text, 'skipped_budget'::text])", name: "github_repositories_enrichment_status_check"
+    t.check_constraint "enrichment_status = ANY (ARRAY['pending'::text, 'complete'::text, 'retryable_failure'::text, 'permanent_failure'::text])", name: "github_repositories_enrichment_status_check"
   end
 
   create_table "ingestion_runs", force: :cascade do |t|

@@ -13,9 +13,9 @@ module Github
     #   1. a never-enriched pending candidate in a class still inside its guarantee, with
     #      actor before repository only as a tie-break;
     #   2. the same, borrowing, when the other class has no currently eligible candidate;
-    #   3. a TTL-stale refresh, "only when no never-enriched pending candidate is
-    #      eligible" — and §10 scopes that condition globally rather than per class, so a
-    #      refresh waits behind the *other* class's pending backlog too.
+    #   3. a TTL-stale refresh only when no never-enriched backlog row exists. Backoff and
+    #      in-flight leases delay first-time work; they never release its reserved quota
+    #      to refresh traffic.
     #
     # The borrow fact is computed here and asserted to the ledger, and it is stale by
     # construction: a poll can persist a new candidate between this query and the debit.
@@ -73,7 +73,7 @@ module Github
         eligible = EntityType.all.index_with { |type| selector.pending_available?(type, now: now) }
 
         pending_choice(budget, requested, eligible) ||
-          refresh_choice(budget, requested, eligible, now: now) ||
+          refresh_choice(budget, requested, now: now) ||
           Choice.none(reason: "no_candidate")
       end
 
@@ -112,10 +112,9 @@ module Github
         Choice.new(entity_type: borrower, pool: :pending, borrow: true, reason: "borrowed_pending")
       end
 
-      # §10: "a refresh spends budget only when no pending candidate is currently
-      # eligible". Read over every class, not only the requested one, so --class actor
-      # cannot promote an actor refresh above a repository still waiting to be enriched
-      # for the first time.
+      # Refresh is strictly subordinate to the durable first-time backlog. This checks
+      # rows rather than only currently-due candidates, so a backoff or lease cannot let
+      # refresh traffic consume quota reserved for eventual enrichment.
       #
       # Then §10:898's second constraint on the same line — refreshes run "within each
       # class's share" — which makes this the same two-step #pending_choice performs, over
@@ -125,14 +124,8 @@ module Github
       # repository's untouched guarantee and eligible stale rows were never selected, which
       # is the class starvation the split exists to prevent, reproduced one pool down.
       #
-      # The eligibility map is rebuilt over the *refresh* pool rather than reusing
-      # `eligible`. CandidateSelector#pending_available? is deliberately pending-only —
-      # counting refreshes there would let a refresh outrank a never-enriched candidate and
-      # invert §10's ladder — but that hazard cannot arise here: this method is only
-      # reached when no class has a pending candidate at all, so there is nothing left for
-      # a refresh to outrank.
-      def refresh_choice(budget, requested, eligible, now:)
-        return nil if eligible.values.any?
+      def refresh_choice(budget, requested, now:)
+        return nil if EntityType.all.any? { |type| selector.pending_backlog?(type) }
 
         refreshable = EntityType.all.index_with { |type| selector.refresh_available?(type, now: now) }
         available = requested.select { |type| refreshable.fetch(type) }
@@ -158,12 +151,10 @@ module Github
         share_used(budget, entity_type) < guarantee
       end
 
-      # §10's borrowing condition, verbatim: the other class has no CURRENTLY ELIGIBLE
-      # candidate, not merely no rows.
-      #
-      # Generic over whichever eligibility map it is handed, because the condition is the
-      # same question asked of whichever pool is being allocated: #pending_choice passes
-      # the pending map, #refresh_choice the refresh one.
+      # Borrow only when the other class has nothing claimable in the same pool. This is
+      # intentionally about due work rather than all rows: a class in backoff must not
+      # strand capacity the other class can spend. Refresh reaches this helper only after
+      # the global first-time backlog has been proven empty.
       def other_classes_quiet?(entity_type, eligible)
         eligible.except(entity_type).values.none?
       end

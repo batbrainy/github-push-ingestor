@@ -66,12 +66,12 @@ RSpec.describe "a page racing another poller's commit", type: :integration do
   # looks. Raw SQL rather than Active Record, because the pooled connection is inside the
   # example's fixture transaction and anything written through it would be invisible to the
   # index this file is about.
-  def commit_actor!(status: "pending", skipped_at: nil)
-    second_session.exec_params(<<~SQL, [ ACTOR_ID, "octocat", status, stamp, skipped_at ])
+  def commit_actor!(status: "pending", next_retry_at: nil, last_error: nil)
+    second_session.exec_params(<<~SQL, [ ACTOR_ID, "octocat", status, stamp, next_retry_at, last_error ])
       INSERT INTO github_actors
         (github_id, login, display_login, api_url, enrichment_status, enrichment_attempts,
-         last_seen_at, first_seen_at, created_at, updated_at, skipped_at)
-      VALUES ($1, $2, $2, 'https://api.github.com/users/octocat', $3, 0, $4, $4, $4, $4, $5)
+         last_seen_at, first_seen_at, created_at, updated_at, next_retry_at, last_error)
+      VALUES ($1, $2, $2, 'https://api.github.com/users/octocat', $3, 0, $4, $4, $4, $4, $5, $6)
     SQL
   end
 
@@ -121,21 +121,20 @@ RSpec.describe "a page racing another poller's commit", type: :integration do
     end
   end
 
-  # §7's rule 4 — "duplicate replays may refresh identity fields but must never reactivate a
-  # skipped_budget entity" — where the duplicate is another session's commit rather than this
-  # session's own earlier write.
-  describe "a skipped entity whose event another poller committed first" do
+  describe "a retryable entity whose event another poller committed first" do
     before do
-      commit_actor!(status: "skipped_budget", skipped_at: stamp)
+      commit_actor!(status: "retryable_failure", next_retry_at: stamp,
+                    last_error: "GitHub unavailable")
       commit_repository!
       commit_push_event!
     end
 
-    it "cannot be reactivated by losing the race" do
+    it "preserves its failure state when this poller loses the event-insert race" do
       writer.write([ well_formed_envelope ], run_id: SecureRandom.uuid)
 
       expect(GithubActor.find_by(github_id: ACTOR_ID))
-        .to have_attributes(enrichment_status: "skipped_budget", skipped_at: frozen_time)
+        .to have_attributes(enrichment_status: "retryable_failure",
+                            next_retry_at: frozen_time, last_error: "GitHub unavailable")
     end
   end
 

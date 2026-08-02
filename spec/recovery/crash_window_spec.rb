@@ -133,31 +133,35 @@ RSpec.describe "crash windows", type: :integration do
       expect(GithubRepository.count).to eq(3)
     end
 
-    # ADR 0005's fourth mechanism, holding across a crash boundary rather than across a plain
-    # replay: the duplicated envelopes produce no RETURNING row, so the reactivation they
-    # would otherwise trigger never runs.
-    it "reactivates nothing the prefix already recorded" do
+    it "preserves retry state for entities in the duplicated prefix" do
       write_prefix
       GithubActor.where(github_id: IngestionHelpers::ACTOR_GITHUB_ID)
-                 .update_all(enrichment_status: "skipped_budget", skipped_at: frozen_time)
+                 .update_all(enrichment_status: "retryable_failure",
+                             next_retry_at: frozen_time + 3600,
+                             last_error: "GitHub unavailable")
 
       replay_whole_page
 
       expect(GithubActor.find_by(github_id: IngestionHelpers::ACTOR_GITHUB_ID))
-        .to have_attributes(enrichment_status: "skipped_budget", skipped_at: frozen_time)
+        .to have_attributes(enrichment_status: "retryable_failure",
+                            next_retry_at: frozen_time + 3600,
+                            last_error: "GitHub unavailable")
     end
 
-    # The other half of the same rule, so the first is not passing merely because nothing
-    # reactivates anything: a genuinely new event for the same entity does.
-    it "still reactivates that entity for an event the crash had not yet seen" do
+    it "registers activity for an event the crash had not yet seen without clearing retry state" do
       write_prefix
       GithubActor.where(github_id: IngestionHelpers::ACTOR_GITHUB_ID)
-                 .update_all(enrichment_status: "skipped_budget", skipped_at: frozen_time)
+                 .update_all(enrichment_status: "retryable_failure",
+                             next_retry_at: frozen_time + 3600,
+                             last_error: "GitHub unavailable")
 
-      writer.write([ well_formed_envelope("id" => "58000009999") ], run_id: SecureRandom.uuid)
+      writer.write([ well_formed_envelope("id" => "58000009999") ],
+                   run_id: SecureRandom.uuid)
 
       expect(GithubActor.find_by(github_id: IngestionHelpers::ACTOR_GITHUB_ID))
-        .to have_attributes(enrichment_status: "pending", skipped_at: nil)
+        .to have_attributes(enrichment_status: "retryable_failure",
+                            next_retry_at: frozen_time + 3600,
+                            last_error: "GitHub unavailable")
     end
 
     # PageWriter#quarantine is deliberately one statement outside every transaction. A crash
@@ -241,12 +245,8 @@ RSpec.describe "crash windows", type: :integration do
     let(:actor_type) { Github::Enrichment::EntityType.fetch(:actor) }
     let!(:event_source) { fixture_event_source }
 
-    # Ingested at Time.current rather than at frozen_time, for the reason
-    # pending_enrichment_recovery_spec.rb states: Solid Queue constructs
-    # ReconcilePendingEnrichmentsJob, so there is no clock to inject into it and its sweep
-    # measures §10's eligibility window against the wall clock. Entities stamped in 2026-07-29
-    # would be outside that window today, and the reconciler would correctly find nothing —
-    # which would make this example pass for a reason that has nothing to do with recovery.
+    # Ingested at Time.current because Solid Queue constructs the reconciliation job and its
+    # operational timestamps should match the worker clock used in this recovery scenario.
     let(:crashed_at) { Time.current }
 
     before { active_budget_window(now: crashed_at) }

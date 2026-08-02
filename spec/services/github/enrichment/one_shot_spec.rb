@@ -153,14 +153,15 @@ RSpec.describe Github::Enrichment::OneShot do
     it "prints the state blocks even when nothing was enriched" do
       one_shot.call
 
-      expect(output.string).to include("Nothing to enrich", "Actors pending/complete/skipped",
-                                       "Persisted push events")
+      expect(output.string).to include("Nothing to enrich", "Actor backlog",
+                                       "Enrichment backlog budget", "Persisted push events")
     end
 
     it "prints the enrichment counters for the invocation" do
       one_shot.call
 
-      expect(output.string).to include("Enrichment cycles", "Candidates skipped (budget)")
+      expect(output.string).to include("Enrichment cycles", "Cycles with nothing eligible")
+      expect(output.string).not_to include("Candidates skipped")
     end
 
     it "writes the whole block in one call, so a JSON log line cannot split it" do

@@ -8,15 +8,14 @@ require "rails_helper"
 # what it leaves behind is exactly this state, and §2A's claim is that this state is
 # recoverable *because* the entity rows are the durable record of pending work.
 #
-# The page is ingested at Time.current rather than at frozen_time, because the reconciler
-# reads the clock the worker will actually be holding — Solid Queue constructs the job, so
-# there is nothing to inject — and §10's eligibility window is measured against it.
+# The page is ingested at Time.current because the reconciler reads the worker's clock and
+# Solid Queue constructs the job, so there is no test clock to inject into that boundary.
 RSpec.describe "recovering enrichment work that was never enqueued", type: :integration do
   let(:transport) { fixture_transport }
   let(:ingested_at) { Time.current }
 
   before do
-    active_budget_window(now: frozen_time)
+    active_budget_window(now: ingested_at)
     fixture_runner(transport: transport, now: ingested_at).call(event_source: fixture_event_source)
 
     # This line is the crash: the four push events and their six stub entities are committed,
@@ -32,6 +31,17 @@ RSpec.describe "recovering enrichment work that was never enqueued", type: :inte
   end
 
   it "rediscovers it on the next reconciler tick" do
+    expect { ReconcilePendingEnrichmentsJob.perform_now }
+      .to have_enqueued_job(EnrichActorJob).exactly(:once)
+      .and have_enqueued_job(EnrichRepositoryJob).exactly(:once)
+  end
+
+  it "rediscovers pending rows even when their durable insertion time is very old" do
+    GithubActor.update_all(created_at: ingested_at - 30.days,
+                           last_seen_at: ingested_at - 30.days)
+    GithubRepository.update_all(created_at: ingested_at - 30.days,
+                                last_seen_at: ingested_at - 30.days)
+
     expect { ReconcilePendingEnrichmentsJob.perform_now }
       .to have_enqueued_job(EnrichActorJob).exactly(:once)
       .and have_enqueued_job(EnrichRepositoryJob).exactly(:once)

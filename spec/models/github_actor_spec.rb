@@ -64,17 +64,13 @@ RSpec.describe GithubActor do
       expect(actor.enrichment_status).to eq("complete")
     end
 
-    # Plan §7: a duplicate event replay may refresh harmless identity fields but can
-    # never reactivate enrichment, or a re-polled window would resurrect skipped
-    # entities with no new activity.
-    it "leaves a budget-skipped entity skipped, with its failure state intact" do
+    it "refreshes identity without clearing a retryable entity's failure state" do
       described_class.upsert_stub!(github_id: 4242, login: "octocat", now: frozen_time)
       described_class.where(github_id: 4242).update_all(
-        enrichment_status: "skipped_budget",
-        skipped_at: frozen_time,
+        enrichment_status: "retryable_failure",
         enrichment_attempts: 3,
         next_retry_at: frozen_time + 3600,
-        last_error: "enrichment allowance exhausted"
+        last_error: "GitHub unavailable"
       )
 
       described_class.upsert_stub!(github_id: 4242, login: "octocat-renamed",
@@ -82,11 +78,10 @@ RSpec.describe GithubActor do
 
       actor = described_class.find_by(github_id: 4242)
       expect(actor.login).to eq("octocat-renamed")
-      expect(actor.enrichment_status).to eq("skipped_budget")
-      expect(actor.skipped_at).to eq(frozen_time)
+      expect(actor.enrichment_status).to eq("retryable_failure")
       expect(actor.enrichment_attempts).to eq(3)
       expect(actor.next_retry_at).to eq(frozen_time + 3600)
-      expect(actor.last_error).to eq("enrichment allowance exhausted")
+      expect(actor.last_error).to eq("GitHub unavailable")
     end
 
     # Sources commit independently and events arrive late, so an out-of-order envelope

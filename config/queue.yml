@@ -1,12 +1,13 @@
-# Solid Queue's process topology (IMPLEMENTATION_PLAN.md §2A). One supervisor per `worker`
-# container: a dispatcher, a scheduler for config/recurring.yml, and one worker process.
+# Solid Queue's process topology. One supervisor per `worker` container: a dispatcher, a
+# scheduler for config/recurring.yml, and two worker processes.
 #
-# Two threads, not the generator's three, and no JOB_CONCURRENCY knob. §5's global request
-# gate makes outbound concurrency exactly one application-wide, so a third thread could only
-# queue behind the gate — and while it waited it would hold a primary-database connection
-# for up to Github::RequestGate::WAIT_SECONDS (45) out of the RAILS_MAX_THREADS (5) that
-# config/database.yml grants per database. Two keeps a reconciler tick from sitting behind a
-# poll that is mid-fetch, which is the only concurrency this system actually needs.
+# The entity tables are the durable enrichment backlog. Queue deliveries are bounded wake-up
+# hints, not one job per entity, but that backlog can remain non-empty for many quota windows.
+# A dedicated single-thread enrichment worker keeps that long-lived workload isolated. The
+# other worker polls only the bounded polling and control queues; polling is listed first so
+# source acquisition stays prompt, while the one-per-minute job cadence keeps control work
+# from accumulating behind it. Both request paths still serialize outbound traffic through
+# Github::RequestGate, and two processes avoid opening a third primary-database pool.
 #
 # polling_interval stays at 1s. Nothing here is latency-sensitive: the poll cadence is
 # POLL_INTERVAL_SECONDS (300), enrichment is capped by the hourly allowance (40 at the
@@ -16,8 +17,12 @@ default: &default
     - polling_interval: 1
       batch_size: 500
   workers:
-    - queues: "*"
-      threads: 2
+    - queues: polling,control
+      threads: 1
+      processes: 1
+      polling_interval: 1
+    - queues: enrichment
+      threads: 1
       processes: 1
       polling_interval: 1
 

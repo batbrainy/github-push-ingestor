@@ -62,33 +62,7 @@ RSpec.describe Github::EnrichmentRunner do
     end
   end
 
-  describe "the order of one cycle" do
-    before { active_budget_window(now: now) }
-
-    # §12's sequence is "exhaustion → deferred → skipped_budget → reactivation", which
-    # requires skipping to keep happening *while* the budget is exhausted — precisely when
-    # boundedness matters. Behind the fairness decision it would stop exactly then.
-    it "ages out overdue candidates before it asks whether it may spend" do
-      aged = octocat(last_seen_at: now - 3601)
-      active_budget_window(now: now, enrichment_used: 40)
-
-      result = runner.call
-
-      expect(result).to have_attributes(status: "deferred", deferral_reason: "class_exhausted", aged_out: 1)
-      expect(aged.reload.enrichment_status).to eq("skipped_budget")
-    end
-
-    it "sweeps on every cycle, including the ones that enrich something" do
-      octocat
-      create_actor(github_id: 999, last_seen_at: now - 3601)
-
-      expect(runner.call.aged_out).to eq(1)
-    end
-  end
-
   describe "deferrals" do
-    # §12 line 981's first step. The entity is untouched and stays in the pool; it becomes
-    # skipped_budget only later, through the sweep, when its own activity ages out.
     it "returns deferred without touching the entity when the class allowance is gone" do
       actor = octocat
       active_budget_window(now: now, enrichment_used: 40)
@@ -119,6 +93,22 @@ RSpec.describe Github::EnrichmentRunner do
       active_budget_window(now: now, enrichment_used: 40)
 
       expect { runner.call }.not_to change { current_budget.enrichment_used }.from(40)
+    end
+
+    it "keeps old work durable across quota windows and enriches it when capacity returns" do
+      actor = octocat(last_seen_at: now - 100_000, created_at: now - 100_000)
+      active_budget_window(now: now, enrichment_used: 40)
+
+      expect(runner.call).to have_attributes(status: "deferred", deferral_reason: "class_exhausted")
+      expect(actor.reload.enrichment_status).to eq("pending")
+
+      next_window = now + 3601
+      active_budget_window(now: next_window, poll_used: 0, enrichment_used: 0,
+                           actor_share_used: 0, repository_share_used: 0)
+      result = fixture_enrichment_runner(transport: transport, now: next_window).call
+
+      expect(result).to have_attributes(status: "enriched", github_id: actor.github_id)
+      expect(actor.reload.enrichment_status).to eq("complete")
     end
   end
 

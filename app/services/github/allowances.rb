@@ -88,9 +88,9 @@ module Github
     # What to actually store when the observed limit makes the configuration
     # infeasible — an IP co-tenant scenario, a proxy, or an unexpected tier.
     #
-    # Polling wins the clamp: §10 ranks polling first, and enrichment reaching zero is
-    # an already-modelled, documented outcome (skipped_budget), whereas polling
-    # stopping is a Story 1 failure. Runtime degrades; only boot refuses.
+    # Polling wins the clamp: §10 ranks polling first, and enrichment reaching zero
+    # defers the durable backlog until a later window, whereas polling stopping is a
+    # Story 1 failure. Runtime degrades; only boot refuses.
     #
     # **The floor of one is what makes "degrades" true rather than "stops".** An observed
     # limit at or below the reserve leaves nothing spendable, and the plain minimum gave

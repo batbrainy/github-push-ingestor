@@ -2,7 +2,7 @@ require "rails_helper"
 
 # §12's "Enrichment job executed twice" exercises one redelivery case. The ingestion-wide
 # guarantees are narrower: a duplicate event ID cannot create another push_events row or
-# reactivate a skipped entity. Executions, run summaries, quarantine counters, budget use,
+# register new entity activity. Executions, run summaries, quarantine counters, budget use,
 # and logs can repeat. Here the second execution really happens, and this scenario asserts
 # only that an already-complete actor is left unchanged by the freshness check.
 #

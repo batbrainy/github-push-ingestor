@@ -5,6 +5,12 @@ Date: 2026-08-01 (UTC)
 Status: Verification of runtime behavior and repository-history gates at the default-branch
 SHA below, plus documentation-only gates against the PR #42 content identified separately
 
+> [!IMPORTANT]
+> This transcript predates the 2026-08-02 durable-backlog correction. Its
+> `enrichment.reactivated` replay assertion verifies the old revision only and is no longer
+> a current gate. Current quota exhaustion defers durable FIFO work instead of creating a
+> terminal budget-skip state; see [`IMPLEMENTATION_PLAN.md` Appendix F](../../IMPLEMENTATION_PLAN.md).
+
 ```text
 Runtime checkout:    88e2260c7f20fea06cdacb88d62132caaed1fc14 (default branch)
 Design-brief source:  blob af214de7a2fc5c1ee3716ec7ff1ee2e73df21b06

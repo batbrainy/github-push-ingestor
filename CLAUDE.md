@@ -8,7 +8,8 @@ plan wins.
 
 1. Read `IMPLEMENTATION_PLAN.md` (repository root). It is the frozen execution
    plan; its pre-implementation revision history lives in Git and in its
-   Appendices A–D, and Appendix E records how the build diverged from it.
+   Appendices A–D, Appendix E records how the build diverged from it, and Appendix F
+   supersedes the enrichment load-shedding policy with a durable backlog.
 2. Read `docs/DESIGN_BRIEF.md` and the ADRs under `docs/adr/`.
 3. Do not change architectural direction, add infrastructure, or add dependencies
    without first updating the plan and stating the tradeoff.
@@ -55,7 +56,7 @@ acquire `SourceLock` — they take only the request gate.
 
 Repeated observation and job execution are expected. State only the two proved ingestion
 invariants: a duplicate GitHub event ID cannot create another `push_events` row, and that
-duplicate cannot register entity activity or reactivate a `skipped_budget` entity.
+duplicate cannot register entity activity.
 Executions, ingestion runs, quarantine occurrence counts, budget debits, and logs may
 repeat or change. Recovery before commit is conditional on the event remaining in a later
 sliding-feed response. Never claim or code against exactly-once execution or universal
@@ -64,9 +65,9 @@ idempotency of persisted state.
 ### Duplicate-event invariants (plan §7)
 
 - `push_events` inserts use `ON CONFLICT (github_event_id) DO NOTHING RETURNING id`.
-- Entity activity fields (`last_seen_at`, `latest_event_at`, reactivation) update
-  only when `RETURNING` produced a row. Duplicate replays may refresh identity
-  fields but must never reactivate a `skipped_budget` entity.
+- Entity activity fields (`last_seen_at`, `latest_event_at`) update only when
+  `RETURNING` produced a row. Duplicate replays may refresh identity fields but must
+  never register new entity activity.
 - Quarantine identity is `payload_fingerprint` alone: SHA-256 of compact UTF-8
   JSON with recursively sorted object keys. One algorithm, no alternates.
 
@@ -75,6 +76,14 @@ idempotency of persisted state.
 Enrichment fetches only validated URLs: HTTPS, host exactly `api.github.com`, no
 userinfo, no non-default port, no IP literals, bounded re-validated redirects.
 Fixture mode fails closed — never a live fallback.
+
+### Durable enrichment backlog (plan §10, Appendix F)
+
+Never-enriched entity rows remain actionable across quota windows. Select them FIFO by
+`created_at ASC, id ASC`; quota or fairness denial defers rather than terminates. The
+default hourly split is 12 polling requests, 40 backlog-enrichment requests, and 8 safety
+reserve requests, with 20/20 actor/repository guarantees and borrowing. Do not schedule a
+refresh while either class has never-enriched work.
 
 ## Database changes
 

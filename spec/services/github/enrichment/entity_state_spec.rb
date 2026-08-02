@@ -66,14 +66,14 @@ RSpec.describe Github::Enrichment::EntityState do
       expect(actor.reload.enrichment_attempts).to eq(0)
     end
 
-    # A stale error or skip instant on a successful row is a permanent lie —
-    # PollState#success's clearing argument, applied to the entity.
-    it "clears the failure and skip state, which would otherwise outlive the failure" do
-      actor.update!(last_error: "boom", skipped_at: now - 60)
+    # A stale error on a successful row is a permanent lie — PollState#success's clearing
+    # argument, applied to the entity.
+    it "clears failure state, which would otherwise outlive the failure" do
+      actor.update!(last_error: "boom")
 
       record(classification: :ok, status: 200, body: good_body, document: document_for(good_body))
 
-      expect(actor.reload).to have_attributes(last_error: nil, skipped_at: nil)
+      expect(actor.reload.last_error).to be_nil
     end
 
     # The next event for this row is a *refresh*, gated by fetched_at plus the TTL rather
@@ -259,8 +259,6 @@ RSpec.describe Github::Enrichment::EntityState do
       expect(actor.reload.attributes).to eq(before)
     end
 
-    # §12's sequence is "exhaustion → deferred → skipped_budget": a denial writes nothing at
-    # all, and the row becomes skipped only later, when its activity ages out.
     it "leaves the row exactly as it found it on a budget denial" do
       before = actor.reload.attributes
 

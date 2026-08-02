@@ -17,7 +17,7 @@ module Github
     # how fast jobs can be created. One live page carries ~90 distinct actors and ~90
     # distinct repositories; enqueuing per created event would put ~2,400 argument-identical
     # cycles an hour on a queue that can spend 40 requests, and every surplus one would run
-    # the age-out sweep and the fairness reads to be told no. The reconciler's 60-second
+    # the fairness reads only to be told no. The reconciler's 60-second
     # cadence is what refills the pipeline instead — it is faster than the budget can be
     # spent, and it self-limits when the budget is gone.
     #
@@ -44,8 +44,12 @@ module Github
       # @return [Hash] the payload it logged, so a caller can assert on it.
       def call(reason:)
         now = @clock.call
-        schedule = class_schedule(now: now)
-        blocked = !schedule.due?(now: now)
+        budget = GithubApiBudget.find_by(id: GithubApiBudget::SINGLETON_ID)
+        schedule = class_schedule(budget, now: now)
+        window_block = window_blocked_by(budget, now: now)
+        schedule_blocked = !schedule.due?(now: now)
+        blocked = schedule_blocked || window_block.present?
+        blocked_by = schedule_blocked ? schedule.binding_component : window_block
 
         payload = EntityType.all.each_with_object({}) do |entity_type, counts|
           enqueue = !blocked && @selector.claimable?(entity_type, now: now)
@@ -54,7 +58,8 @@ module Github
           counts[:"#{entity_type.key}_enqueued"] = enqueue ? 1 : 0
         end
 
-        log(payload.merge(reason: reason, blocked_by: (schedule.binding_component if blocked)).compact, now: now)
+        log(payload.merge(reason: reason, blocked_by: (blocked_by if blocked)).compact,
+            budget: budget, now: now)
       end
 
       private
@@ -70,17 +75,21 @@ module Github
       # relieved by borrowing, not a deferral, so refusing to enqueue on it would withhold
       # work the ledger would have granted.
       #
-      # find_by, never bootstrap!: a read path must not create the ledger row. A clean
-      # checkout has no row, every component is nil, and the schedule is due — which is
-      # right, because the first poll is what initializes the window.
-      def class_schedule(now:)
-        budget = GithubApiBudget.find_by(id: GithubApiBudget::SINGLETON_ID)
-
+      # The caller obtains the row with find_by, never bootstrap!: a read path must not
+      # create it. A missing or existing-uninitialized ledger blocks dispatch because the
+      # request gate would deny enrichment until the first poll supplies authoritative
+      # rate-limit headers.
+      def class_schedule(budget, now:)
         EnrichmentSchedule.new(
           next_retry_at: nil,
           global_blocked_until: budget&.global_blocked_until,
           enrichment_class_blocked_until: budget&.enrichment_class_blocked_until(now: now)
         )
+      end
+
+      def window_blocked_by(budget, now:)
+        return :window_uninitialized if budget.nil? || budget.window_initialized_at.nil?
+        :window_elapsed if budget.reset_at.present? && now >= budget.reset_at
       end
 
       # §11 lists "reconciliation summaries" among the INFO events, and this is that line —
@@ -91,10 +100,11 @@ module Github
       #
       # The summary is PR 7's, unchanged: per-status counts per class, per-class share usage,
       # the window state, and when enrichment is next due.
-      def log(payload, now:)
+      def log(payload, budget:, now:)
         enqueued = payload.fetch(:actor_enqueued) + payload.fetch(:repository_enqueued)
         entry = { event: "enrichment.dispatched", **payload,
-                  **Summary.capture(now: now, configuration: @configuration, selector: @selector).to_log }
+                  **Summary.capture(now: now, configuration: @configuration,
+                                    selector: @selector, budget: budget).to_log }
 
         enqueued.positive? ? Rails.logger.info(entry) : Rails.logger.debug(entry)
         payload

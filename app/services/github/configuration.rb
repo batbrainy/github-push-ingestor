@@ -36,7 +36,6 @@ module Github
       "MAX_REDIRECTS" => "2",
       "SOURCE_LOCK_WAIT_SECONDS" => "30",
       "ACTOR_ENRICHMENT_SHARE" => "0.50",
-      "ENRICHMENT_ELIGIBILITY_WINDOW_SECONDS" => "3600",
       "ACTOR_REFRESH_TTL_SECONDS" => "86400",
       "REPOSITORY_REFRESH_TTL_SECONDS" => "86400",
       "ENRICHMENT_COVERAGE_WINDOW_SECONDS" => "86400"
@@ -46,13 +45,11 @@ module Github
     # divides, and a zero page count or source count silently derives a poll allowance
     # of nothing.
     #
-    # The three enrichment timings join the group for the same reason. A zero
-    # eligibility window puts every candidate past its window the instant it is created,
-    # so the sweep skips the entire backlog and enrichment can never run; a zero refresh
-    # TTL makes every enriched entity instantly stale, turning off the freshness cache
-    # §13 lists as a PR 7 capability. "Never refresh" is a large number, not zero.
+    # The two enrichment refresh timings join the group for the same reason. A zero
+    # refresh TTL makes every enriched entity instantly stale, turning off the freshness
+    # cache §13 lists as a PR 7 capability. "Never refresh" is a large number, not zero.
     #
-    # The coverage window is the fourth, and it fails the same way from the other end. It
+    # The coverage window is reporting-only, and it fails the same way from the other end. It
     # is the sole denominator of §11's three percentages, so a zero window puts every
     # denominator at zero and Github::Enrichment::Coverage reports null for all three,
     # permanently — §11's headline metric disabled by a number rather than by a decision.
@@ -66,7 +63,6 @@ module Github
       http_open_timeout_seconds: "HTTP_OPEN_TIMEOUT_SECONDS",
       http_read_timeout_seconds: "HTTP_READ_TIMEOUT_SECONDS",
       source_lock_wait_seconds: "SOURCE_LOCK_WAIT_SECONDS",
-      enrichment_eligibility_window_seconds: "ENRICHMENT_ELIGIBILITY_WINDOW_SECONDS",
       actor_refresh_ttl_seconds: "ACTOR_REFRESH_TTL_SECONDS",
       repository_refresh_ttl_seconds: "REPOSITORY_REFRESH_TTL_SECONDS",
       enrichment_coverage_window_seconds: "ENRICHMENT_COVERAGE_WINDOW_SECONDS"
@@ -93,8 +89,7 @@ module Github
                 :enabled_live_source_count, :rate_limit_reserve,
                 :http_open_timeout_seconds, :http_read_timeout_seconds,
                 :max_http_retries, :max_redirects, :source_lock_wait_seconds,
-                :actor_enrichment_share, :enrichment_eligibility_window_seconds,
-                :actor_refresh_ttl_seconds, :repository_refresh_ttl_seconds,
+                :actor_enrichment_share, :actor_refresh_ttl_seconds, :repository_refresh_ttl_seconds,
                 :enrichment_coverage_window_seconds
 
     def initialize(env = ENV)

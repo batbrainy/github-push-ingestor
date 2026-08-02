@@ -41,11 +41,9 @@ x-app-env: &app_env
   RATE_LIMIT_RESERVE: ${RATE_LIMIT_RESERVE:-8}
   # §10's enrichment policy, in the shared anchor for a sharper version of the same
   # reason. ACTOR_ENRICHMENT_SHARE decides how the ledger splits the enrichment allowance
-  # under its row lock, and the three timings decide which candidates are *currently
-  # eligible* — which is the input to the borrow decision the ledger then acts on. Two
+  # under its row lock, and the refresh TTLs decide when completed rows become stale. Two
   # processes reading different values would enforce different policies against one row.
   ACTOR_ENRICHMENT_SHARE: ${ACTOR_ENRICHMENT_SHARE:-0.50}
-  ENRICHMENT_ELIGIBILITY_WINDOW_SECONDS: ${ENRICHMENT_ELIGIBILITY_WINDOW_SECONDS:-3600}
   ACTOR_REFRESH_TTL_SECONDS: ${ACTOR_REFRESH_TTL_SECONDS:-86400}
   REPOSITORY_REFRESH_TTL_SECONDS: ${REPOSITORY_REFRESH_TTL_SECONDS:-86400}
   # §11's coverage window, forwarded for the same reason the four allowance inputs are —

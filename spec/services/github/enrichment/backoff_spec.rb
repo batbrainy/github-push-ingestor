@@ -34,12 +34,8 @@ RSpec.describe Github::Enrichment::Backoff do
       expect(full_jitter.delay_for(20)).to eq(described_class::MAX_SECONDS.to_f)
     end
 
-    # The cap equals the pinned ENRICHMENT_ELIGIBILITY_WINDOW_SECONDS, so a backoff can
-    # never outlast the window that would age the row into skipped_budget — the cap is
-    # never what strands a row.
-    it "caps at exactly the pinned eligibility window, so a backoff never outlives it" do
-      expect(described_class::MAX_SECONDS)
-        .to eq(Github::Configuration::DEFAULTS.fetch("ENRICHMENT_ELIGIBILITY_WINDOW_SECONDS").to_i)
+    it "caps at one rate-limit window so a repeatedly failing row periodically rejoins the FIFO" do
+      expect(described_class::MAX_SECONDS).to eq(3600)
     end
 
     # Additive only: subtracting could schedule a retry sooner than the floor, and the

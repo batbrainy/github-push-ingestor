@@ -13,6 +13,10 @@ RSpec.shared_examples "an enrichment job" do |entity_class:, entity_type:, log_k
 
   before { allow(Github::EnrichmentRunner).to receive(:new).and_return(runner) }
 
+  it "runs on the dedicated enrichment queue" do
+    expect(described_class.new.queue_name).to eq("enrichment")
+  end
+
   it "runs exactly one cycle, narrowed to its own class" do
     expect(runner).to receive(:call).with(entity_class: entity_class).once.and_return(enriched)
 

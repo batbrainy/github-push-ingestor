@@ -116,15 +116,14 @@ RSpec.describe GithubRepository do
       expect(repository.enrichment_status).to eq("complete")
     end
 
-    it "leaves a budget-skipped entity skipped, with its failure state intact" do
+    it "refreshes identity without clearing a retryable entity's failure state" do
       described_class.upsert_stub!(github_id: 8484, full_name: "octocat/hello-world",
                                    now: frozen_time)
       described_class.where(github_id: 8484).update_all(
-        enrichment_status: "skipped_budget",
-        skipped_at: frozen_time,
+        enrichment_status: "retryable_failure",
         enrichment_attempts: 2,
         next_retry_at: frozen_time + 3600,
-        last_error: "enrichment allowance exhausted"
+        last_error: "GitHub unavailable"
       )
 
       described_class.upsert_stub!(github_id: 8484, full_name: "octocat/renamed",
@@ -132,10 +131,10 @@ RSpec.describe GithubRepository do
 
       repository = described_class.find_by(github_id: 8484)
       expect(repository.full_name).to eq("octocat/renamed")
-      expect(repository.enrichment_status).to eq("skipped_budget")
-      expect(repository.skipped_at).to eq(frozen_time)
+      expect(repository.enrichment_status).to eq("retryable_failure")
       expect(repository.enrichment_attempts).to eq(2)
-      expect(repository.last_error).to eq("enrichment allowance exhausted")
+      expect(repository.next_retry_at).to eq(frozen_time + 3600)
+      expect(repository.last_error).to eq("GitHub unavailable")
     end
   end
 
