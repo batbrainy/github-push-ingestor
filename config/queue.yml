@@ -10,14 +10,22 @@
 # Github::RequestGate, and two processes avoid opening a third primary-database pool.
 #
 # polling_interval stays at 1s. Nothing here is latency-sensitive: the poll cadence is
-# POLL_INTERVAL_SECONDS (300), enrichment is capped by the hourly allowance (40 at the
-# defaults), and both recurring tasks fire on a 60-second schedule.
+# POLL_INTERVAL_SECONDS (300), enrichment is paced by the Search ledger and capped by the
+# core detail-fallback allowance, and both recurring tasks fire on a 60-second schedule.
+#
+# Multi-queue workers are declared as a YAML **list**, never a comma-joined string.
+# SolidQueue::QueueSelector takes `Array(queue_list)`, so `queues: polling,control` is one
+# queue literally named "polling,control" and matches nothing — that worker claims no job
+# for the life of the process, silently: it registers, heartbeats, and polls forever while
+# ready executions accumulate. Found by watching a live run make no progress.
 default: &default
   dispatchers:
     - polling_interval: 1
       batch_size: 500
   workers:
-    - queues: polling,control
+    - queues:
+        - polling
+        - control
       threads: 1
       processes: 1
       polling_interval: 1

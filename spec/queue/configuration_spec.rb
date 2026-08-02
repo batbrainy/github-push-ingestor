@@ -69,20 +69,29 @@ RSpec.describe "Solid Queue configuration" do
 
     # A job enqueued into a queue no worker polls is a silent, total failure, and nothing else
     # in the suite would catch it.
+    #
+    # Asserted through SolidQueue::QueueSelector rather than by splitting the configured
+    # value here, because that is precisely the bug this example exists to catch: a
+    # comma-joined string reads as three queue names to a human and as ONE queue literally
+    # named "polling,control" to Array(), which matches no execution ever. The worker still
+    # registers, heartbeats, and polls — it simply claims nothing, forever. Splitting the
+    # string in the spec proved the author's intent and nothing about the runtime.
     it "works every queue this application enqueues into" do
-      queues = [ PollEventSourceJob, EnrichActorJob, EnrichRepositoryJob,
+      queues = [ PollEventSourceJob, EnrichmentCycleJob,
                  ReconcilePendingEnrichmentsJob ].map { _1.new.queue_name }.uniq.sort
-      configured = queue_config.dig("production", "workers")
-                               .flat_map { _1.fetch("queues").split(",") }.uniq.sort
+      selected = queue_config.dig("production", "workers").flat_map do |worker|
+        SolidQueue::QueueSelector.new(worker.fetch("queues"), SolidQueue::ReadyExecution)
+                                 .send(:eligible_queues)
+      end.uniq.sort
 
       expect(queues).to eq(%w[control enrichment polling])
-      expect(configured).to eq(queues)
+      expect(selected).to eq(queues)
     end
 
     it "isolates the durable enrichment backlog from polling and control work" do
-      workers = queue_config.dig("production", "workers").index_by { _1.fetch("queues") }
+      workers = queue_config.dig("production", "workers").index_by { Array(_1.fetch("queues")) }
 
-      expect(workers.keys).to contain_exactly("polling,control", "enrichment")
+      expect(workers.keys).to contain_exactly(%w[polling control], %w[enrichment])
       expect(workers.values).to all(include("threads" => 1, "processes" => 1))
     end
 

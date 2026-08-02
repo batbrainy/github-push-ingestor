@@ -12,10 +12,10 @@ RSpec.describe "Solid Queue", :queue do
 
   describe "enqueueing" do
     it "writes a job row and a ready execution" do
-      expect { EnrichActorJob.perform_later }.to change(SolidQueue::Job, :count).by(1)
+      expect { EnrichmentCycleJob.perform_later }.to change(SolidQueue::Job, :count).by(1)
 
       job = SolidQueue::Job.last
-      expect(job.class_name).to eq("EnrichActorJob")
+      expect(job.class_name).to eq("EnrichmentCycleJob")
       expect(job.queue_name).to eq("enrichment")
       expect(SolidQueue::ReadyExecution.where(job_id: job.id)).to exist
     end
@@ -74,11 +74,14 @@ RSpec.describe "Solid Queue", :queue do
       expect(configuration.configured_processes.map(&:kind))
         .to contain_exactly(:dispatcher, :worker, :worker, :scheduler)
 
+      # The list form matters at runtime, not only in the file: SolidQueue::Worker
+      # wraps this value in Array(), so a comma-joined string would become one queue
+      # name no execution ever carries.
       worker_queues = configuration.configured_processes
                                    .select { |process| process.kind == :worker }
-                                   .map { |process| process.attributes.fetch(:queues) }
+                                   .map { |process| Array(process.attributes.fetch(:queues)) }
 
-      expect(worker_queues).to contain_exactly("polling,control", "enrichment")
+      expect(worker_queues).to contain_exactly(%w[polling control], [ "enrichment" ])
     end
 
     it "hands the scheduler this application's two ticks" do
