@@ -2,7 +2,7 @@
 
 Date: 2026-07-31
 
-Status: Accepted; durable-backlog refresh priority amended 2026-08-02
+Status: Accepted; durable-backlog refresh priority amended 2026-08-02; staged-batch enrichment amended 2026-08-02
 
 ## Context
 
@@ -134,3 +134,18 @@ non-positive delta, which `#fallback_instant` already treats exactly as an absen
 leave capacity idle whenever the other class has no stale rows — while §10:812's borrowing
 rule is stated generally rather than scoped to the pending pool. Borrowing remains valid
 after the durable never-enriched backlog is empty.
+
+## Amendment (2026-08-02): refresh-pool fairness superseded by staged refresh composition
+
+Plan Appendix G ([ADR 0013](0013-derivation-first-staged-batch-enrichment.md)) deletes the
+per-entity refresh pool this ADR's second half repaired: there is no separate refresh
+request shape any more, so `#refresh_choice` and its `borrowed_refresh` reason are gone
+with `Enrichment::Fairness`. Refresh now rides the same Search batch path under the
+composition rule — a batch fills from its own class's never-enriched backlog first, tops
+up spare slots with TTL-stale, recently active (`REFRESH_ACTIVE_WITHIN_SECONDS`) complete
+rows only when neither class has claimable backlog, and refresh-only batches run only
+when neither class has backlog at all. The property this ADR fought for survives in
+stronger form: backlog outranks freshness in every lane, and refresh capacity cannot
+starve a class because lanes rotate by weight over whole batches. The secondary-limit
+escalation in the first half is untouched, and the search ledger gains its own
+`blocked_until` handling for search-resource limits.

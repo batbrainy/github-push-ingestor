@@ -2,7 +2,7 @@
 
 Date: 2026-07-30
 
-Status: Accepted
+Status: Accepted; staged-batch enrichment amended 2026-08-02
 
 ## Context
 
@@ -108,3 +108,17 @@ the startup-validation rejection path is exercisable by lowering `POLL_INTERVAL_
 instead. Deriving `ENABLED_LIVE_SOURCE_COUNT` from `event_sources` at runtime is PR 9's
 "dynamic multi-source allocation validation"; doing it at boot would reintroduce the
 database dependency that keeps validation safe to run before migrations.
+
+## Amendment (2026-08-02): the core ledger is now one of two resource ledgers
+
+Plan Appendix G ([ADR 0013](0013-derivation-first-staged-batch-enrichment.md)) moves
+normal-path enrichment onto GitHub's per-minute **search** resource, accounted by its own
+singleton ledger (`Github::SearchBudgetLedger` over `github_search_budget`). This ledger's
+mechanics — transactional reservation, failures-stay-spent, monotonic reconciliation,
+resource verification, per-window bootstrap — are unchanged, but its
+`enrichment_allowance`/`enrichment_used` pair is **redefined**: it now budgets the bounded
+payload-URL detail-fallback lane (`CORE_DETAIL_FALLBACK_ALLOWANCE`, default 4/hour) rather
+than the remainder formula, and feasibility becomes
+`poll + reserve + detail_fallback ≤ limit`, with the remainder deliberately unspent.
+The resource-mismatch skip above now cuts both ways: this ledger ignores `search` headers,
+and the search ledger ignores `core` headers.

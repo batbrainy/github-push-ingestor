@@ -2,7 +2,7 @@
 
 Date: 2026-07-31
 
-Status: Accepted; durable-backlog ordering amended 2026-08-02
+Status: Accepted; durable-backlog ordering amended 2026-08-02; staged-batch enrichment amended 2026-08-02
 
 ## Context
 
@@ -137,6 +137,19 @@ iterates them. The global request gate makes outbound concurrency exactly one
 application-wide, so the fanned-out jobs would serialize on the same advisory lock while
 each held a database connection. Deferred to PR 9, which owns multi-source allocation.
 
+## Amendment (2026-08-02): dispatch enqueues staged cycles; observations commit with the event
+
+Plan Appendix G ([ADR 0013](0013-derivation-first-staged-batch-enrichment.md)) replaces
+the per-class `EnrichActorJob`/`EnrichRepositoryJob` with a single argument-less
+`EnrichmentCycleJob`: `Github::Enrichment::Dispatch` enqueues at most one cycle when the
+dual-ledger admission and claimability checks say work could proceed, and a cycle runs
+batch lanes then detail lanes inside its time budget. The decisions here carry over
+unweakened — the enqueue is still a hint, the entity rows (now stage-carrying) are still
+the durable record, and `ReconcilePendingEnrichmentsJob` still sweeps them every 60
+seconds. One addition strengthens the durability boundary: event-source
+`enrichment_observations` rows are written **inside** the ingest transaction, so the raw
+evidence an entity's derivation rests on commits atomically with the push event itself.
+
 ## Related
 
 - ADR 0002 — advisory locks and the request gate (the crash-safety property this decision
@@ -145,3 +158,4 @@ each held a database connection. Deferred to PR 9, which owns multi-source alloc
 - ADR 0005 — repeated execution with duplicate-safe event writes (the narrow event-row and
   entity-activity guarantees under redelivery)
 - ADR 0007 — enrichment fairness shares and borrowing (why a job cannot carry an entity id)
+- ADR 0013 — derivation-first staged batch enrichment (the staged cycle this dispatch feeds)

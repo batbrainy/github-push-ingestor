@@ -2,7 +2,7 @@
 
 Date: 2026-07-30
 
-Status: Accepted; durable-backlog policy amended 2026-08-02
+Status: Accepted; durable-backlog policy amended 2026-08-02; staged-batch enrichment amended 2026-08-02
 
 ## Context
 
@@ -181,3 +181,18 @@ This policy deliberately does not promise a bounded completion time. If unique e
 arrive faster than 40 attempts per hour can serve them, backlog size and oldest pending age
 will grow. That pressure is reported directly; work is never converted into a terminal
 budget outcome merely because the quota window ended.
+
+## Amendment (2026-08-02): share fairness is now detail-lane only; search lanes use weights
+
+Plan Appendix G ([ADR 0013](0013-derivation-first-staged-batch-enrichment.md)) makes
+Search batches the normal enrichment path, so this ADR's share arithmetic —
+`floor(enrichment_allowance × ACTOR_ENRICHMENT_SHARE)`, borrowing on the caller's word,
+`:share_exhausted` as a denial — now governs only the bounded core **detail-fallback**
+lane, whose allowance is `CORE_DETAIL_FALLBACK_ALLOWANCE` (default 4, so the guarantees
+default to 2/2). The batch lanes are balanced differently: a weighted rotation
+(`ACTOR_ENRICHMENT_WEIGHT` / `REPOSITORY_ENRICHMENT_WEIGHT`, defaults 1/1) over whole
+Search requests, with a lane that has nothing claimable yielding its slot — batch
+capacity is per-request rather than per-entity, so a per-entity share would misdescribe
+it. The deleted `Enrichment::Fairness` class's decisions survive in `BatchClaim`
+(claimability), `CycleRunner`'s lane schedule (rotation and borrowed slots), and the
+ledger's unchanged share enforcement for detail requests.

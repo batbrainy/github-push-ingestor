@@ -95,8 +95,11 @@ globally named `github-push-ingestor_pgdata` volume.
       grep -E 'Non-push events ignored:[[:space:]]+1' "$fixture_ingest_output"
       ```
 
-- [ ] `GITHUB_MODE=fixture docker compose run --rm enrich --limit 6` exits 0 and leaves
-      `complete 2 / permanent_failure 1` in each entity class.
+- [ ] `GITHUB_MODE=fixture docker compose run --rm -e SEARCH_PACING_SECONDS=0 enrich
+      --limit 6` exits 0 and leaves `complete 2 / permanent_failure 1` in each entity
+      class — two Search batches, then two detail-fallback `404` terminals (the pacing
+      override lets the second batch run immediately instead of reporting a pacing
+      deferral).
 - [ ] SQL state is exactly 4 events, 3 actors, 3 repositories, 3 quarantine rows, and 3 total
       quarantine occurrences:
 
@@ -208,6 +211,18 @@ particular, read the erratum atop
 - [ ] Malformed data quarantined durably per the taxonomy (canonical fingerprints,
       occurrence-counted) and does not terminate the batch — 3 rows, occurrences 3 → 6 on
       replay, and 4 events persisted beside them
+- [ ] **Both staged batch paths demonstrably run** (plan Appendix G): the fixture
+      `default` walkthrough completes one actor and one repository Search batch, then two
+      payload-URL detail fallbacks that meet `404`s and go terminal — two `complete` plus
+      one `permanent_failure` per class from exactly 2 search + 2 detail requests
+      (`fixtures/github/README.md`, the enrichment end-to-end specs)
+- [ ] Batch results apply only on a **stable-ID match** — the `search_renamed_repository`
+      and `search_unrequested_result` scenarios show a renamed and an unrequested item
+      observed but never applied, routed to fallback or recorded as `unrequested_result`
+- [ ] **No quota-based terminal state exists** — `git grep -n skipped_budget -- app lib
+      db/schema.rb` returns nothing, and every search/core denial reason
+      (`ceiling`, `reserve`, `pacing`, `blocked`, class/share exhaustion) defers rather
+      than terminates
 
 ---
 
@@ -251,6 +266,14 @@ particular, read the erratum atop
       oldest pending timestamp/age, reserved allowance usage, and coverage percentages by
       the defined formulas — without initiating GitHub requests or fabricating a drain ETA
       — `spec/requests/status_spec.rb`, `Github::Enrichment::Coverage`
+- [ ] `/status` carries the Appendix G blocks with their exact keys: `ledger` uses
+      `detail_fallback` (renamed from `enrichment`); `search_ledger` publishes
+      ceiling/reserve/spendable/used/per-lane usage/`blocked_until`/
+      `next_request_earliest_at`; `scheduler` publishes every staged tunable; each entity
+      class publishes `contract_backlog_count` and all seven `stages` with counts and
+      oldest ages; `batches` publishes all four request-kind × entity-kind groups with
+      fill ratios; and `throughput.catch_up.state` is exactly one of
+      `keeping_up | not_keeping_up | insufficient_sample`
 - [ ] During §1's empty-volume fixture phase, while the worker has never been started, hash
       the complete budget row and record all request counters. Call `/health/live`,
       `/health/ready`, and `/status` repeatedly, then require the hash and counters to be
@@ -349,13 +372,16 @@ particular, read the erratum atop
 ## 7. Forbidden-claim scan
 
 ```bash
-claim_pattern='exactly[ -]?once|effectively[ -]?once|once-only[[:space:]]+(execution|processing|delivery)|(complete|full|exhaustive)[[:space:]]+(upstream[[:space:]]+)?(event[[:space:]]+)?capture|captur(e|es|ed|ing)[[:space:]]+(all|every)[[:space:]]+(upstream[[:space:]]+|public[[:space:]]+|GitHub[[:space:]]+)?events?|(complete|full|exhaustive)[[:space:]]+enrichment([[:space:]]+coverage)?|enrich(es|ed|ing)?[[:space:]]+(all|every)[[:space:]]+(actors?|repositories|entities)|sampling[[:space:]]+becomes[[:space:]]+coverage|100%[[:space:]]+(capture|enrichment|coverage)'
+claim_pattern='exactly[ -]?once|effectively[ -]?once|once-only[[:space:]]+(execution|processing|delivery)|(complete|full|exhaustive)[[:space:]]+(upstream[[:space:]]+)?(event[[:space:]]+)?capture|captur(e|es|ed|ing)[[:space:]]+(all|every)[[:space:]]+(upstream[[:space:]]+|public[[:space:]]+|GitHub[[:space:]]+)?events?|(complete|full|exhaustive)[[:space:]]+enrichment([[:space:]]+coverage)?|enrich(es|ed|ing)?[[:space:]]+(all|every)[[:space:]]+(actors?|repositories|entities)|sampling[[:space:]]+becomes[[:space:]]+coverage|100%[[:space:]]+(capture|enrichment|coverage)|guaranteed?[[:space:]]+catch[ -]?up|catch[ -]?up[[:space:]]+(is[[:space:]]+)?guaranteed|(will|shall)[[:space:]]+(always[[:space:]]+)?catch[[:space:]]+up|eventual(ly)?[[:space:]]+catch(es)?[ -]?(up|ing[[:space:]]+up)|backlog[[:space:]]+(always|will)[[:space:]]+drains?|bounded[[:space:]]+drain[[:space:]]+time'
 git grep -nI -i -E "$claim_pattern" -- .
 ```
 
 **The rule: every prose hit must explicitly reject the guarantee.** The regex assignment
 itself is scan vocabulary, not a claim. Any affirmative system-level promise of singular
-execution, exhaustive upstream capture, or exhaustive enrichment fails the gate; do not
-approve it merely because it avoids one exact phrase.
+execution, exhaustive upstream capture, exhaustive enrichment, or guaranteed catch-up
+fails the gate; do not approve it merely because it avoids one exact phrase. Catch-up may
+be described only as a dated, measured comparison of completion and arrival rates —
+`/status` says `not_keeping_up` when the comparison fails, and no document promises the
+backlog drains.
 
 - [ ] Every hit is a negation

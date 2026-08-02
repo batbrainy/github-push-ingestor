@@ -1,6 +1,6 @@
 # GitHub Push Event Ingestion Service — Implementation Plan
 
-> **This plan was finalized through four pre-implementation review rounds**: an adversarial multi-lens design review with live probes of the unauthenticated GitHub API (**Appendix A**), an independent validation pass against official GitHub, PostgreSQL, and Rails/Solid Queue documentation (**Appendix B**), an implementation-readiness re-check that corrected locking, scheduling, Compose, and PR-ordering defects (**Appendix C**), and a freeze-readiness pass that corrected lock scoping, class-level blocking, bootstrap, restart, and entity-activity semantics (**Appendix D**). The initial plan (V1) and the full revision trail are preserved in Git history; the appendices record what changed and why. Appendix F supersedes the original enrichment load-shedding policy with the durable-backlog design adopted on 2026-08-02. The one section added during revision is numbered **2A** to keep the original numbering stable.
+> **This plan was finalized through four pre-implementation review rounds**: an adversarial multi-lens design review with live probes of the unauthenticated GitHub API (**Appendix A**), an independent validation pass against official GitHub, PostgreSQL, and Rails/Solid Queue documentation (**Appendix B**), an implementation-readiness re-check that corrected locking, scheduling, Compose, and PR-ordering defects (**Appendix C**), and a freeze-readiness pass that corrected lock scoping, class-level blocking, bootstrap, restart, and entity-activity semantics (**Appendix D**). The initial plan (V1) and the full revision trail are preserved in Git history; the appendices record what changed and why. Appendix F supersedes the original enrichment load-shedding policy with the durable-backlog design adopted on 2026-08-02, and **Appendix G** supersedes Appendix F's per-entity service model with derivation-first staged batch enrichment, adopted the same day. The one section added during revision is numbered **2A** to keep the original numbering stable.
 >
 > File locations: this plan lives at the repository root. `DESIGN_BRIEF.md` and the ADRs live under `docs/`.
 
@@ -32,7 +32,7 @@ The delivered implementation will satisfy the required public-events source whil
 - `PushEvent` filtering and processing
 - Raw event payload retention (semantic retention via `jsonb` — see Section 7)
 - Structured push-event fields
-- Actor and repository enrichment (**durable, quota-paced FIFO backlog with per-class fairness** — see Section 10)
+- Actor and repository enrichment (**durable, staged, batch-served FIFO backlog with per-class fairness** — see Section 10 and Appendix G)
 - Duplicate-safe `push_events` persistence
 - Pagination via the `Link` response header
 - ETag and `304 Not Modified` handling (bandwidth/correctness measure, scoped to the canonical first-page request — see Sections 9–10)
@@ -279,14 +279,14 @@ Child issues:
 Two request paths share the executor; only polling takes a source lock:
 
 ```text
-POLLING PATH                            ENRICHMENT PATH
+POLLING PATH                            ENRICHMENT PATH (Appendix G)
 
-IngestionRunner                         EnrichActorJob / EnrichRepositoryJob
-  → SourceLock(event_source_id)           │
+IngestionRunner                         EnrichmentCycleJob → CycleRunner
+  → SourceLock(event_source_id)           │  batch lanes, then detail lanes
   → EventSource (PublicEvents|Fixture)    │
   → RequestExecutor ◄─────────────────────┘
       → RequestGate (global, serial)
-      → BudgetLedger (class-aware, formula-derived, per-window)
+      → BudgetLedger (core) | SearchBudgetLedger (per-minute search)
       → UrlPolicy
       → Transport: Faraday (live) | Fixture
            |
@@ -294,6 +294,7 @@ IngestionRunner                         EnrichActorJob / EnrichRepositoryJob
 PostgreSQL Transaction
 - raw payload; structured fields
 - stub actor/repo upserts (merge rules)
+- event-source enrichment observations (append-only)
 - INSERT … ON CONFLICT DO NOTHING RETURNING id
 - activity updates ONLY when a row returned
 - malformed-event quarantine (fingerprints)
@@ -301,17 +302,21 @@ PostgreSQL Transaction
            v
 Solid Queue (PostgreSQL-backed)
            |
-     +-----+------+
-     |            |
-     v            v
-Actor Job    Repository Job
- (fair-share   (fair-share
-  budgeted)     budgeted)
-     |            |
-     +-----+------+
+           v
+EnrichmentCycleJob (one queued cycle at a time)
+           |
+     +-----+---------------------+
+     |                           |
+     v                           v
+Search batches             Detail fallbacks
+ (BatchClaim/BatchRunner,   (DetailClaim/DetailRunner,
+  search ledger, ≤ 10        core detail-fallback
+  exact qualifiers)          allowance, payload URLs)
+     |                           |
+     +-----+---------------------+
            |
            v
-PostgreSQL
+PostgreSQL (observations + projections + batch envelopes)
 ```
 
 **Lock-order invariant:** source lock → request gate, never the reverse.
@@ -324,7 +329,8 @@ PostgreSQL
 - `Github::RequestExecutor`
 - `Github::SourceLock` (session advisory lock, `(SOURCE_LOCK, event_source_id)`; owned by `IngestionRunner`, polling only)
 - `Github::RequestGate` (global session advisory lock, `(REQUEST_GATE, 1)`)
-- `Github::BudgetLedger` (class-aware; allowance formula; per-window bootstrap)
+- `Github::BudgetLedger` (core resource; class-aware; allowance formula; per-window bootstrap)
+- `Github::SearchBudgetLedger` (search resource; per-minute window — Appendix G)
 - `Github::RateLimitPolicy`
 - `Github::RetryPolicy`
 - `Github::UrlPolicy` (enrichment URL validation)
@@ -338,10 +344,17 @@ PostgreSQL
 - `Github::Events::ProcessorRegistry`
 - `Github::Events::PushEventProcessor`
 - `Github::IngestionRunner`
+- `Github::Enrichment::SearchQuery` / `Github::Enrichment::SearchResponse` (batch query construction and envelope parsing)
+- `Github::Enrichment::BatchClaim` / `Github::Enrichment::BatchRunner` (Search-batch lane: FIFO claim under lease, apply-by-stable-ID)
+- `Github::Enrichment::DetailClaim` / `Github::Enrichment::DetailRunner` (payload-URL detail-fallback lane)
+- `Github::Enrichment::Admission` (read-only dual-ledger admission verdicts)
+- `Github::Enrichment::CycleRunner` (one enrichment cycle: batch lanes, then detail lanes, inside a time budget)
+- `Github::Enrichment::ObservationRecorder` (append-only observation writes)
 - `PollEventSourceJob`
-- `EnrichActorJob`
-- `EnrichRepositoryJob`
+- `EnrichmentCycleJob`
 - `ReconcilePendingEnrichmentsJob`
+
+(The per-entity `EnrichActorJob`/`EnrichRepositoryJob`, `EnrichmentRunner`, `Enrichment::Fairness`, `CandidateSelector`, `Claim`, and `EntityState` from the pre-Appendix-G design are deleted; `Github::EnrichmentSchedule` remains as the core admission value object.)
 
 ## 6. Event-Source Design
 
@@ -417,7 +430,9 @@ Single-row global ledger (constrained singleton), through which **every** outbou
 - `window_status` — `uninitialized | active | globally_blocked`
 - `window_initialized_at`
 - `poll_allowance`, `poll_used`
-- `enrichment_allowance`, `enrichment_used`
+- `enrichment_allowance`, `enrichment_used` — since Appendix G these budget the
+  **detail-fallback** lane only (`CORE_DETAIL_FALLBACK_ALLOWANCE`, default 4); the
+  batch normal path spends the separate search ledger
 - `actor_share_used`, `repository_share_used` (fairness accounting — Section 10)
 - `reserve`
 - `observed_at`
@@ -598,6 +613,90 @@ event.repo.url  → api_url
 (enrichment populates description, language, owner_github_id, raw_payload)
 ```
 
+`owner_login` and `name` are **derived locally** from `full_name` at ingest (Appendix G) —
+no network call is spent on a field the stored payload already determines.
+
+### Staged enrichment columns on both entity tables (new in Appendix G)
+
+Both entity tables carry the staged pipeline alongside the unchanged
+`enrichment_status` business outcome:
+
+- `enrichment_stage` — check-constrained to the seven **resting** stages:
+  `batch_pending | batch_in_flight | detail_pending | detail_in_flight |
+  retry_scheduled | contract_complete | terminal`. Event-native persistence, local
+  derivation, and batch application are instants, not stages — they are recorded by
+  the timestamp columns below because no row ever rests in them.
+- Instant timestamps, `COALESCE`-keep-first where first observation matters:
+  `event_native_at`, `derived_at`, `batch_pending_at`, `batch_applied_at`,
+  `detail_pending_at`, `retry_scheduled_at`, `contract_completed_at`, `terminal_at`
+- `detail_attempts` — the detail-fallback retry ladder, bounded by
+  `DETAIL_FALLBACK_MAX_ATTEMPTS` (default 3)
+- `lease_token` (uuid) + `leased_until` — the durable batch/detail claim lease
+  (`ENRICHMENT_LEASE_SECONDS`, default 600); expired leases are reclaimed, and
+  projection writes are guarded by token + batch id
+- `latest_observation_id` / `latest_observation_source` / `latest_observed_at` —
+  the projection's pointer into the append-only observation history
+- `current_enrichment_batch_id` — the in-flight request attempt owning this row
+- Contract columns: actors add `account_type`; repositories add `fork`, `archived`,
+  `default_branch`, `github_created_at`, and the locally derived `owner_login` —
+  joining the existing `description`, `language`, and `owner_github_id`
+- Index `(enrichment_stage, created_at, id)` — the per-stage FIFO scan; plus an
+  index on `leased_until` for stale-lease reclaim
+
+### `enrichment_batches` (new in Appendix G)
+
+One row per enrichment **request attempt** — search batch or detail fallback — so
+batch quality is measurable from durable state:
+
+- `id`, `correlation_id` (uuid, unique)
+- `request_kind` — `search | detail`; `entity_kind` — `actor | repository`
+- `status` — `in_flight | succeeded | failed | deferred | stale_lease`
+- `requested_github_ids`, `requested_identifiers` (`jsonb`) — the claimed membership
+- `request_url`, `response_status`; `response_body` stored **only** for non-OK
+  responses, truncated
+- `total_count`, `incomplete_results` — the Search envelope facts
+- `requested_count`, `returned_count`, `valid_count`, `missing_count`,
+  `invalid_count` — non-negative check-constrained
+- `started_at`, `completed_at`, `last_error`
+- Observed rate-limit headers: `rate_limit_resource`, `rate_limit_limit`,
+  `rate_limit_remaining`, `rate_limit_used`, `rate_limit_reset_at`
+- timestamps; indexes on `correlation_id`, `(request_kind, entity_kind, started_at)`,
+  and `started_at`
+
+### `enrichment_observations` (new in Appendix G)
+
+Append-only evidence — the model is read-only after persist, and refresh repoints the
+projection rather than overwriting retained raw responses:
+
+- `id`, `entity_kind` (`actor | repository`), `entity_github_id` (stable GitHub ID)
+- `source` — `event | search | detail` (check-constrained)
+- `observed_at`, `raw_payload` (`jsonb`, the complete raw item)
+- `payload_fingerprint` — the same canonical SHA-256 algorithm as quarantine
+- `enrichment_batch_id`, `push_event_id`, `request_correlation_id`,
+  `requested_identifier` — provenance
+- `validation_outcome` — including `unrequested_result` for items nobody asked for
+- timestamps; indexed by `(entity_kind, entity_github_id, observed_at)` and by
+  fingerprint
+
+Event-source observations are written **inside the ingest transaction** with the push
+event, so evidence commits with the event it came from.
+
+### `github_search_budget` (new in Appendix G)
+
+Singleton (`CHECK (id = 1)`) ledger for GitHub's **search** rate-limit resource — a
+separate per-minute budget the core ledger must not conflate:
+
+- `resource` — `"search"` (verified against `x-ratelimit-resource`)
+- `limit`, `remaining`, `reset_at`, `observed_at` — header-reconciled, monotonic
+  within a window
+- `request_ceiling` (default 10), `reserve` (default 2), `used`, `actor_used`,
+  `repository_used` — non-negative check-constrained
+- `blocked_until`, `last_request_at`, `lock_version`, timestamps
+
+Windows are 60 seconds. The window rolls at `reset_at`, or — because a denied minute
+may observe no headers at all — when `last_request_at` is at least 60 seconds old and
+`used` is positive (the header-less roll).
+
 ## 8. Durability and Crash Recovery
 
 ### Durability boundary
@@ -683,6 +782,9 @@ effective_enrichment_time = max(
 )
 ```
 
+(Since Appendix G this rule governs the core **detail-fallback** lane; Search batches are
+admitted against the independent per-minute search ledger instead.)
+
 `reset_at` is informational; it never participates in scheduling directly. With defaults: configured cadence 300s, observed floor 60s → effective normal cadence 300s.
 
 ### Pagination
@@ -752,7 +854,7 @@ Documented constraints (official GitHub docs, verified during the review rounds)
 
 **Unauthenticated `304` accounting.** The endpoint documentation contains a general statement that `304` responses do not affect the rate limit, while GitHub’s REST best-practices documentation limits that exemption to correctly authorized requests. Two dated unauthenticated probes (review-supplied evidence, 2026-07-28) showed `x-ratelimit-used` increasing across a `304` (one transcript: 200 → used 4, remaining 56; immediate conditional replay → 304, used 5, remaining 55). This implementation therefore budgets every unauthenticated request — including `304`s — as one request. ETag remains a bandwidth/correctness measure, never a quota saver, in this configuration. **PR 6 re-runs and commits a dated probe transcript as a required validation gate** — normal `GET`, explicit `X-GitHub-Api-Version: 2022-11-28`, exact UTC timestamps, ETag, and complete before/after rate-limit headers — so the design brief cites first-party evidence.
 
-**Allowance formula**, computed at startup and on configuration change:
+**Allowance formula** (amended by Appendix G), computed at startup and on configuration change:
 
 ```text
 poll_attempt_allowance =
@@ -760,25 +862,58 @@ poll_attempt_allowance =
   × MAX_PAGES_PER_POLL
   × ENABLED_LIVE_SOURCE_COUNT
 
-enrichment_allowance =
-  rate_limit − RATE_LIMIT_RESERVE − poll_attempt_allowance
+detail_fallback_allowance = CORE_DETAIL_FALLBACK_ALLOWANCE   # a bounded reserve, not the remainder
+
+feasible ⇔ poll_attempt_allowance + RATE_LIMIT_RESERVE + detail_fallback_allowance ≤ rate_limit
 ```
 
 With defaults:
 
 ```text
 ceil(3600 / 300) × 1 × 1 = 12 poll attempts/hour
-60 − 8 − 12              = 40 enrichment attempts/hour
+12 poll + 4 detail fallback + 8 reserve = 24 ≤ 60
 ```
 
 | Allocation | Default |
 |---|---:|
 | Scheduled polling | 12 request-attempts/hour |
-| Enrichment | up to 40 request-attempts/hour |
+| Detail fallback (bounded core lane — Appendix G) | up to 4 request-attempts/hour |
 | Intentionally unspent reserve | 8 requests/hour |
+| **Deliberately unspent remainder** | 36 requests/hour |
 | **Total** | **60 requests/hour** |
 
-Startup validation **rejects** any configuration where `poll_attempt_allowance + reserve >= effective_limit` — that would leave no capacity for required Story 3 enrichment.
+The remainder is deliberately unspent: since Appendix G, normal-path enrichment runs on
+the **search** rate-limit resource, not on core, so leaving core headroom costs enrichment
+nothing and protects polling from co-tenant pressure. The stored
+`enrichment_allowance`/`enrichment_used` pair now budgets the detail-fallback lane.
+
+Startup validation **rejects** any configuration where
+`poll_attempt_allowance + RATE_LIMIT_RESERVE + CORE_DETAIL_FALLBACK_ALLOWANCE` exceeds the
+effective limit — that would over-commit the core budget the moment every lane ran hot.
+
+### Search budget (per-minute resource — Appendix G)
+
+GitHub's Search endpoints report their own rate-limit resource (`x-ratelimit-resource:
+search`, observed limit 10 per minute unauthenticated). The `github_search_budget`
+singleton ledger accounts for it independently of core:
+
+```text
+SEARCH_REQUEST_CEILING  = 10 per minute (observed header limit)
+SEARCH_SAFETY_RESERVE   =  2 per minute (never spent)
+spendable               =  8 search requests per minute
+SEARCH_PACING_SECONDS   =  6 seconds between search requests (0 disables)
+SEARCH_BATCH_SIZE       ≤ 10 exact qualifiers per request
+```
+
+Windows are 60 seconds, rolled from response headers or — because a fully denied minute
+observes no headers — by the header-less rule: `last_request_at` at least 60 seconds old
+with `used` positive. Denials are ordered `search_blocked` → `search_pacing` →
+`search_reserve_reached` → `search_ceiling_exhausted`, and every denial **defers** the
+batch; none terminates an entity. Search rate-limit and secondary-limit responses set
+`blocked_until` from `Retry-After`, then the reset instant, then now + 60 seconds,
+whichever is latest. Reconciliation is monotonic and discards headers whose resource is
+not `search`. `SEARCH_WORKER_CONCURRENCY` is pinned to 1 while the global request gate
+serializes all outbound calls.
 
 **Global vs class blocking — one timestamp cannot serve both.** The stored `global_blocked_until` covers only conditions that must stop *all* live requests:
 
@@ -793,7 +928,7 @@ poll_class_blocked_until       = poll_used >= poll_allowance ? reset_at : nil
 enrichment_class_blocked_until = enrichment_used >= enrichment_allowance ? reset_at : nil
 ```
 
-So enrichment exhausting its 40 attempts never stops polling, and polling exhausting its 12 never stops enrichment. Actor/repository share exhaustion lives inside `BudgetLedger.reserve!(:actor | :repository)` and never touches the global block. A routine future `X-RateLimit-Reset` on a successful response never defers anything.
+So the detail-fallback lane exhausting its 4 attempts never stops polling, and polling exhausting its 12 never stops enrichment — batch enrichment does not even spend core. Actor/repository share exhaustion lives inside `BudgetLedger.reserve!(:actor | :repository)` and never touches the global block; search-window exhaustion lives in the search ledger and blocks only search. A routine future `X-RateLimit-Reset` on a successful response never defers anything.
 
 **Secondary rate limits are global.** They are IP-scoped, and they can arise on *any* live request — including enrichment, which has no source row. On any secondary-limit response: set `global_blocked_until` from `Retry-After` (or ≥ 1 minute with exponential backoff when the header is absent), also update the request-specific source or entity retry state, and stop all live requests until the block expires.
 
@@ -802,48 +937,61 @@ So enrichment exhausting its 40 attempts never stops polling, and polling exhaus
 Consequence, stated honestly: one observed live page of `/events` held ~92–95 PushEvents with ~89 distinct actors and ~92 distinct repositories:
 
 ```text
-89 actors + 92 repositories = 181 entity requests/page (cold)
-181 × 12 polls/hour ≈ 2,172 requests/hour of cold demand
-40 available enrichments/hour ≈ 1.8% same-hour service ratio under the all-cold assumption
+89 actors + 92 repositories = 181 entity references/page (cold)
+181 × 12 polls/hour ≈ 2,172 references/hour of cold demand
 ```
 
 This is a cold-demand pressure scenario, not a measured arrival rate: it assumes every
 poll contains entirely new identities, while entity rows deduplicate repeated actors and
-repositories across events and overlapping pages. The actual unique arrival rate must be
-measured against the 40-attempt service rate.
+repositories across events and overlapping pages. Under the pre-Appendix-G one-request-
+per-entity model, 40 core attempts/hour could not plausibly meet it; Appendix G's staged
+batch path raises the theoretical service ceiling to 4,800 items/hour (a labeled
+hypothesis, not proof), and `/status` publishes the **measured** arrival and completion
+rates so the comparison is data rather than arithmetic.
 
-**Enrichment is a durable, quota-paced backlog**, and it must be **fair across classes**:
-repository candidates alone exceed the entire hourly allowance, so a naive repo-first
-policy would starve actor enrichment indefinitely — violating Story 3, which requires both.
-The default ledger reserves 12 attempts for polling, 40 for draining never-enriched work,
-and 8 as a safety reserve. Fairness policy with explicit rounding:
+**Enrichment is a durable, staged, batch-served backlog** (Appendix G), and it must be
+**fair across classes**. Never-enriched work is served FIFO by `created_at ASC, id ASC`
+within each class. The normal path claims up to `SEARCH_BATCH_SIZE` (10) entities per
+Search request under the per-minute search ledger; actor and repository batch lanes
+rotate by weight (`ACTOR_ENRICHMENT_WEIGHT` / `REPOSITORY_ENRICHMENT_WEIGHT`, defaults
+1/1), and a lane with no claimable work yields its slot to the other. Only items a batch
+could not settle — missing, renamed, identity-mismatched, or contract-invalid — enter the
+detail-fallback lane, which is bounded by the core detail allowance and split by the
+fairness shares with explicit rounding:
 
 ```text
 actor_guarantee      = floor(enrichment_allowance × ACTOR_ENRICHMENT_SHARE)
 repository_guarantee = enrichment_allowance − actor_guarantee
 
-Defaults: ACTOR_ENRICHMENT_SHARE = 0.50 → 20 actor / 20 repository
+Defaults: 4 × 0.50 → 2 actor / 2 repository detail-fallback attempts/hour
 
-Borrowing: a class may borrow the other’s unused capacity only when the
-other class has no CURRENTLY CLAIMABLE backlog candidate (not merely no rows).
+Borrowing: a class may borrow the other’s unused detail capacity only when the
+other class has no CURRENTLY CLAIMABLE detail candidate (not merely no rows).
 ```
 
-Within each class, never-enriched candidates are served FIFO by `created_at ASC, id ASC`.
-Their entity rows remain durable across quota exhaustion,
-window rollover, process restart, and lost enqueue hints. A denied reservation defers the
-candidate; it never terminates it. A TTL-stale refresh receives no request while either
-class has any never-enriched backlog work. If unique arrivals continuously exceed 40
-attempts per hour, the backlog can grow without a bounded completion estimate; `/status`
-therefore reports backlog size, oldest pending timestamp/age, and reserved allowance usage.
-It does not report a drain ETA because no durable outcome history exists from which to
-derive an honest service rate.
+Entity rows remain durable across quota exhaustion, window rollover, process restart, and
+lost enqueue hints. A denied reservation — core or search, ceiling, reserve, or pacing —
+defers the work; it never terminates it. **There is no quota-based terminal outcome.**
+TTL-stale refreshes ride the same batch path under Appendix G's composition rule: a
+batch fills from its own class's never-enriched backlog first, tops up spare slots with
+refresh candidates only when its own backlog is exhausted **and** the other class has no
+claimable backlog, and a refresh-only batch runs only when neither class has backlog. If
+unique arrivals continuously exceed the measured service rate, the backlog grows;
+`/status` reports backlog size, per-stage counts and oldest ages, measured arrival and
+completion rates, and a tri-state catch-up verdict. It still publishes no drain forecast.
 
 Timing configuration (pinned defaults; tunable):
 
 ```text
 ACTOR_REFRESH_TTL_SECONDS             = 86400
 REPOSITORY_REFRESH_TTL_SECONDS        = 86400
+REFRESH_ACTIVE_WITHIN_SECONDS         = 604800   (refresh only recently active entities)
 ENRICHMENT_COVERAGE_WINDOW_SECONDS    = 86400
+ENRICHMENT_METRICS_WINDOW_SECONDS     = 3600     (throughput/batch-quality window)
+CATCH_UP_MIN_SAMPLE_SECONDS           = 900      (below this, catch-up is insufficient_sample)
+ENRICHMENT_LEASE_SECONDS              = 600
+ENRICHMENT_RETRY_BASE_SECONDS         = 60,  ENRICHMENT_RETRY_MAX_SECONDS = 3600
+ENRICHMENT_CYCLE_BUDGET_SECONDS       = 55       (one cycle stays inside the dispatch tick)
 ```
 
 ### Enrichment URL validation (SSRF boundary)
@@ -856,6 +1004,14 @@ Enrichment follows URLs supplied inside event payloads, so a strict trust bounda
 - Fixture mode permits only the fixture URI scheme/host and fails closed
 - No arbitrary external URL is ever fetched
 - Violations mark the entity `permanent_failure`
+
+Appendix G splits enrichment URLs into **two origins**. Search URLs are
+**application-origin constants**: `Github::Enrichment::SearchQuery` builds them from a
+constant host and path plus URL-encoded exact qualifiers derived from stored identity
+fields, and they still pass through the same in-chain validation as every other request.
+Detail URLs remain **payload-origin** and clear the full boundary above. The two never
+mix: after a Search miss, the fallback fetches only the entity's stored payload-provided
+`api_url` — no identifier is ever turned into a constructed detail URL.
 
 ### Headers to process
 
@@ -913,13 +1069,20 @@ actor/repo response malformed        → entity permanent_failure or retryable_f
 
 Never disable the event source because one enrichment target disappeared.
 
-### Request prioritization
+### Request prioritization (amended by Appendix G)
+
+On the **core** resource:
 
 1. Polling for new events (from `poll_attempt_allowance`)
-2. Actor and repository enrichment (from `enrichment_allowance`, under the fairness guarantees — neither class can starve the other)
-3. Refreshing stale enrichment (within each class’s share, and only when neither entity class has any never-enriched backlog work)
+2. Detail fallback, only within its explicit `CORE_DETAIL_FALLBACK_ALLOWANCE` (4/hour),
+   under the fairness guarantees — it can never take the polling allocation
+3. Nothing else spends core; the remainder is deliberately unspent headroom
 
-Polling receives priority because raw-event capture is more time-sensitive than enrichment — and the enrichment slice is guaranteed by its own allowance rather than starved by priority alone.
+The **search** resource is independent: batch enrichment — backlog first, then refresh
+under Appendix G's composition rule — spends the per-minute search ledger and competes
+with nothing on core. Polling receives core priority because raw-event capture is
+time-sensitive; enrichment throughput lives on its own resource, so neither starves the
+other by construction.
 
 ## 11. Observability
 
@@ -938,9 +1101,31 @@ Common fields: timestamp, level, service, environment, event name, `run_id`, job
 
 - `GET /health/live` — process is running. **Never calls GitHub, never consumes budget.**
 - `GET /health/ready` — primary database reachable and required schema present. Same guarantee.
-- `GET /status` — reports persisted state only; **never initiates a GitHub request**:
+- `GET /status` — reports persisted state only; **never initiates a GitHub request**.
+  Top-level blocks (as amended by Appendix G): `captured_at`, `sources`, `ledger`,
+  `search_ledger`, `scheduler`, `enrichment`, `batches`, `throughput`, `coverage`:
   - poll state (scheduling components, last run)
-  - ledger state: window status, per-class used/allowance (`actor_requests_used/available`, `repository_requests_used/available`, poll used/allowance), `remaining`, `reset_at`, `global_blocked_until`, reserve
+  - core ledger state: window status, `poll` used/allowance, `detail_fallback`
+    used/allowance (renamed from `enrichment`), `actor_requests`/`repository_requests`
+    used/available, `remaining`, `reset_at`, `global_blocked_until`, reserve
+  - search ledger state: presence, observed limit/remaining/reset, ceiling, reserve,
+    spendable, used (total and per lane), `blocked_until`, `last_request_at`, and the
+    pacing-derived `next_request_earliest_at`
+  - scheduler settings, published so every tunable is visible: search
+    ceiling/reserve/batch size/pacing/concurrency, fairness weights and share, core
+    detail-fallback allowance and reserve, retry/backoff/lease/cycle timings, refresh
+    TTLs and activity window, metrics windows
+  - per-class enrichment state: the four status counts, backlog and contract-backlog
+    counts, oldest pending timestamp/age, and per-stage counts with oldest ages across
+    all seven stages; plus `claimable_now` and `next_enrichment_at`
+  - batch quality over the metrics window: attempts, in-flight, succeeded, failed,
+    deferred, stale-lease, requested/returned/valid/missing/invalid item counts, fill
+    ratio, and `incomplete_results` count — for all four request-kind × entity-kind
+    groups
+  - throughput: measured arrivals, completions, terminals, exits, hourly rates, and
+    backlog delta per lane and combined, plus a tri-state `catch_up.state`
+    (`keeping_up | not_keeping_up | insufficient_sample`) gated by
+    `CATCH_UP_MIN_SAMPLE_SECONDS`. Measured rates, never a drain forecast
   - enrichment coverage, computed over `ENRICHMENT_COVERAGE_WINDOW_SECONDS` with **defined formulas**:
 
 ```text
@@ -956,7 +1141,9 @@ events_with_both_entities_enriched_pct =
 ```
 
   - per-class backlog size and oldest pending timestamp/age, alongside reserved allowance
-    usage; no drain ETA without durable outcome history
+    usage. Appendix G supersedes the original no-drain-ETA wording: durable outcome
+    history now exists, so `/status` publishes measured completion and arrival rates —
+    but still no forecast, because a measured past rate does not bound future arrivals
 - `GET /api/push_events`
 - `GET /api/push_events/:id`
 
@@ -984,6 +1171,11 @@ Testing focuses on correctness boundaries rather than exhaustive framework behav
 - Pagination stop logic (`Link`-header driven; cap / allowance / no-next / empty)
 - Enrichment state machine transitions, including durable quota deferral, FIFO ordering,
   and duplicate replay without new activity
+- Staged-batch units (Appendix G): `SearchQuery` construction (repeated exact
+  qualifiers, never `OR`; encoding; batch-size cap), `SearchResponse` envelope parsing,
+  stable-ID validation including rename and identity-mismatch refusal, search-ledger
+  accounting (ceiling, reserve, pacing, header-less window roll, blocked_until
+  precedence), admission verdicts, and configuration validation for every new variable
 
 ### Persistence tests
 
@@ -1007,6 +1199,17 @@ Testing focuses on correctness boundaries rather than exhaustive framework behav
 - FIFO selection by `created_at ASC, id ASC` under sustained arrivals
 - Refresh suppression while any never-enriched actor or repository work remains
 - Class fairness: repository flood cannot starve actors (and vice versa); borrowing only when the other class has no claimable backlog candidate
+- Batch response matrix (Appendix G, driven by the search fixture corpus): complete,
+  partial, empty, malformed-envelope, renamed-repository, unrequested-result, and
+  `incomplete_results` responses — ID-valid items applied, everything else observed and
+  routed to detail fallback or retry, all in one transaction per response
+- Dual-window deferral: core hourly exhaustion and search per-minute exhaustion defer
+  independently, and neither produces a terminal entity outcome
+- Catch-up metrics: throughput window arithmetic, `insufficient_sample` below the
+  minimum sample, `keeping_up`/`not_keeping_up` from backlog delta and contract backlog
+- Migration interplay: legacy `enrichment_status` rows map onto the staged stage
+  machine (`complete → contract_complete`, `retryable_failure → retry_scheduled`,
+  candidates → `batch_pending`) without losing durable work
 - Poll allowance protected from enrichment demand — and vice versa (class-blocking isolation: one class exhausted, the other proceeds)
 - Rate-limit exhaustion (`403` + headers → `global_blocked_until`); routine `reset_at` never defers; secondary limit blocks globally including enrichment
 - Per-window bootstrap: new window → counters reset → enrichment ineligible until the first poll initializes it
@@ -1088,8 +1291,8 @@ File locations: `IMPLEMENTATION_PLAN.md` at the repository root; `DESIGN_BRIEF.m
 Must include:
 
 - Pointer to `IMPLEMENTATION_PLAN.md`, noting pre-implementation history in Git and
-  Appendices A–D, execution deltas in Appendix E, and the durable-backlog correction in
-  Appendix F
+  Appendices A–D, execution deltas in Appendix E, the durable-backlog correction in
+  Appendix F, and the staged-batch enrichment design in Appendix G
 - Problem overview
 - Architecture summary
 - Requirements
@@ -1126,9 +1329,9 @@ Keep within one to two pages — the brief is the reviewer’s primary architect
 - Data model
 - Durability boundary
 - **The request-budget formula and table, and the unauthenticated `304` finding** — worded precisely: the endpoint documentation contains a general statement that `304` responses do not affect the rate limit, while the REST best-practices documentation limits that exemption to correctly authorized requests; dated unauthenticated probes showed `x-ratelimit-used` increasing across a `304`; this implementation therefore budgets unauthenticated conditional requests as one request
-- **Enrichment as a durable FIFO backlog with per-class fairness; quota exhaustion defers
-  without terminating, refresh waits for the never-enriched pool to empty, and unbounded
-  growth is reported rather than hidden**
+- **Enrichment as a durable, staged, batch-served FIFO backlog with per-class fairness;
+  quota exhaustion defers without terminating, refresh rides the same batch path after
+  backlog, and catch-up is measured and published rather than promised**
 - Duplicate-safe event persistence and restart recovery (advisory-lock ownership; outbox-style recovery; Docker restart policies)
 - Enrichment strategy and the SSRF boundary
 - Tradeoffs and assumptions (including `jsonb` semantic retention)
@@ -1141,8 +1344,9 @@ Keep within one to two pages — the brief is the reviewer’s primary architect
 
 The plan’s pre-implementation revision history is preserved in Git history and summarized
 in Appendices A–D — the review-driven revision rounds are themselves submission-worthy
-evidence of process. Appendix E records execution deltas and Appendix F the durable-backlog
-correction.
+evidence of process. Appendix E records execution deltas, Appendix F the durable-backlog
+correction, and Appendix G the staged-batch enrichment design that supersedes Appendix F's
+service model.
 
 ### Architecture Decision Records (`docs/adr/`)
 
@@ -1218,17 +1422,20 @@ evidence for the other.
 - Reconciliation recovers missing enrichment scheduling
 - Never-enriched entity rows remain durable across quota exhaustion and window rollover;
   FIFO selection prevents newer arrivals from starving older work
-- A selection that observes either class has never-enriched backlog work does not choose a
-  refresh; a concurrent insert after that read can cross at most one one-request runner cycle
+- A batch claim that observes claimable never-enriched work in either class takes no
+  refresh candidate (Appendix G's composition rule); a concurrent insert after that read
+  can cross at most one already-claimed batch before the next claim suppresses refresh
 
 ### Operability
 
 - Logs are readable through `docker compose logs -f` at the default level
 - Correlation fields (`run_id`, job ID) are present
 - `/health/live` and `/health/ready` are meaningful and never consume budget
-- `/status` reports window status, poll state, per-class ledger state, backlog size, oldest
-  pending timestamp/age, reserved allowance usage, and coverage percentages computed by the
-  defined formulas — without initiating GitHub requests or fabricating a drain ETA
+- `/status` reports window status, poll state, both ledgers' state, backlog size and
+  per-stage counts, oldest pending timestamp/age, reserved allowance usage, batch quality,
+  measured throughput with the tri-state catch-up verdict, and coverage percentages
+  computed by the defined formulas — without initiating GitHub requests or fabricating a
+  drain ETA
 - Retry behavior is visible
 - Failures contain actionable context
 
@@ -1253,6 +1460,8 @@ evidence for the other.
 - No misleading guarantee of complete upstream event capture
 - No claim of exactly-once execution
 - No claim that enrichment coverage is complete
+- No claim of guaranteed catch-up — only a dated, measured comparison of completion and
+  arrival rates, with `/status` reporting `not_keeping_up` when the comparison fails
 - No failing or flaky tests
 
 ## 17. Delivery Principle
@@ -1410,3 +1619,133 @@ The arithmetic in Appendix A still matters, but its conclusion changes: if uniqu
 continue above the 40-attempt service rate, backlog size and oldest pending age can grow
 without a bounded completion estimate. That is an operational fact to expose and capacity
 to revisit, not permission to discard durable work.
+
+## Appendix G — Derivation-first staged batch enrichment (2026-08-02)
+
+Appendix F made the backlog durable; it did not make it drain. Its service model — one
+core request per entity, 40 attempts per hour — cannot plausibly meet the observed cold
+demand, and authentication remains out of scope. This appendix supersedes Appendix F's
+per-entity capacity assumption while preserving its durability guarantees, and amends
+Sections 5, 7, 10, 11, 12, and 16 in place. A live unauthenticated probe supplied the
+enabling facts: repeated exact `user:`/`repo:` Search qualifiers returned 5/5 requested
+users and 9/10 requested repositories with `incomplete_results: false`; the miss was
+`facebook/react` redirecting to `react/react` — a rename, which is why stable-ID
+validation and a fallback exist; both responses reported the `search` rate-limit resource
+with a limit of 10; and joining exact qualifiers with `OR` produced HTTP 422.
+
+### The decision
+
+- **Derivation first.** Ingestion persists event-native identity and appends an
+  event-source observation transactionally with each push event, derives every locally
+  computable field (repository `owner_login` and short `name` from `full_name`), and
+  stamps the event-native/derived/batch-pending instants. No network request is spent on
+  a fact the stored payload already determines. Duplicate demand coalesces by stable
+  GitHub entity ID.
+- **Search batches are the normal path.** Up to `SEARCH_BATCH_SIZE` (10) repeated exact
+  `user:` / `repo:` qualifiers per request — joined by spaces, **never `OR`** — on the
+  separate per-minute search ledger (ceiling 10, reserve 2, pacing 6 seconds, 60-second
+  windows with a header-less roll). Results are mapped by stable integer ID, never by
+  result order or mutable login/name alone.
+- **Payload-URL detail fallback, bounded.** Only items a batch could not settle —
+  missing, renamed, identity-mismatched, or contract-invalid — fetch their stored
+  payload-provided `api_url` through the core ledger's
+  `CORE_DETAIL_FALLBACK_ALLOWANCE` (4/hour). The fallback never constructs a URL from an
+  identifier and never touches the polling allocation.
+- **Dual ledgers.** `github_api_budget` (core: 12 poll + 4 detail fallback + 8 reserve
+  ≤ 60, remainder deliberately unspent) and `github_search_budget` (per-minute search)
+  are reconciled independently against their own `x-ratelimit-resource` headers. The
+  global request gate still serializes all outbound requests.
+- **A useful-data completion contract per entity.** Completion is an explicit, queryable
+  contract, not "every field GitHub can return": actors require account type plus the
+  complete raw search item on top of event-native identity; repositories require
+  description, primary language, owner GitHub ID, fork status, archived status, default
+  branch, and GitHub creation time plus the raw item, with short name and owner login
+  derived locally. Nullable fields are valid as nulls; "complete" means a valid response
+  was durably observed and the contract evaluated. Actor profile name, company,
+  location, bio, and follower counts are deliberately outside the contract.
+- **Append-only observations plus batch envelopes.** Every raw item — event, search, or
+  detail — is an append-only `enrichment_observations` row with fingerprint, provenance,
+  and validation outcome; every request attempt is an `enrichment_batches` envelope with
+  counts, envelope facts, and observed rate-limit headers. Entity tables remain the
+  latest queryable projection and point at their latest successful observation. A
+  refresh repoints the projection; it never overwrites retained evidence.
+- **A stage machine with seven resting stages.** `batch_pending`, `batch_in_flight`,
+  `detail_pending`, `detail_in_flight`, `retry_scheduled`, `contract_complete`,
+  `terminal` — check-constrained, leased (`ENRICHMENT_LEASE_SECONDS` = 600), with
+  instant timestamps for the conditions no row rests in (event-native, derived, batch
+  applied). `enrichment_status` stays the business outcome. `retry_scheduled` belongs to
+  the batch path; detail retries rest in `detail_pending` with `next_retry_at` — the
+  claimable stage sets are provably disjoint. Detail retries are bounded by
+  `DETAIL_FALLBACK_MAX_ATTEMPTS` (3); a 404/410 on a detail URL is an immediate
+  entity-specific terminal outcome that retains events, observations, reason, and
+  timestamps.
+- **No quota-based terminal outcome, ever.** Ceiling, reserve, pacing, and fairness
+  denials defer work — batch rows to `deferred`, entity rows released to their resting
+  stage. `skipped_budget` and every trace of it are removed. Terminal outcomes exist
+  only for entity-specific facts.
+- **Refresh through the same batch path.** There is no separate refresh request shape;
+  TTL-stale, recently active (`REFRESH_ACTIVE_WITHIN_SECONDS`) complete rows re-enter
+  the same Search batches under the composition rule below.
+
+### The refresh composition rule
+
+A batch claim fills from its own class's never-enriched backlog first, FIFO by
+`created_at ASC, id ASC`. TTL-stale refresh candidates (oldest `fetched_at` first) may
+top up spare slots only when the claiming class's own backlog is exhausted **and** the
+other class has no claimable backlog either. A refresh-only batch runs only when neither
+class has any claimable backlog. Never-enriched work therefore always outranks freshness,
+in both lanes, without a separate scheduling mechanism.
+
+### The capacity hypothesis, and the measured gate
+
+The arithmetic that motivated this design is a **hypothesis, not proof**: 8 spendable
+search requests per minute × batches of 10 → a theoretical ceiling of 4,800 returned
+items per hour, against the 2,172–2,280 cold entities per hour of Appendix A's short
+pressure sample — before misses, fallback, retries, and pacing. The acceptance gate is
+therefore **measured, not derived**: `/status` publishes a `throughput` block (arrivals,
+completions, terminals, hourly rates, backlog delta, per lane and combined) and a
+tri-state `catch_up.state` — `keeping_up`, `not_keeping_up`, or `insufficient_sample`
+below `CATCH_UP_MIN_SAMPLE_SECONDS` — and the service reports `not_keeping_up` rather
+than claiming eventual catch-up when completions do not exceed arrivals. This supersedes
+Appendix F's no-drain-ETA wording: durable outcome history now exists, so measured rates
+are published — still no forecast, because a measured past rate does not bound future
+arrivals.
+
+### What the live verification changed
+
+Three defects survived design review and the offline corpus, and were found only by
+running the staged path against the real unauthenticated API
+([dated transcript](docs/evidence/2026-08-02-live-staged-batch-enrichment.md)):
+
+1. **A payload URL that cannot be parsed is a permanent outcome, not a retryable one.**
+   The actor `github-actions[bot]` supplies a URL containing brackets, which
+   `Github::UrlPolicy` refuses before the gate. Retrying it would spend three of the four
+   hourly core detail requests re-refusing the same stored string. Detail fallback now
+   terminates on `not_found`, `client_error`, and `permanent_error` alike, matching §10's
+   classification table.
+2. **Search answers `422` — not an empty result set — when every requested identifier is
+   unsearchable.** A batch of ten silently omits its unsearchable members, which is why
+   the exploratory probe never saw this; a batch whose members are *all* renamed or
+   deleted gets a validation failure instead. Read as a generic client error, the members
+   retried on the one lane that can never resolve them. A `422` carrying that signature is
+   now treated as "every requested identifier is missing", and its members take the same
+   fallback route an omitted item takes.
+3. **A multi-queue Solid Queue worker must be declared as a YAML list.**
+   `queues: polling,control` names one queue literally called `"polling,control"`, because
+   `SolidQueue::QueueSelector` wraps its input in `Array()`. That worker registered,
+   heartbeated, and polled forever while claiming nothing, so the always-on container
+   never polled or reconciled. This predates the staged-enrichment work; the suite missed
+   it because the spec split the configured string itself and so asserted intent rather
+   than runtime behavior. Both queue specs now assert through the selector.
+
+The general lesson, recorded because it is the reason this gate exists: each of the three
+is a case where the code and its tests agreed with each other and disagreed with the
+world.
+
+What supersedes what: Appendix F's durable-backlog invariants (rows survive quota
+windows; denial defers; FIFO by `created_at, id`; no quota terminal state) carry forward
+unchanged. Its one-request-per-entity service model, its "40 backlog-enrichment requests"
+core split, its refresh-suppression phrasing, and its refusal to publish any service rate
+are superseded by the staged batch path, the 12 + 4 + 8 core formula with the search
+budget beside it, the refresh composition rule, and the measured catch-up block. ADR 0013
+records the decision and its rejected alternatives.
