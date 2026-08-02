@@ -1,5 +1,30 @@
 # github-push-ingestor
 
+## New here? Start with the offline demo
+
+This program regularly checks GitHub's public activity feed, saves public code-push
+events, and lets you inspect who pushed to which repository. The offline demo uses
+prerecorded GitHub responses, makes no internet requests, and walks through the complete
+collect → save → enrich → inspect flow in a few minutes.
+
+```bash
+GITHUB_MODE=fixture docker compose up --build -d db setup web
+GITHUB_MODE=fixture docker compose run --rm ingest
+GITHUB_MODE=fixture docker compose run --rm enrich --limit 6
+curl -s http://localhost:3000/api/push_events
+```
+
+On a fresh project database, ingestion saves **4 valid push events**, quarantines **3
+malformed events**, and ignores **1 event that is not a push**. Enrichment then attempts all
+**6 actor/repository backlog rows**: **4 complete successfully**, while **2 intentional
+`404` outcomes** become permanent failures for a deleted user and repository. Nothing in
+this walkthrough contacts GitHub or consumes real API quota.
+
+Already used this project and seeing different totals or a deferred poll? The database is
+preserved between runs. Follow [Deterministic fixture verification](#deterministic-fixture-verification)
+for the clean-reset walkthrough and expected output. When you are ready for the complete
+automatic service, continue to [Quick start](#quick-start).
+
 Fault-tolerant Rails service for ingesting, enriching, and persisting GitHub
 Push events.
 
@@ -50,11 +75,11 @@ What it does, running:
 
 **Enrichment is a durable, quota-paced backlog.** With the defaults, the hourly ledger
 reserves 12 requests for polling, 40 for the enrichment class, and 8 as a safety reserve.
-Durable backlog work has priority over refreshes within those 40 attempts, which carry
-20/20 actor/repository guarantees with borrowing. Entity
-rows remain actionable until a real enrichment response produces success or an
-entity-specific terminal failure: quota exhaustion defers them to a later window, FIFO
-oldest-first, and never converts delay into a terminal outcome. See [Known
+Durable backlog work has priority over refreshes within those 40 attempts. Actors and
+repositories receive 20/20 guarantees with borrowing. Entity rows remain actionable until
+enrichment succeeds or an entity-specific terminal outcome is established; quota exhaustion
+only defers them to a later window. Selection remains FIFO, oldest-first within each class,
+and delay never becomes a terminal outcome. See [Known
 limitations](#known-limitations) for what happens when arrivals outpace that service rate.
 
 **With the default `GITHUB_MODE=live`, `docker compose up` starts spending real
@@ -574,10 +599,11 @@ Three conventions in the response body are worth knowing before reading one:
   exist prints `null`. Where `null` would be ambiguous the disambiguating fact gets
   its own field — `ledger.present` separates "no ledger row yet" from "remaining is
   genuinely 0", `due_now` separates "no constraint applies" from "unknown", and
-  `claimable_now` separates "work is claimable this second" from "nothing is
-  waiting". An empty coverage window reports `null` percentages, not `0.0`: the
-  ratio is undefined, not zero, and every denominator is published beside its ratio
-  so you can check it.
+  `claimable_now` says whether work is eligible under persisted backlog and ledger state;
+  `backlog_count`, `next_enrichment_at`, and the ledger window/block fields distinguish
+  deferred work from an empty backlog. An empty coverage window reports `null`
+  percentages, not `0.0`: the ratio is undefined, not zero, and every denominator is
+  published beside its ratio so you can check it.
 - **The coverage window is measured on `created_at`** — when *this application*
   persisted the event, not GitHub's `occurred_at`. Coverage grades this
   application's enrichment pipeline and uses the same local clock as backlog and
@@ -766,14 +792,15 @@ limits are IP-scoped rather than window-scoped
 
 | Status | Entered when | Left when | Spends budget |
 |---|---|---|---|
-| `pending` | A stub row is created by ingestion | Enrichment succeeds or reaches a failure outcome | Yes, when allowance is available |
-| `complete` | An enrichment fetch succeeded | Remains complete; after the TTL it may be refreshed in place once a selection observes the never-enriched backlog empty | Only on refresh |
-| `retryable_failure` | A `5xx`, timeout, or transport error | The backoff expires and a retry runs | Yes — it stays a candidate |
-| `permanent_failure` | A `404` or other permanent `4xx` on the entity URL | Never, automatically | Yes for the HTTP outcome; no future retries |
+| `pending` | Ingestion creates a stub row | Success, a retryable outcome, or a permanent outcome | When a request is admitted; not for a URL-policy rejection |
+| `complete` | An enrichment fetch succeeds | Stays complete while fresh; after TTL it may refresh once the backlog is observed empty. Transient refresh failures keep it complete; terminal outcomes may make it `permanent_failure` | When a refresh request is admitted |
+| `retryable_failure` | A retryable entity or transport outcome occurs | Retried after backoff; leaves on success or a permanent outcome | When a request is admitted |
+| `permanent_failure` | A permanent response, document, redirect/policy, or transport outcome occurs | Never, automatically | Every admitted outbound attempt; a pre-gate URL rejection spends none |
 
-`pending` and `retryable_failure` rows are the durable backlog. They are selected FIFO,
-oldest first, and quota exhaustion only defers them to a later window. A duplicate replay
-may refresh identity fields but does not register new activity or change backlog priority.
+`pending` and `retryable_failure` rows are the durable backlog. Within each entity class
+they are selected FIFO, oldest first, and quota exhaustion only defers them to a later
+window. A duplicate replay may refresh identity fields but does not register new activity
+or change backlog priority.
 
 ### Replay behavior by table
 
@@ -1145,7 +1172,7 @@ IngestionRunner ──► SourceLock ──► PollSchedule (due? — five compo
                                  ├──► PageLoop ──► RequestExecutor ──► RequestGate
 EnrichmentRunner ────────────────┘      │ ▲                        ──► BudgetLedger.reserve!
   FIFO backlog → class, borrow          │ │                        ──► UrlPolicy
-  Refresh only when backlog empty       │ └── LinkHeader.next_url  ──► Transport (Faraday | Fixture)
+  Refresh after backlog observed empty  │ └── LinkHeader.next_url  ──► Transport (Faraday | Fixture)
   Claim → lease on next_retry_at        │                                   │
   (never a SourceLock, §8 step 1)       │                                   ▼
                                         │                  PageWriter: one transaction per event
@@ -1287,9 +1314,12 @@ pinned API version (0011), and Solid Queue over Kafka (0012).
 
 ## Continuous ingestion
 
-The `worker` container runs one Solid Queue supervisor: a dispatcher, the worker
-threads from [`config/queue.yml`](config/queue.yml), and a scheduler running
-[`config/recurring.yml`](config/recurring.yml). Two tasks fire every 60 seconds.
+The `worker` container runs one Solid Queue supervisor: a dispatcher, a scheduler running
+[`config/recurring.yml`](config/recurring.yml), and two single-thread worker processes from
+[`config/queue.yml`](config/queue.yml). One process serves `polling,control`; the other is
+dedicated to `enrichment`, so polling and control work never queue behind the enrichment
+workload. Outbound polling and enrichment attempts still serialize through `RequestGate`.
+Two tasks fire every 60 seconds.
 
 **A tick is not a poll.** `PollEventSourceJob` selects the sources whose cached
 `next_poll_at` has arrived, and `Github::IngestionRunner` then re-reads each one
@@ -1311,8 +1341,9 @@ entity state remains discoverable on a later successful scheduled tick without a
 cleanup job or queue inspection (plan §8,
 [ADR 0008](docs/adr/0008-post-commit-enqueue-and-entity-scoped-reconciliation.md)).
 
-Each cycle enriches at most one entity, chosen by §10's fairness policy under a
-lease, so a backlog of ninety pending actors is one queued job rather than ninety.
+Each dispatch call enqueues at most one job per class regardless of backlog depth; entity
+rows, not queued jobs, are the backlog. Each cycle enriches at most one entity, chosen by
+§10's fairness policy under a lease.
 Steady state at the defaults: twelve polls an hour, and at most forty enrichment
 requests an hour split into 20/20 actor/repository guarantees with borrowing. Within each
 class the oldest never-enriched entity is selected first; a selection considers refresh
@@ -1552,10 +1583,10 @@ ceiling, and of deliberate scope decisions. Each is a stated operational boundar
 entity requests per page, or ~2,172 an hour if every poll contained entirely new entities,
 against 40 available. That extrapolation is a pressure scenario, not the measured
 deduplicated arrival rate: repeated actors, repositories, and overlapping pages collapse to
-shared rows. Entity rows nevertheless remain durable FIFO backlog work; quota exhaustion
-defers them to later windows and never terminates them. If measured unique arrivals remain
-above 40 attempts per hour, backlog size and oldest pending age grow and no
-finite drain estimate is honest. `/status` publishes backlog count, oldest pending age,
+shared rows. Entity rows nevertheless remain durable backlog work, FIFO within each entity
+class; quota exhaustion defers them to later windows and never terminates them. If measured
+unique arrivals remain above 40 attempts per hour, backlog size and oldest pending age grow
+and no finite drain estimate is honest. `/status` publishes backlog count, oldest pending age,
 and the reserved allowance's usage; it does not fabricate an ETA from incomplete history.
 
 **2. There is no guarantee of complete upstream capture.** Pagination deepens a single
@@ -1606,13 +1637,14 @@ verification](#crash-recovery-verification); Extension D (testing strategy) is
 described there.
 
 **9. Business tables and the enrichment backlog can grow without bound.** `push_events`,
-`ingestion_runs`, and `quarantined_events` are append-only, and never-enriched actor and
-repository rows remain actionable until attempted — this service is the system of record,
+`ingestion_runs`, and `quarantined_events` are append-only, and actor and repository rows
+remain actionable until enrichment succeeds or establishes an entity-specific terminal
+outcome — this service is the system of record,
 and retention, pruning, and archival were deliberately not built. Twelve poll attempts an
 hour at up to ~100 events each can add roughly 1,200 event rows and as many as 2,400 entity
-references an hour before deduplication, while only 40 enrichment attempts drain the
-backlog. The only shipped pruning is Solid Queue's finished-job cleanup in the queue
-database, which holds no business data.
+references an hour before deduplication, while only 40 enrichment request attempts per hour
+are available to work that backlog. The only shipped pruning is Solid Queue's finished-job
+cleanup in the queue database, which holds no business data.
 
 ## Development
 
