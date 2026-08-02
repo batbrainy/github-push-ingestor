@@ -455,9 +455,10 @@ RSpec.describe Github::IngestionRunner do
   # so what these examples pin is *when* the hint is emitted — after every row is durable,
   # outside the source lock, and only when the run created something.
   describe "enqueueing enrichment after commit" do
-    it "enqueues one cycle per class when the run created events" do
-      expect { ingest }.to have_enqueued_job(EnrichActorJob).exactly(:once)
-        .and have_enqueued_job(EnrichRepositoryJob).exactly(:once)
+    it "enqueues one wake-up cycle when the run created events" do
+      expect { ingest }.to have_enqueued_job(EnrichmentCycleJob).exactly(:once)
+
+      expect(ActiveJob::Base.queue_adapter.enqueued_jobs.map { _1[:job] }).to eq([ EnrichmentCycleJob ])
     end
 
     # A replay refreshes identity but creates no event row, so there is no new work hint to
@@ -483,7 +484,7 @@ RSpec.describe Github::IngestionRunner do
     # a write to another database).
     it "enqueues only once the rows are durable, the run row is closed, and the lock is released" do
       observed = []
-      allow(EnrichActorJob).to receive(:perform_later) do
+      allow(EnrichmentCycleJob).to receive(:perform_later) do
         transaction = ActiveRecord::Base.lease_connection.current_transaction
 
         observed << {

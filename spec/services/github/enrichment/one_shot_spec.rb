@@ -1,56 +1,127 @@
 require "rails_helper"
 
 RSpec.describe Github::Enrichment::OneShot do
-  # An instance_double, so the CLI contract is asserted independently of what enrichment
-  # actually does — the shape ingestion/one_shot_spec.rb uses for the same reason.
-  let(:runner) { instance_double(Github::EnrichmentRunner) }
+  # instance_doubles, so the CLI contract — lanes, the request limit, exit codes, the
+  # report — is asserted independently of what the runners actually do, the shape
+  # ingestion/one_shot_spec.rb uses for the same reason.
+  let(:batch_runner) { instance_double(Github::Enrichment::BatchRunner) }
+  let(:detail_runner) { instance_double(Github::Enrichment::DetailRunner) }
+  let(:admission) { instance_double(Github::Enrichment::Admission) }
+  let(:batch_claim) { instance_double(Github::Enrichment::BatchClaim) }
+  let(:detail_claim) { instance_double(Github::Enrichment::DetailClaim) }
   let(:output) { StringIO.new }
   let(:error_output) { StringIO.new }
 
+  let(:granted) { Github::Enrichment::Admission::GRANTED }
+
+  def denial(reason)
+    Github::Enrichment::Admission::Verdict.new(reason: reason, retry_in_seconds: nil)
+  end
+
   def one_shot(argv: [])
-    described_class.new(argv: argv, output: output, error_output: error_output, runner: runner)
+    described_class.new(argv: argv, output: output, error_output: error_output,
+                        batch_runner: batch_runner, detail_runner: detail_runner,
+                        admission: admission, batch_claim: batch_claim,
+                        detail_claim: detail_claim)
   end
 
-  def result(status:, **overrides)
-    Github::EnrichmentRunner::Result.new(status: status, **overrides)
+  def batch_result(status:, **overrides)
+    defaults = { status: status, entity_type: :actor, batch_id: 41, requested_count: 3,
+                 returned_count: 3, valid_count: 2, fallback_count: 1, deferral_reason: nil }
+
+    Github::Enrichment::BatchRunner::Result.new(**defaults.merge(overrides))
   end
 
-  def returning(*results)
-    allow(runner).to receive(:call).and_return(*results)
+  def detail_result(status:, **overrides)
+    defaults = { status: status, entity_type: :actor, github_id: 583_231, batch_id: 42,
+                 reason: nil }
+
+    Github::Enrichment::DetailRunner::Result.new(**defaults.merge(overrides))
+  end
+
+  # Both lanes admissible and empty by default; each example states only its deviation.
+  before do
+    allow(admission).to receive(:search).and_return(granted)
+    allow(admission).to receive(:detail).and_return(granted)
+    allow(batch_claim).to receive(:claimable?).and_return(false)
+    allow(detail_claim).to receive(:claimable?).and_return(false)
+  end
+
+  def batch_work!
+    allow(batch_claim).to receive(:claimable?).and_return(true)
+  end
+
+  def detail_work!
+    allow(detail_claim).to receive(:claimable?).and_return(true)
   end
 
   describe "exit codes" do
-    it "succeeds when it enriched something" do
-      returning(result(status: "enriched", entity_type: :actor, github_id: 1))
+    it "succeeds when a batch applied its items" do
+      batch_work!
+      allow(batch_runner).to receive(:call).and_return(batch_result(status: "completed"))
 
       expect(one_shot.call.exit_code).to eq(described_class::SUCCESS)
     end
 
-    # §10 is explicit that a 404 on one enrichment target is not a failure of anything
-    # else. Without this rule a reviewer running the deterministic fixture scenario would
-    # get exit 1 for ghostuser, which is correct behaviour reported as breakage.
-    it "succeeds on a permanent failure, which is a decided and durable outcome" do
-      returning(result(status: "failed", entity_type: :actor, github_id: 1,
-                       enrichment_status: "permanent_failure", last_error: "404"))
+    # §10 is explicit that a confirmed-gone entity is a decided, durable outcome. Without
+    # this rule a reviewer running the deterministic fixture scenario would get exit 1 for
+    # ghostuser — correct behaviour reported as breakage.
+    it "succeeds on a terminal detail outcome, which is decided and durable" do
+      detail_work!
+      allow(detail_runner).to receive(:call)
+        .and_return(detail_result(status: "terminal", reason: "entity_gone_404"))
 
-      expect(one_shot.call.exit_code).to eq(described_class::SUCCESS)
+      expect(one_shot(argv: %w[ --stage detail ]).call.exit_code).to eq(described_class::SUCCESS)
     end
 
-    it "fails on a retryable failure, which is the one case where work is genuinely unfinished" do
-      returning(result(status: "failed", entity_type: :actor, github_id: 1,
-                       enrichment_status: "retryable_failure", last_error: "500"))
+    it "fails when a batch failed, which schedules retries for every claimed item" do
+      batch_work!
+      allow(batch_runner).to receive(:call)
+        .and_return(batch_result(status: "failed", deferral_reason: "search_http_500"))
 
       expect(one_shot.call.exit_code).to eq(described_class::FAILURE)
     end
 
+    it "fails when a detail attempt is scheduled to be retried" do
+      detail_work!
+      allow(detail_runner).to receive(:call)
+        .and_return(detail_result(status: "retry_scheduled", reason: "502"))
+
+      expect(one_shot(argv: %w[ --stage detail ]).call.exit_code).to eq(described_class::FAILURE)
+    end
+
     # §9's rule for the ingestion command, and the same reasoning: the request never
     # happened, so a reviewer's command must not look broken.
-    it "succeeds on every deferral, because nothing failed" do
-      %w[ idle deferred lease_lost ].each do |status|
-        returning(result(status: status, deferral_reason: "class_exhausted"))
+    it "succeeds on a ledger deferral, because nothing failed" do
+      batch_work!
+      allow(batch_runner).to receive(:call)
+        .and_return(batch_result(status: "deferred", deferral_reason: "search_reserve_reached"))
 
-        expect(one_shot.call.exit_code).to eq(described_class::SUCCESS), "expected #{status} to exit 0"
-      end
+      expect(one_shot.call.exit_code).to eq(described_class::SUCCESS)
+    end
+
+    # A lease lost to a concurrent worker means the entity was decided elsewhere — work
+    # happened, just not here.
+    it "succeeds on a lost lease and an empty backlog alike" do
+      expect(one_shot.call.exit_code).to eq(described_class::SUCCESS)
+
+      detail_work!
+      allow(detail_runner).to receive(:call).and_return(detail_result(status: "lease_lost"))
+
+      expect(one_shot(argv: %w[ --stage detail ]).call.exit_code).to eq(described_class::SUCCESS)
+    end
+
+    # There is no pacing sleep here: the always-on cycle waits pacing out, a one-shot
+    # reports the truth and exits 0. The unstubbed batch_runner double is itself the
+    # proof that no request was attempted — a call would raise.
+    it "reports a pacing denial and stops without a request" do
+      batch_work!
+      allow(admission).to receive(:search).and_return(denial(:search_pacing))
+
+      result = one_shot(argv: %w[ --stage batch ]).call
+
+      expect(result.exit_code).to eq(described_class::SUCCESS)
+      expect(output.string).to include("Search deferred — search_pacing")
     end
 
     it "refuses a bad option rather than running with a guess" do
@@ -58,8 +129,19 @@ RSpec.describe Github::Enrichment::OneShot do
       expect(error_output.string).to include("bin/enrich")
     end
 
+    it "refuses a configuration the initializer would have refused" do
+      batch_work!
+      allow(batch_runner).to receive(:call)
+        .and_raise(Github::Errors::ConfigurationError, "SEARCH_BATCH_SIZE must be positive")
+
+      expect(one_shot.call.exit_code).to eq(described_class::REFUSED)
+      expect(error_output.string).to include("Configuration error")
+    end
+
     it "refuses a corpus gap, which is an authoring bug that recurs until it is fixed" do
-      allow(runner).to receive(:call).and_raise(Github::Errors::FixtureMiss.new("/users/nobody"))
+      batch_work!
+      allow(batch_runner).to receive(:call)
+        .and_raise(Github::Errors::FixtureMiss.new("/search/users?q=user%3Anobody"))
 
       expect(one_shot.call.exit_code).to eq(described_class::REFUSED)
       expect(error_output.string).to include("Fixture corpus error")
@@ -67,40 +149,63 @@ RSpec.describe Github::Enrichment::OneShot do
   end
 
   describe "--limit" do
-    it "runs one cycle by default, which is the unit PR 8's jobs wrap" do
-      expect(runner).to receive(:call).once.and_return(result(status: "enriched", entity_type: :actor, github_id: 1))
+    it "attempts one request by default" do
+      batch_work!
+      detail_work!
+      expect(batch_runner).to receive(:call).once.and_return(batch_result(status: "completed"))
 
       one_shot.call
     end
 
-    it "runs up to the number of cycles it was given" do
-      expect(runner).to receive(:call).exactly(3).times
-                                      .and_return(result(status: "enriched", entity_type: :actor, github_id: 1))
+    # The limit counts REQUESTS across both lanes, not entities and not lanes — a batch of
+    # ten entities is one request against it.
+    it "spends the request budget across both lanes in order" do
+      allow(batch_claim).to receive(:claimable?).and_return(true, false, false)
+      detail_work!
+      expect(batch_runner).to receive(:call).once.with(entity_class: :actor)
+                                            .and_return(batch_result(status: "completed"))
+      expect(detail_runner).to receive(:call).once.with(entity_class: :actor, borrow: false)
+                                             .and_return(detail_result(status: "completed"))
+
+      expect(one_shot(argv: %w[ --limit 2 ]).call.exit_code).to eq(described_class::SUCCESS)
+    end
+
+    it "attempts up to the number of requests it was given" do
+      batch_work!
+      expect(batch_runner).to receive(:call).exactly(3).times
+                                            .and_return(batch_result(status: "completed"))
 
       one_shot(argv: %w[ --limit 3 ]).call
     end
 
-    it "stops early when nothing is eligible, rather than asking again for no reason" do
-      expect(runner).to receive(:call).once.and_return(result(status: "idle"))
+    # Two consecutive idle claims end a lane — the same race guard the cycle uses — so an
+    # emptied backlog cannot spin the remaining limit away on claims.
+    it "stops a lane after two consecutive idle claims" do
+      batch_work!
+      expect(batch_runner).to receive(:call).twice.and_return(batch_result(status: "idle"))
 
-      one_shot(argv: %w[ --limit 5 ]).call
+      one_shot(argv: %w[ --limit 5 --stage batch ]).call
     end
 
-    it "stops early on a deferral, because the next cycle would be refused identically" do
-      expect(runner).to receive(:call).once
-                                      .and_return(result(status: "deferred", deferral_reason: "class_exhausted"))
+    it "stops on a deferral, because the next request would be refused identically" do
+      batch_work!
+      expect(batch_runner).to receive(:call).once
+        .and_return(batch_result(status: "deferred", deferral_reason: "search_reserve_reached"))
 
-      one_shot(argv: %w[ --limit 5 ]).call
+      one_shot(argv: %w[ --limit 5 --stage batch ]).call
+
+      expect(output.string).to include("Search batch deferred — search_reserve_reached")
     end
 
     # §16 requires malformed data not to terminate the batch, and the same reasoning
-    # applies to an entity that 404s halfway through a run.
-    it "does not stop on a failed entity, which must not terminate the batch" do
-      expect(runner).to receive(:call).exactly(3).times.and_return(
-        result(status: "failed", entity_type: :actor, github_id: 1, enrichment_status: "permanent_failure")
-      )
+    # applies to a failed request halfway through a run.
+    it "does not stop on a failed batch, which must not terminate the run" do
+      batch_work!
+      expect(batch_runner).to receive(:call).twice
+        .and_return(batch_result(status: "failed", deferral_reason: "search_http_500"))
 
-      one_shot(argv: %w[ --limit 3 ]).call
+      expect(one_shot(argv: %w[ --limit 2 --stage batch ]).call.exit_code)
+        .to eq(described_class::FAILURE)
     end
 
     it "refuses a non-positive limit" do
@@ -108,21 +213,46 @@ RSpec.describe Github::Enrichment::OneShot do
     end
   end
 
+  describe "--stage" do
+    it "runs only the batch lane when asked, never consulting the detail side" do
+      batch_work!
+      detail_work!
+      allow(batch_runner).to receive(:call).and_return(batch_result(status: "completed"))
+
+      one_shot(argv: %w[ --stage batch ]).call
+
+      expect(admission).not_to have_received(:detail)
+    end
+
+    it "runs only the detail lane when asked, never consulting the search side" do
+      batch_work!
+      detail_work!
+      allow(detail_runner).to receive(:call).and_return(detail_result(status: "completed"))
+
+      one_shot(argv: %w[ --stage detail ]).call
+
+      expect(admission).not_to have_received(:search)
+    end
+
+    it "refuses a stage it does not have" do
+      expect(one_shot(argv: %w[ --stage hourly ]).call.exit_code).to eq(described_class::REFUSED)
+      expect(error_output.string).to include("hourly")
+    end
+  end
+
   describe "--class" do
-    it "passes the class through to the runner" do
-      expect(runner).to receive(:call).with(entity_class: "actor")
-                                      .and_return(result(status: "idle"))
+    it "narrows selection to the named class without asking about the other" do
+      batch_work!
+      allow(batch_runner).to receive(:call).and_return(batch_result(status: "completed"))
 
-      one_shot(argv: %w[ --class actor ]).call
+      one_shot(argv: %w[ --class actor --stage batch ]).call
+
+      expect(batch_runner).to have_received(:call).with(entity_class: :actor)
+      expect(batch_claim).not_to have_received(:claimable?)
+        .with(Github::Enrichment::EntityType.fetch(:repository))
     end
 
-    it "asks the runner to choose when no class was named" do
-      expect(runner).to receive(:call).with(entity_class: nil).and_return(result(status: "idle"))
-
-      one_shot.call
-    end
-
-    it "rejects a class that has no enrichment counters" do
+    it "rejects a class that has no enrichment lanes" do
       expect(one_shot(argv: %w[ --class organization ]).call.exit_code).to eq(described_class::REFUSED)
       expect(error_output.string).to include("organization")
     end
@@ -139,29 +269,26 @@ RSpec.describe Github::Enrichment::OneShot do
     # §8 step 1: "Enrichment jobs skip this step — they take only the request gate." There
     # is no busy path to contract, and that absence is the guarantee made visible.
     it "never waits for a source lock, which enrichment does not take" do
-      expect(runner).to receive(:call).with(entity_class: nil).and_return(result(status: "idle"))
+      batch_work!
+      allow(batch_runner).to receive(:call).and_return(batch_result(status: "completed"))
+      expect(Github::SourceLock).not_to receive(:acquire)
 
       one_shot.call
+
+      expect(Github::LockOrder.held_keys).to be_empty
     end
   end
 
   describe "the report" do
-    before { returning(result(status: "idle")) }
-
     # §9's rule for the ingestion command applies here too: stdout always proves system
     # state, even when nothing happened.
-    it "prints the state blocks even when nothing was enriched" do
+    it "prints the tally and both persisted-state blocks even when nothing was attempted" do
       one_shot.call
 
-      expect(output.string).to include("Nothing to enrich", "Actor backlog",
-                                       "Enrichment backlog budget", "Persisted push events")
-    end
-
-    it "prints the enrichment counters for the invocation" do
-      one_shot.call
-
-      expect(output.string).to include("Enrichment cycles", "Cycles with nothing eligible")
-      expect(output.string).not_to include("Candidates skipped")
+      expect(output.string).to include(
+        "Nothing to enrich", "Requests attempted", "Actor contract backlog",
+        "Search budget", "Detail fallback budget", "Persisted push events"
+      )
     end
 
     it "writes the whole block in one call, so a JSON log line cannot split it" do
@@ -170,20 +297,42 @@ RSpec.describe Github::Enrichment::OneShot do
       one_shot.call
     end
 
-    it "names the entity and the outcome in the headline" do
-      returning(result(status: "enriched", entity_type: :actor, github_id: 583_231))
+    it "names the batch outcome in the headline" do
+      batch_work!
+      allow(batch_runner).to receive(:call).and_return(batch_result(status: "completed"))
 
       one_shot.call
 
-      expect(output.string).to include("Enriched actor 583231 — complete")
+      expect(output.string).to include("Search batch actor #41 — requested 3, valid 2, fallback 1")
     end
 
-    it "names the deferral reason rather than reporting a bare failure" do
-      returning(result(status: "deferred", deferral_reason: "class_exhausted"))
+    it "names the detail outcome in the headline" do
+      detail_work!
+      allow(detail_runner).to receive(:call).and_return(detail_result(status: "completed"))
+
+      one_shot(argv: %w[ --stage detail ]).call
+
+      expect(output.string).to include("Detail actor 583231 — complete")
+    end
+
+    it "names the retry reason rather than reporting a bare failure" do
+      detail_work!
+      allow(detail_runner).to receive(:call)
+        .and_return(detail_result(status: "retry_scheduled", reason: "502"))
+
+      one_shot(argv: %w[ --stage detail ]).call
+
+      expect(output.string).to include("Detail actor 583231 — retry scheduled: 502")
+    end
+
+    it "still prints the persisted state when it refused to run" do
+      batch_work!
+      allow(batch_runner).to receive(:call)
+        .and_raise(Github::Errors::ConfigurationError, "SEARCH_BATCH_SIZE must be positive")
 
       one_shot.call
 
-      expect(output.string).to include("Enrichment deferred — class_exhausted")
+      expect(output.string).to include("Actor contract backlog", "Persisted push events")
     end
 
     # A summary that cannot be read must not mask the outcome that was already decided.

@@ -53,6 +53,12 @@ RSpec.describe "a page racing another poller's commit", type: :integration do
     # to PageWriter. With no fixture transaction to revert it, this RESET is the only thing
     # that stops a 250ms lock timeout riding the pooled connection into the rest of the run.
     connection.execute("RESET lock_timeout")
+    # The event-native observations first: they carry a real foreign key to the
+    # push_events rows deleted next.
+    connection.execute(
+      "DELETE FROM enrichment_observations WHERE push_event_id IN " \
+      "(SELECT id FROM push_events WHERE github_event_id IN ('#{EVENT_ID}', '#{OTHER_EVENT_ID}'))"
+    )
     connection.execute(
       "DELETE FROM push_events WHERE github_event_id IN ('#{EVENT_ID}', '#{OTHER_EVENT_ID}')"
     )
@@ -118,6 +124,14 @@ RSpec.describe "a page racing another poller's commit", type: :integration do
 
       expect(GithubActor.find_by(github_id: ACTOR_ID).last_seen_at).to eq(frozen_time)
       expect(GithubActor.find_by(github_id: ACTOR_ID).latest_event_at).to be_nil
+    end
+
+    # The observation ledger rides the same RETURNING gate: a duplicate that registered
+    # no activity appended no event-native evidence either.
+    it "appends no observation for the loser" do
+      writer.write([ well_formed_envelope ], run_id: SecureRandom.uuid)
+
+      expect(EnrichmentObservation.where(source: "event")).to be_empty
     end
   end
 
@@ -205,13 +219,15 @@ RSpec.describe "a page racing another poller's commit", type: :integration do
     end
 
     # ADR 0005's per-envelope transaction, seen from the failure side: the envelope leaves no
-    # half-written entity pair behind, because the repository upsert was inside the same
-    # transaction the timeout rolled back.
+    # half-written entity pair behind — and no orphan observation — because the repository
+    # upsert and the observation appends were inside the same transaction the timeout
+    # rolled back.
     it "leaves no partial pair behind" do
       writer.write([ well_formed_envelope ], run_id: SecureRandom.uuid)
 
       expect(GithubRepository.where(github_id: REPOSITORY_ID)).to be_empty
       expect(PushEvent.where(github_event_id: EVENT_ID)).to be_empty
+      expect(EnrichmentObservation.where(source: "event")).to be_empty
     end
 
     # ADR 0005's per-envelope transaction, against a real contended row rather than the

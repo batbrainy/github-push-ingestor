@@ -18,10 +18,10 @@ RSpec.describe ReconcilePendingEnrichmentsJob do
     allow(Rails.logger).to receive(:info)
 
     job = described_class.new
-    expect { job.perform_now }.to have_enqueued_job(EnrichActorJob).exactly(:once)
+    expect { job.perform_now }.to have_enqueued_job(EnrichmentCycleJob).exactly(:once)
 
     expect(Rails.logger).to have_received(:info).with(
-      hash_including(event: "job.completed", job_id: job.job_id, reason: "reconcile", actor_enqueued: 1)
+      hash_including(event: "job.completed", job_id: job.job_id, reason: "reconcile", cycle_enqueued: 1)
     )
   end
 

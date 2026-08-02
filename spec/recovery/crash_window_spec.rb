@@ -241,7 +241,10 @@ RSpec.describe "crash windows", type: :integration do
   # This is as close as RSpec gets to §15 step 8. The transcript in docs/evidence/ is the rest.
   describe "the whole container-kill cycle, without the container" do
     let(:source_namespace) { Github::AdvisoryLock::SOURCE_LOCK_NAMESPACE }
-    let(:claim) { Github::Enrichment::Claim.new(configuration: Github.configuration) }
+    let(:recovery_configuration) do
+      configuration_with("GITHUB_MODE" => "fixture", "SEARCH_PACING_SECONDS" => "0")
+    end
+    let(:claim) { Github::Enrichment::BatchClaim.new(configuration: recovery_configuration) }
     let(:actor_type) { Github::Enrichment::EntityType.fetch(:actor) }
     let!(:event_source) { fixture_event_source }
 
@@ -251,29 +254,32 @@ RSpec.describe "crash windows", type: :integration do
 
     before { active_budget_window(now: crashed_at) }
 
-    # Everything a worker container was holding at the instant it was killed.
+    # Everything a worker container was holding at the instant it was killed. The batch
+    # claim leases every actor in the FIFO and opens an in_flight enrichment_batches
+    # row — the exact durable residue a kill mid-batch leaves.
     def crash!
       fixture_runner(transport: transport, now: crashed_at).call(event_source: event_source)
 
-      claim.acquire(actor_type, pool: :pending, now: crashed_at)    # a lease with no worker
-      clear_enqueued_jobs                                           # the lost enqueue
-      acquire_in_other_session(source_namespace,                    # the dead poller's lock
+      @abandoned_lease = claim.acquire(actor_type, now: crashed_at)  # a lease with no worker
+      clear_enqueued_jobs                                            # the lost enqueue
+      acquire_in_other_session(source_namespace,                     # the dead poller's lock
                                Github::AdvisoryLock.key_for(event_source.id))
-      terminate_second_session!                                     # the kill
+      terminate_second_session!                                      # the kill
       wait_for_advisory_lock_release(source_namespace, Github::AdvisoryLock.key_for(event_source.id))
     end
 
     # The restart, running only the two recurring tasks a real worker runs, at a clock past
-    # the abandoned lease's expiry — so the entity the dead worker was holding is reachable
-    # again by arithmetic alone, with no cleanup step.
+    # the abandoned lease's expiry — so the entities the dead worker was holding are
+    # reachable again by arithmetic alone, with no cleanup step.
     def restart!
-      allow(Github).to receive(:configuration).and_return(configuration_with("GITHUB_MODE" => "fixture"))
-      allow(Github::EnrichmentRunner).to receive(:new).and_call_original
-      allow(Github::EnrichmentRunner).to receive(:new)
-        .and_return(fixture_enrichment_runner(transport: transport,
-                                              now: crashed_at + claim.lease_seconds + 1))
+      revived_at = crashed_at + recovery_configuration.enrichment_lease_seconds + 1
 
-      6.times do
+      allow(Github).to receive(:configuration).and_return(recovery_configuration)
+      allow(Github::Enrichment::CycleRunner).to receive(:new)
+        .and_return(fixture_cycle_runner(transport: transport, now: revived_at,
+                                         configuration: recovery_configuration))
+
+      3.times do
         ReconcilePendingEnrichmentsJob.perform_now
         perform_enqueued_jobs
       end
@@ -285,9 +291,16 @@ RSpec.describe "crash windows", type: :integration do
 
       expect(PushEvent.count).to eq(4)
       expect(GithubActor.find_by(github_id: IngestionHelpers::ACTOR_GITHUB_ID))
-        .to have_attributes(enrichment_status: "complete", name: "The Octocat")
+        .to have_attributes(enrichment_status: "complete", enrichment_stage: "contract_complete")
       expect(GithubRepository.find_by(github_id: IngestionHelpers::REPOSITORY_GITHUB_ID).enrichment_status)
         .to eq("complete")
+    end
+
+    it "finalizes the dead worker's batch as stale_lease evidence, never deleting it" do
+      crash!
+      restart!
+
+      expect(@abandoned_lease.batch.reload.status).to eq("stale_lease")
     end
 
     it "needs no operator step, no cleanup job and no sweeper to get there" do

@@ -2,8 +2,29 @@ require "rails_helper"
 
 RSpec.describe Github::Enrichment::EntityType do
   describe ".all" do
-    it "covers exactly the two classes the ledger has enrichment counters for" do
-      expect(described_class.keys).to eq(Github::Request::ENRICHMENT_CLASSES)
+    it "covers exactly the two entity classes, each with a detail and a search request class" do
+      expect(described_class.keys).to eq(Github::Request::DETAIL_CLASSES)
+      expect(described_class.all.map(&:request_class)).to eq(Github::Request::DETAIL_CLASSES)
+      expect(described_class.all.map(&:search_request_class)).to eq(Github::Request::SEARCH_CLASSES)
+    end
+
+    # The two ledger-facing vocabularies must stay in lockstep: every request class the
+    # budget ledgers meter for enrichment is reachable from exactly one entity type, so a
+    # new class cannot be added on one side and silently go unmetered on the other.
+    it "spans the ledger's enrichment classes exactly" do
+      classes = described_class.all.flat_map do |type|
+        [ type.request_class, type.search_request_class ]
+      end
+
+      expect(classes).to match_array(Github::Request::ENRICHMENT_CLASSES)
+    end
+
+    # The batch runner reserves under :actor_search/:repository_search (the per-minute
+    # search ledger) while the detail fallback reserves under :actor/:repository (the
+    # bounded core allowance). The pairing is enumerated here, once.
+    it "pairs each key with its own search request class" do
+      expect(described_class.fetch(:actor).search_request_class).to eq(:actor_search)
+      expect(described_class.fetch(:repository).search_request_class).to eq(:repository_search)
     end
 
     it "maps each key to its own model, parser and log field" do

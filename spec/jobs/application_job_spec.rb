@@ -73,12 +73,12 @@ RSpec.describe ApplicationJob do
 
   describe "retries" do
     # Every job here can spend GitHub budget, and both retry ladders are already durable and
-    # coordinated with the ledger (Github::Ingestion::PollState and
-    # Github::Enrichment::EntityState). A second, uncoordinated Active Job ladder would
+    # coordinated with the ledger (Github::Ingestion::PollState and the enrichment
+    # runners). A second, uncoordinated Active Job ladder would
     # re-poll a source whose backoff was just written. The 60-second recurring tick is the
     # retry.
     it "declares none, in any job in this application" do
-      jobs = [ ApplicationJob, PollEventSourceJob, EnrichActorJob, EnrichRepositoryJob,
+      jobs = [ ApplicationJob, PollEventSourceJob, EnrichmentCycleJob,
                ReconcilePendingEnrichmentsJob ]
 
       expect(jobs.map { |job| job.rescue_handlers.map(&:first) }.flatten).to be_empty

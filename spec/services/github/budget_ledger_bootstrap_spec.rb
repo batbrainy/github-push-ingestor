@@ -163,22 +163,24 @@ RSpec.describe Github::BudgetLedger, "bootstrap edge cases" do
     # configuration created it. ADR 0004 accepts that: allowances change at window
     # boundaries, "the price of keeping the change atomic with the counter reset".
     it "does not restate the allowances of a row another configuration created" do
-      described_class.new(configuration: configuration_with(POLL_INTERVAL_SECONDS: "600"))
+      described_class.new(configuration: configuration_with(POLL_INTERVAL_SECONDS: "600",
+                                                            CORE_DETAIL_FALLBACK_ALLOWANCE: "6"))
         .bootstrap!(now: frozen_time)
 
       ledger.bootstrap!(now: frozen_time)
 
-      expect(budget).to have_attributes(poll_allowance: 6, enrichment_allowance: 46)
+      expect(budget).to have_attributes(poll_allowance: 6, enrichment_allowance: 6)
     end
 
     it "adopts the current configuration at the first window it opens" do
-      described_class.new(configuration: configuration_with(POLL_INTERVAL_SECONDS: "600"))
+      described_class.new(configuration: configuration_with(POLL_INTERVAL_SECONDS: "600",
+                                                            CORE_DETAIL_FALLBACK_ALLOWANCE: "6"))
         .bootstrap!(now: frozen_time)
       ledger.reserve!(:poll, now: frozen_time)
 
       ledger.reconcile!(snapshot, request_class: :poll, now: frozen_time)
 
-      expect(budget).to have_attributes(poll_allowance: 12, enrichment_allowance: 40)
+      expect(budget).to have_attributes(poll_allowance: 12, enrichment_allowance: 4)
     end
 
     # A block set before the window was ever initialized. denial_reason derives blocking

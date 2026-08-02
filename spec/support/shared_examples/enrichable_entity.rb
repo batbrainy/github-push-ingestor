@@ -2,7 +2,8 @@
 # (IMPLEMENTATION_PLAN.md §7), so its data-level guarantees are asserted once here.
 #
 # Scope note: activity is the transition the ingest path owns. Fetch outcomes belong to
-# Github::Enrichment::EntityState, and leasing belongs to Github::Enrichment::Claim.
+# Github::Enrichment::BatchRunner and DetailRunner, and leasing belongs to
+# Github::Enrichment::BatchClaim and DetailClaim.
 #
 # The host group must provide `valid_attributes`.
 RSpec.shared_examples "an enrichable entity" do
@@ -12,6 +13,10 @@ RSpec.shared_examples "an enrichable entity" do
 
   let(:refresh_index_name) do
     "index_#{described_class.table_name}_on_enrichment_refresh"
+  end
+
+  let(:stage_fifo_index_name) do
+    "index_#{described_class.table_name}_on_stage_fifo"
   end
 
   describe "enrichment status column" do
@@ -53,6 +58,44 @@ RSpec.shared_examples "an enrichable entity" do
       expect_violation(ActiveRecord::CheckViolation) do
         described_class.where(id: record.id).update_all(enrichment_attempts: -1)
       end
+    end
+  end
+
+  # The staged pipeline's resting positions (§7, Appendix F). enrichment_status stays the
+  # business outcome; the stage is where the row currently sits between the batch and
+  # detail lanes, and the CHECK constraint is what keeps a torn write from inventing an
+  # eighth position no claim would ever select.
+  describe "enrichment stage column" do
+    it "starts at batch_pending, the staged pipeline's entry position" do
+      expect(described_class.create!(valid_attributes).enrichment_stage).to eq("batch_pending")
+    end
+
+    it "accepts every resting stage the plan documents" do
+      Enrichable::ENRICHMENT_STAGES.each_with_index do |stage, index|
+        record = described_class.create!(
+          valid_attributes.merge(github_id: 93_000 + index, enrichment_stage: stage)
+        )
+        expect(record.reload.enrichment_stage).to eq(stage)
+      end
+    end
+
+    it "rejects an undocumented stage at the database level" do
+      record = described_class.create!(valid_attributes)
+
+      expect_violation(ActiveRecord::CheckViolation) do
+        described_class.where(id: record.id).update_all(enrichment_stage: "invented")
+      end
+    end
+
+    # Both claims select FIFO *within* a stage set — batch by created_at, id over the
+    # backlog stages — so the leading stage column is what lets one index answer either
+    # claim's ordered scan without touching the other's rows.
+    it "is backed by the stage-FIFO index the claims select through" do
+      index = described_class.connection.indexes(described_class.table_name)
+                             .find { |i| i.name == stage_fifo_index_name }
+
+      expect(index).not_to be_nil
+      expect(index.columns).to eq(%w[enrichment_stage created_at id])
     end
   end
 

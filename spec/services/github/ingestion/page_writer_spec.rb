@@ -66,6 +66,94 @@ RSpec.describe Github::Ingestion::PageWriter do
     end
   end
 
+  # §8 steps 6–8 as one durability boundary: the accepted event and both event-native
+  # identity fragments commit together. The entity row coalesces future demand by stable
+  # GitHub id; the observation rows preserve the distinct raw evidence each accepted event
+  # supplied.
+  describe "event-native observations" do
+    it "appends one observation per entity, carrying the raw fragment and its fingerprint" do
+      write(well_formed_envelope)
+
+      event = PushEvent.sole
+      actor_observation = EnrichmentObservation.find_by(entity_kind: "actor")
+      repository_observation = EnrichmentObservation.find_by(entity_kind: "repository")
+
+      expect(EnrichmentObservation.count).to eq(2)
+      expect(actor_observation).to have_attributes(
+        entity_github_id: 583_231, source: "event", validation_outcome: "event_native",
+        push_event_id: event.id, observed_at: received_at
+      )
+      expect(actor_observation.raw_payload).to eq(well_formed_envelope.fetch("actor"))
+      expect(actor_observation.payload_fingerprint)
+        .to eq(Github::Events::PayloadFingerprint.fingerprint(well_formed_envelope.fetch("actor")))
+      expect(repository_observation).to have_attributes(
+        entity_github_id: 1_296_269, source: "event", validation_outcome: "event_native",
+        push_event_id: event.id
+      )
+      expect(repository_observation.raw_payload).to eq(well_formed_envelope.fetch("repo"))
+    end
+
+    # Forcing the transaction's last insert to fail is the proof of the boundary: nothing
+    # about the envelope survives, not even the push_events row that had already inserted
+    # or the stubs upserted before it.
+    it "commits the observations with the event, or commits nothing at all" do
+      allow(EnrichmentObservation).to receive(:insert_all!)
+        .and_raise(ActiveRecord::StatementInvalid, "forced by the example")
+
+      tally = write(well_formed_envelope)
+
+      expect(tally.to_h).to include(events_created: 0, events_failed: 1)
+      expect(PushEvent.count).to eq(0)
+      expect(EnrichmentObservation.count).to eq(0)
+      expect(GithubActor.count).to eq(0)
+      expect(GithubRepository.count).to eq(0)
+    end
+
+    # §8's duplicate rule extended to evidence: a replay registered no activity, so it
+    # also supplies no new observation rows.
+    it "adds no observation for a duplicate replay" do
+      write(well_formed_envelope)
+      write(well_formed_envelope, at: frozen_time + 60)
+
+      expect(EnrichmentObservation.count).to eq(2)
+    end
+
+    it "stamps the pipeline entry instants when the entity is first observed" do
+      write(well_formed_envelope)
+
+      expect(GithubActor.sole).to have_attributes(
+        event_native_at: received_at, derived_at: received_at, batch_pending_at: received_at
+      )
+      expect(GithubRepository.sole).to have_attributes(
+        event_native_at: received_at, derived_at: received_at, batch_pending_at: received_at
+      )
+    end
+
+    # COALESCE keeps the first-ever instant: a repeat event for a known entity adds its
+    # evidence but does not restart the entity's pipeline clock, so the FIFO position a
+    # backlog row earned on first observation is never lost to later popularity.
+    it "keeps the first pipeline instants when a second event references the same entity" do
+      write(well_formed_envelope)
+      write(well_formed_envelope("id" => "58000000099",
+                                 "payload" => { "push_id" => 27_500_000_099 }),
+            at: frozen_time + 60)
+
+      expect(EnrichmentObservation.count).to eq(4)
+      expect(GithubActor.sole).to have_attributes(
+        event_native_at: frozen_time, derived_at: frozen_time, batch_pending_at: frozen_time
+      )
+    end
+
+    # Only accepted events supply evidence: a quarantined envelope wrote no entity rows to
+    # attach evidence to, and an ignored one wrote nothing at all.
+    it "writes no observation for a quarantined or ignored envelope" do
+      write([ well_formed_envelope("type" => "WatchEvent"),
+              well_formed_envelope("payload" => { "head" => nil }) ])
+
+      expect(EnrichmentObservation.count).to eq(0)
+    end
+  end
+
   # GitHub's clock and ours are different clocks, and the documented 30s–6h latency means
   # occurred_at can sit either side of the observation. Nothing may clamp it.
   it "lets latest_event_at exceed last_seen_at when GitHub's timestamp is later" do

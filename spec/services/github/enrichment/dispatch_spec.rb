@@ -1,8 +1,8 @@
 require "rails_helper"
 
-# The one rule both enqueue paths share (§8 steps 10 and 11): "is there durable enrichment
-# work this class could do right now?", answered from the committed entity rows and the
-# ledger, never from the queue.
+# The one rule both enqueue paths share (§8 steps 10 and 11): "is there staged enrichment
+# work a cycle could do right now?", answered from the committed entity rows and the two
+# ledgers, never from the queue.
 RSpec.describe Github::Enrichment::Dispatch do
   subject(:dispatch) { described_class.new(clock: -> { frozen_time }) }
 
@@ -14,62 +14,108 @@ RSpec.describe Github::Enrichment::Dispatch do
     create_repository(github_id: 1_296_269, last_seen_at: frozen_time, **overrides)
   end
 
+  def detail_pending!(model)
+    model.update_all(enrichment_stage: "detail_pending", detail_pending_at: frozen_time)
+  end
+
   before { active_budget_window(now: frozen_time) }
 
-  describe "when a class has work" do
-    it "enqueues one cycle for each class that does, and none for the class that does not" do
-      actor
-
-      expect { dispatch.call(reason: "reconcile") }
-        .to have_enqueued_job(EnrichActorJob).exactly(:once)
-      expect(ActiveJob::Base.queue_adapter.enqueued_jobs.map { _1[:job] }).to eq([ EnrichActorJob ])
-    end
-
-    # However deep the backlog. Github::EnrichmentRunner enriches at most one entity per call,
-    # so queue depth is set by §10's hourly allowance and not by how many rows are waiting —
-    # 90 pending actors would otherwise become 90 cycles the ledger refuses 40 requests in.
-    it "enqueues one cycle whether one entity is pending or fifty" do
-      50.times { |index| create_actor(github_id: 1_000 + index, last_seen_at: frozen_time) }
-
-      expect { dispatch.call(reason: "reconcile") }.to have_enqueued_job(EnrichActorJob).exactly(:once)
-    end
-
-    it "reports what it scheduled" do
+  describe "when there is claimable batch work" do
+    # A missing search-ledger row is a grant: the search ledger self-bootstraps from
+    # configuration, so a clean checkout's first committed entity is immediately claimable.
+    it "enqueues exactly one cycle, whichever classes have work" do
       actor
       repository
 
-      expect(dispatch.call(reason: "ingestion"))
-        .to eq(actor_enqueued: 1, repository_enqueued: 1, reason: "ingestion")
+      expect { dispatch.call(reason: "reconcile") }
+        .to have_enqueued_job(EnrichmentCycleJob).exactly(:once)
+      expect(ActiveJob::Base.queue_adapter.enqueued_jobs.map { _1[:job] }).to eq([ EnrichmentCycleJob ])
     end
 
-    # §11 lists "reconciliation summaries" among the INFO events, and PR 7's Summary is what
-    # fills it — per-status counts, per-class share usage, the window state.
-    it "logs the summary at INFO, because a tick that scheduled work is worth reading" do
+    # However deep the backlog. EnrichmentCycleJob loops until a ledger denies, so queue
+    # depth is set by the budgets, not by how many rows are waiting — 90 pending actors
+    # would otherwise become 90 cycles the ledgers refuse most of.
+    it "enqueues one cycle whether one entity is pending or fifty" do
+      50.times { |index| create_actor(github_id: 1_000 + index, last_seen_at: frozen_time) }
+
+      expect { dispatch.call(reason: "reconcile") }
+        .to have_enqueued_job(EnrichmentCycleJob).exactly(:once)
+    end
+
+    # Pacing is a wait, not a refusal: the cycle sleeps it out on its own worker thread,
+    # so a paced ledger is still admissible work.
+    it "still enqueues while the search ledger is only pacing" do
+      actor
+      active_search_window(now: frozen_time, last_request_at: frozen_time - 2)
+
+      expect { dispatch.call(reason: "reconcile") }
+        .to have_enqueued_job(EnrichmentCycleJob).exactly(:once)
+    end
+
+    it "reports what it scheduled, and nothing that blocked" do
+      actor
+
+      expect(dispatch.call(reason: "ingestion")).to eq(cycle_enqueued: 1, reason: "ingestion")
+    end
+
+    # INFO only when it scheduled something. The rich per-stage summary lives on /status
+    # and the one-shot now — this line carries the decision alone, so the exact-argument
+    # match below is also the proof that no summary is merged onto it anymore.
+    it "logs the bare decision at INFO, with no summary merged onto the line" do
       actor
       allow(Rails.logger).to receive(:info)
 
       dispatch.call(reason: "reconcile")
 
       expect(Rails.logger).to have_received(:info).with(
-        hash_including(event: "enrichment.dispatched", reason: "reconcile", actor_enqueued: 1,
-                       enrichment_used: 0, enrichment_allowance: 40, window_status: "active")
+        event: "enrichment.dispatched", cycle_enqueued: 1, reason: "reconcile"
       )
     end
   end
 
-  describe "when there is nothing to do" do
-    it "enqueues nothing when every entity is decided" do
-      actor(enrichment_status: "complete", fetched_at: frozen_time)
-      repository(enrichment_status: "permanent_failure")
-
-      expect { dispatch.call(reason: "reconcile") }.not_to have_enqueued_job
+  describe "when only detail-fallback work is claimable" do
+    before do
+      # Search denied outright (remaining at the reserve), so batch work alone could not
+      # justify a cycle — the detail lane has to carry the decision.
+      active_search_window(now: frozen_time, remaining: 2)
     end
 
-    # An entity another worker is mid-way through is not pending work: the claim lease lives
-    # on next_retry_at, and every one of the selector's queries excludes it.
+    it "enqueues one cycle for a claimable detail row under a granted core window" do
+      actor
+      detail_pending!(GithubActor)
+
+      expect { dispatch.call(reason: "reconcile") }
+        .to have_enqueued_job(EnrichmentCycleJob).exactly(:once)
+    end
+
+    it "enqueues nothing when the core allowance is spent too" do
+      actor
+      detail_pending!(GithubActor)
+      active_budget_window(now: frozen_time, enrichment_used: 4, reset_at: frozen_time + 600)
+
+      expect { dispatch.call(reason: "reconcile") }.not_to have_enqueued_job
+      expect(dispatch.call(reason: "reconcile"))
+        .to include(blocked_by: [ :search_reserve_reached, :class_exhausted ])
+    end
+  end
+
+  describe "when there is nothing claimable" do
+    it "enqueues nothing when every entity is decided, and names both empty lanes" do
+      actor(enrichment_status: "complete", enrichment_stage: "contract_complete",
+            fetched_at: frozen_time)
+      repository(enrichment_status: "permanent_failure", enrichment_stage: "terminal")
+
+      expect { dispatch.call(reason: "reconcile") }.not_to have_enqueued_job
+      expect(dispatch.call(reason: "reconcile"))
+        .to include(blocked_by: [ :no_batch_work, :no_detail_work ])
+    end
+
+    # An entity another worker is mid-way through is not pending work: the live lease
+    # excludes it from both claims until leased_until passes.
     it "enqueues nothing while the only candidate is leased by a live worker" do
       actor
-      GithubActor.update_all(next_retry_at: frozen_time + 600)
+      GithubActor.update_all(enrichment_stage: "batch_in_flight",
+                             leased_until: frozen_time + 600)
 
       expect { dispatch.call(reason: "reconcile") }.not_to have_enqueued_job
     end
@@ -87,77 +133,41 @@ RSpec.describe Github::Enrichment::Dispatch do
     end
   end
 
-  # §9's effective_enrichment_time, minus the entity component this object is not choosing.
-  describe "when the ledger says enrichment cannot happen" do
-    it "enqueues nothing while a global block is in force, and names it" do
+  describe "when both ledgers deny" do
+    # blocked_by is always the pair [search-side, detail-side], so an operator reads one
+    # line and knows which lane to look at.
+    it "enqueues nothing while the search ledger is blocked and no core window exists" do
       actor
-      active_budget_window(now: frozen_time, global_blocked_until: frozen_time + 300)
-
-      expect { dispatch.call(reason: "reconcile") }.not_to have_enqueued_job
-      expect(dispatch.call(reason: "reconcile")).to include(blocked_by: :global_blocked_until)
-    end
-
-    it "enqueues nothing once the enrichment class has spent its allowance" do
-      actor
-      active_budget_window(now: frozen_time, enrichment_used: 40, reset_at: frozen_time + 600)
-
-      expect { dispatch.call(reason: "reconcile") }.not_to have_enqueued_job
-      expect(dispatch.call(reason: "reconcile")).to include(blocked_by: :enrichment_class_blocked_until)
-    end
-
-    # §10: a share exhaustion is a *denial* relieved by borrowing, not a deferral. Refusing to
-    # enqueue on it would withhold work the ledger would have granted — the reason
-    # Github::EnrichmentSchedule leaves the share out too.
-    it "still enqueues when only one class's fairness share is spent" do
-      actor
-      active_budget_window(now: frozen_time, actor_share_used: 20, enrichment_used: 20)
-
-      expect { dispatch.call(reason: "reconcile") }.to have_enqueued_job(EnrichActorJob)
-    end
-  end
-
-  # A clean checkout has no ledger row: the first enrichment reservation would create an
-  # uninitialized row and be denied until a poll supplies authoritative headers. Dispatch
-  # avoids enqueueing that known-no-op while remaining read-only.
-  describe "before the first window exists" do
-    it "does not enqueue or create the ledger row" do
+      detail_pending!(GithubActor)
+      active_search_window(now: frozen_time, blocked_until: frozen_time + 300)
       GithubApiBudget.delete_all
-      actor
-
-      expect { dispatch.call(reason: "ingestion") }.not_to have_enqueued_job
-      expect(GithubApiBudget.count).to eq(0)
-      expect(dispatch.call(reason: "reconcile")).to include(blocked_by: :window_uninitialized)
-    end
-
-    it "does not enqueue when an uninitialized ledger row already exists" do
-      GithubApiBudget.delete_all
-      Github::BudgetLedger.new.bootstrap!(now: frozen_time)
-      actor
 
       expect { dispatch.call(reason: "reconcile") }.not_to have_enqueued_job
-      expect(dispatch.call(reason: "reconcile")).to include(blocked_by: :window_uninitialized)
+      expect(dispatch.call(reason: "reconcile"))
+        .to include(blocked_by: [ :search_blocked, :window_uninitialized ])
     end
 
-    [ 0, 40 ].each do |used|
-      it "does not enqueue after an old window elapses with #{used} enrichment attempts used" do
-        active_budget_window(now: frozen_time - 3600, reset_at: frozen_time - 1,
-                             enrichment_used: used,
-                             actor_share_used: used / 2,
-                             repository_share_used: used / 2)
-        actor
+    it "enqueues nothing once the search ceiling and the detail allowance are both spent" do
+      actor
+      repository
+      detail_pending!(GithubRepository)
+      active_search_window(now: frozen_time, remaining: 5, used: 8)
+      active_budget_window(now: frozen_time, enrichment_used: 4, reset_at: frozen_time + 600)
 
-        expect { dispatch.call(reason: "reconcile") }.not_to have_enqueued_job
-        expect(dispatch.call(reason: "reconcile")).to include(blocked_by: :window_elapsed)
-      end
+      expect { dispatch.call(reason: "reconcile") }.not_to have_enqueued_job
+      expect(dispatch.call(reason: "reconcile"))
+        .to include(blocked_by: [ :search_ceiling_exhausted, :class_exhausted ])
     end
   end
 
   it "makes no GitHub request and takes no lock" do
     actor
     expect(Github::RequestGate).not_to receive(:hold)
+    expect(Github::SourceLock).not_to receive(:acquire)
 
     dispatch.call(reason: "reconcile")
 
     expect(WebMock).not_to have_requested(:any, //)
+    expect(Github::LockOrder.held_keys).to be_empty
   end
 end

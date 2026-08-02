@@ -195,9 +195,10 @@ RSpec.describe PollEventSourceJob do
       expect(PushEvent.count).to eq(4)
     end
 
+    # One cycle job, however much the page created: Github::Enrichment::CycleRunner
+    # loops until a ledger denies, so the enqueue is a hint rather than a unit of work.
     it "hands the run's enrichment work to the queue" do
-      expect { poll! }.to have_enqueued_job(EnrichActorJob).exactly(:once)
-        .and have_enqueued_job(EnrichRepositoryJob).exactly(:once)
+      expect { poll! }.to have_enqueued_job(EnrichmentCycleJob).exactly(:once)
     end
   end
 end

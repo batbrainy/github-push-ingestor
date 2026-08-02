@@ -30,7 +30,25 @@ RSpec.describe Github::Configuration do
         # §11's coverage window, pinned at 86400 by §10. It arrives with the rich /status
         # rather than earlier because until Github::Enrichment::Coverage existed nothing
         # read it, and §16 forbids a knob with no consumer.
-        enrichment_coverage_window_seconds: 86_400
+        enrichment_coverage_window_seconds: 86_400,
+        # Appendix F's staged-enrichment block: the search lane's per-minute budget, the
+        # core detail-fallback cap, and the cycle/retry/lease timings around them.
+        core_detail_fallback_allowance: 4,
+        search_request_ceiling: 10,
+        search_safety_reserve: 2,
+        search_batch_size: 10,
+        search_pacing_seconds: 6,
+        search_worker_concurrency: 1,
+        enrichment_cycle_budget_seconds: 55,
+        actor_enrichment_weight: 1,
+        repository_enrichment_weight: 1,
+        detail_fallback_max_attempts: 3,
+        enrichment_lease_seconds: 600,
+        enrichment_retry_base_seconds: 60,
+        enrichment_retry_max_seconds: 3_600,
+        enrichment_metrics_window_seconds: 3_600,
+        catch_up_min_sample_seconds: 900,
+        refresh_active_within_seconds: 604_800
       )
     end
 
@@ -97,15 +115,91 @@ RSpec.describe Github::Configuration do
       end
     end
 
-    it "accepts zero where zero is meaningful: no reserve, no retries, no redirects" do
-      config = configuration(RATE_LIMIT_RESERVE: "0", MAX_HTTP_RETRIES: "0", MAX_REDIRECTS: "0")
+    it "accepts zero where zero is meaningful: no reserve, no retries, no redirects, no fallback" do
+      config = configuration(RATE_LIMIT_RESERVE: "0", MAX_HTTP_RETRIES: "0", MAX_REDIRECTS: "0",
+                             CORE_DETAIL_FALLBACK_ALLOWANCE: "0", SEARCH_SAFETY_RESERVE: "0")
 
       expect { config.validate! }.not_to raise_error
     end
 
-    it "rejects a negative retry or redirect count" do
-      expect { configuration(MAX_REDIRECTS: "-1").validate! }
-        .to raise_error(Github::Errors::ConfigurationError, /MAX_REDIRECTS/)
+    # Zero pacing is the offline fixture walkthrough's operating point: a one-shot runs
+    # both lanes back to back with no wait between search requests.
+    it "accepts zero pacing, which disables the wait rather than breaking it" do
+      expect { configuration(SEARCH_PACING_SECONDS: "0").validate! }.not_to raise_error
+    end
+
+    it "rejects a negative value in every member of the non-negative group" do
+      described_class::NON_NEGATIVE_INTEGERS.each_value do |variable|
+        expect { configuration(variable.to_sym => "-1").validate! }
+          .to raise_error(Github::Errors::ConfigurationError, /#{variable}/),
+              "expected #{variable}=-1 to be rejected"
+      end
+    end
+  end
+
+  # Appendix F's structural rules between the staged-enrichment knobs: each one relates
+  # two numbers, so the group validates after the sign checks and names the variable an
+  # operator must move.
+  describe "validation of the staged-enrichment knobs (Appendix F)" do
+    it "rejects a search reserve that swallows the whole ceiling" do
+      expect { configuration(SEARCH_SAFETY_RESERVE: "10").validate! }
+        .to raise_error(Github::Errors::ConfigurationError, /SEARCH_SAFETY_RESERVE/)
+    end
+
+    it "accepts a reserve one below the ceiling, which leaves one spendable request" do
+      expect { configuration(SEARCH_SAFETY_RESERVE: "9").validate! }.not_to raise_error
+    end
+
+    # GitHub caps repeated qualifiers well below the per_page maximum; ten is the batch
+    # size the live probes behind Appendix F verified.
+    it "accepts a batch size of ten and rejects eleven" do
+      expect { configuration(SEARCH_BATCH_SIZE: "10").validate! }.not_to raise_error
+      expect { configuration(SEARCH_BATCH_SIZE: "11").validate! }
+        .to raise_error(Github::Errors::ConfigurationError, /SEARCH_BATCH_SIZE/)
+    end
+
+    # The global request gate serialises outbound calls, so a second search worker could
+    # only queue behind the first while holding claims whose leases are burning down.
+    it "requires exactly one search worker while the request gate serialises outbound calls" do
+      expect { configuration(SEARCH_WORKER_CONCURRENCY: "2").validate! }
+        .to raise_error(Github::Errors::ConfigurationError, /SEARCH_WORKER_CONCURRENCY/)
+    end
+
+    it "rejects a retry base above the retry ceiling, and accepts them equal" do
+      expect { configuration(ENRICHMENT_RETRY_BASE_SECONDS: "3601").validate! }
+        .to raise_error(Github::Errors::ConfigurationError, /ENRICHMENT_RETRY_BASE_SECONDS/)
+      expect { configuration(ENRICHMENT_RETRY_BASE_SECONDS: "3600").validate! }.not_to raise_error
+    end
+
+    # The cycle runs inside a 60-second dispatch tick, so a budget at or past the tick
+    # would let one cycle overlap the next dispatch decision.
+    it "rejects a cycle budget at or above the sixty-second dispatch tick" do
+      expect { configuration(ENRICHMENT_CYCLE_BUDGET_SECONDS: "60").validate! }
+        .to raise_error(Github::Errors::ConfigurationError, /ENRICHMENT_CYCLE_BUDGET_SECONDS/)
+      expect { configuration(ENRICHMENT_CYCLE_BUDGET_SECONDS: "59").validate! }.not_to raise_error
+    end
+
+    # A pacing wait the cycle budget cannot contain would defer every batch after the
+    # first, forever: no cycle could ever wait out its own pacing.
+    it "rejects a pacing interval the cycle budget cannot wait out" do
+      expect { configuration(SEARCH_PACING_SECONDS: "55").validate! }
+        .to raise_error(Github::Errors::ConfigurationError, /SEARCH_PACING_SECONDS/)
+      expect { configuration(SEARCH_PACING_SECONDS: "54").validate! }.not_to raise_error
+    end
+
+    # The lease must outlive the worst-case single fetch — (MAX_HTTP_RETRIES + 1) x
+    # (MAX_REDIRECTS + 1) attempts, each waiting out the gate and both HTTP timeouts —
+    # or a slow-but-alive worker loses its claimed rows to a stale-lease reclaim
+    # mid-request. 585 at the pinned defaults, and the boundary is strict.
+    it "rejects a lease that the worst-case fetch could outlive, at the exact boundary" do
+      expect { configuration(ENRICHMENT_LEASE_SECONDS: "585").validate! }
+        .to raise_error(Github::Errors::ConfigurationError, /ENRICHMENT_LEASE_SECONDS/)
+      expect { configuration(ENRICHMENT_LEASE_SECONDS: "586").validate! }.not_to raise_error
+    end
+
+    it "derives that worst case from the gate wait, the timeouts, the retries and the redirects" do
+      expect(configuration.worst_case_fetch_seconds).to eq(585)
+      expect(configuration(MAX_HTTP_RETRIES: "0", MAX_REDIRECTS: "0").worst_case_fetch_seconds).to eq(65)
     end
   end
 
@@ -163,27 +257,32 @@ RSpec.describe Github::Configuration do
     end
   end
 
-  describe "startup validation of the allowance split (plan §10)" do
-    it "accepts the pinned defaults, which leave forty enrichment attempts an hour" do
+  describe "startup validation of the allowance split (plan §10, Appendix F)" do
+    it "accepts the pinned defaults, which commit twelve poll and four fallback attempts" do
       expect(configuration.validate!.allowances)
-        .to have_attributes(poll_allowance: 12, enrichment_allowance: 40)
+        .to have_attributes(poll_allowance: 12, enrichment_allowance: 4)
     end
 
     # Polling every 60 seconds is 60 attempts an hour — the entire unauthenticated
     # limit — which is exactly the V1 defect Appendix A item 2 records.
     it "rejects a cadence that would spend the whole hourly limit on polling" do
       expect { configuration(POLL_INTERVAL_SECONDS: "60").validate! }
-        .to raise_error(Github::Errors::ConfigurationError, /no capacity for enrichment/)
+        .to raise_error(Github::Errors::ConfigurationError, /exceed the core limit/)
     end
 
+    # The message names CORE_DETAIL_FALLBACK_ALLOWANCE among the levers: the allowance
+    # is a configured commitment now, so lowering it is a legitimate way out.
     it "names the offending numbers so an operator can fix it without reading the code" do
       expect { configuration(POLL_INTERVAL_SECONDS: "60").validate! }
-        .to raise_error(/poll_allowance \(60\).*RATE_LIMIT_RESERVE \(8\)/m)
+        .to raise_error(/poll_allowance \(60\).*CORE_DETAIL_FALLBACK_ALLOWANCE \(4\).*RATE_LIMIT_RESERVE \(8\)/m)
     end
 
-    it "rejects the exact boundary, because a zero enrichment allowance fails Story 3" do
-      expect { configuration(RATE_LIMIT_RESERVE: "48").validate! }
-        .to raise_error(Github::Errors::ConfigurationError)
+    # Appendix F's predicate is <= : the three commitments may fill the limit exactly,
+    # because each is a real, funded plan — and the first request past it is rejected.
+    it "accepts the sum landing exactly on the limit, and rejects one attempt more" do
+      expect { configuration(RATE_LIMIT_RESERVE: "44").validate! }.not_to raise_error
+      expect { configuration(RATE_LIMIT_RESERVE: "45").validate! }
+        .to raise_error(Github::Errors::ConfigurationError, /CORE_DETAIL_FALLBACK_ALLOWANCE/)
     end
 
     it "returns itself when valid, so the initializer can validate and assign in one line" do
@@ -250,9 +349,14 @@ RSpec.describe Github::Configuration do
     end
 
     # It is a report, not a rule: §7 already accepts that these are request-*attempt*
-    # allowances, so an amplifying configuration must still boot.
+    # allowances, so an amplifying configuration must still boot. The lease is raised
+    # alongside, because the same retries and redirects stretch the worst-case fetch to
+    # 2340 seconds and the lease rule is a genuine rejection.
     it "is not a rejection, so an amplifying configuration still validates" do
-      expect { configuration(MAX_HTTP_RETRIES: "5", MAX_REDIRECTS: "5").validate! }.not_to raise_error
+      amplified = configuration(MAX_HTTP_RETRIES: "5", MAX_REDIRECTS: "5",
+                                ENRICHMENT_LEASE_SECONDS: "2341")
+
+      expect { amplified.validate! }.not_to raise_error
     end
   end
 

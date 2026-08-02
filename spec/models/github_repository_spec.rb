@@ -30,6 +30,43 @@ RSpec.describe GithubRepository do
       expect(described_class.find(id).name).to be_nil
     end
 
+    # Appendix F's derivation-first rule: the owner segment of the qualified name is
+    # locally derivable, so it is stamped at ingest with no fetch — it is what the
+    # Search batch query is later built from.
+    it "derives owner_login locally from the qualified name" do
+      described_class.upsert_stub!(github_id: 8484, full_name: "octocat/hello-world",
+                                   now: frozen_time)
+
+      expect(described_class.find_by(github_id: 8484).owner_login).to eq("octocat")
+    end
+
+    it "leaves owner_login null for an unqualified name rather than guessing" do
+      described_class.upsert_stub!(github_id: 8484, full_name: "hello-world",
+                                   now: frozen_time)
+
+      expect(described_class.find_by(github_id: 8484).owner_login).to be_nil
+    end
+
+    it "refreshes owner_login when a later observation shows a transferred repository" do
+      described_class.upsert_stub!(github_id: 8484, full_name: "octocat/hello-world",
+                                   now: frozen_time)
+      described_class.upsert_stub!(github_id: 8484, full_name: "new-owner/hello-world",
+                                   now: frozen_time + 60)
+
+      repository = described_class.find_by(github_id: 8484)
+      expect(repository.full_name).to eq("new-owner/hello-world")
+      expect(repository.owner_login).to eq("new-owner")
+    end
+
+    it "does not let an older envelope regress owner_login" do
+      described_class.upsert_stub!(github_id: 8484, full_name: "new-owner/hello-world",
+                                   now: frozen_time + 300)
+      described_class.upsert_stub!(github_id: 8484, full_name: "octocat/hello-world",
+                                   now: frozen_time)
+
+      expect(described_class.find_by(github_id: 8484).owner_login).to eq("new-owner")
+    end
+
     it "refreshes full_name on a later observation" do
       described_class.upsert_stub!(github_id: 8484, full_name: "octocat/hello-world",
                                    now: frozen_time)
@@ -93,6 +130,9 @@ RSpec.describe GithubRepository do
       expect(described_class.count).to eq(0)
     end
 
+    # The contract columns are enrichment-owned: only a validated Search item or detail
+    # document writes them, so an envelope refresh — which knows nothing about forks or
+    # branches — must leave every one of them exactly as the last enrichment left it.
     it "never clears enrichment-owned fields" do
       described_class.upsert_stub!(github_id: 8484, full_name: "octocat/hello-world",
                                    now: frozen_time)
@@ -100,8 +140,13 @@ RSpec.describe GithubRepository do
         description: "My first repository",
         language: "Ruby",
         owner_github_id: 1,
+        fork: true,
+        archived: false,
+        default_branch: "main",
+        github_created_at: Time.utc(2011, 1, 26, 19, 1, 12),
         raw_payload: { "full_name" => "octocat/hello-world" },
         enrichment_status: "complete",
+        enrichment_stage: "contract_complete",
         fetched_at: frozen_time
       )
 
@@ -112,8 +157,13 @@ RSpec.describe GithubRepository do
       expect(repository.description).to eq("My first repository")
       expect(repository.language).to eq("Ruby")
       expect(repository.owner_github_id).to eq(1)
+      expect(repository.fork).to be(true)
+      expect(repository.archived).to be(false)
+      expect(repository.default_branch).to eq("main")
+      expect(repository.github_created_at).to eq(Time.utc(2011, 1, 26, 19, 1, 12))
       expect(repository.raw_payload).to eq("full_name" => "octocat/hello-world")
       expect(repository.enrichment_status).to eq("complete")
+      expect(repository.enrichment_stage).to eq("contract_complete")
     end
 
     it "refreshes identity without clearing a retryable entity's failure state" do

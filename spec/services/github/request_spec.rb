@@ -13,21 +13,50 @@ RSpec.describe Github::Request do
       expect { described_class.new(url: "https://api.github.com/events") }.to raise_error(ArgumentError)
     end
 
-    it "accepts exactly the three classes the ledger has counters for" do
+    it "names exactly the five classes the two ledgers have counters for" do
+      expect(described_class::CLASSES)
+        .to eq(%i[ poll actor repository actor_search repository_search ])
+    end
+
+    it "accepts every named class" do
       described_class::CLASSES.each do |request_class|
         expect(request(request_class: request_class).request_class).to eq(request_class)
       end
     end
 
+    # :search in particular: the search *pair* is spelled :actor_search and
+    # :repository_search, and the bare word must stay an error rather than silently
+    # spending some default allowance.
     it "rejects an unknown class rather than silently spending the wrong allowance" do
       expect { request(request_class: :search) }
         .to raise_error(ArgumentError, /request_class/)
     end
 
-    it "treats actor and repository requests as enrichment, and polls as not" do
-      expect(request(request_class: :actor)).to be_enrichment
-      expect(request(request_class: :repository)).to be_enrichment
+    # Appendix F splits enrichment across two ledgers: the search pair debits the
+    # per-minute search ledger, the detail pair debits the core detail-fallback
+    # allowance, and every one of the four is enrichment as opposed to polling.
+    it "counts the search pair and the detail pair as enrichment, and polls as not" do
+      expect(described_class::ENRICHMENT_CLASSES)
+        .to match_array(%i[ actor repository actor_search repository_search ])
+      described_class::ENRICHMENT_CLASSES.each do |request_class|
+        expect(request(request_class: request_class)).to be_enrichment
+      end
       expect(request(request_class: :poll)).not_to be_enrichment
+    end
+
+    it "keeps the detail and search pairs disjoint, so no class debits both ledgers" do
+      expect(described_class::DETAIL_CLASSES).to eq(%i[ actor repository ])
+      expect(described_class::SEARCH_CLASSES).to eq(%i[ actor_search repository_search ])
+      expect(described_class::DETAIL_CLASSES & described_class::SEARCH_CLASSES).to be_empty
+    end
+
+    # The predicate Github::RequestExecutor routes ledgers on: a search-class request
+    # reserves and reconciles against the search ledger, everything else the core one.
+    it "answers #search? for the search pair alone" do
+      expect(request(request_class: :actor_search)).to be_search
+      expect(request(request_class: :repository_search)).to be_search
+      expect(request(request_class: :actor)).not_to be_search
+      expect(request(request_class: :poll)).not_to be_search
     end
   end
 
@@ -36,9 +65,25 @@ RSpec.describe Github::Request do
       expect(request(request_class: :actor).borrow).to be(false)
     end
 
-    it "refuses a borrowing poll, because borrowing is a concept between the two enrichment classes" do
+    it "refuses a borrowing poll, because borrowing is a concept between the two detail classes" do
       expect { request(request_class: :poll, borrow: true) }
         .to raise_error(ArgumentError, /borrow/)
+    end
+
+    # The search ledger has no shares to borrow between: fairness on that lane is the
+    # cycle's weighted rotation, not a per-class counter, so a borrowing search request
+    # is a programming error rather than a wider authorization.
+    it "refuses a borrowing search request, which has no share to spend past" do
+      described_class::SEARCH_CLASSES.each do |request_class|
+        expect { request(request_class: request_class, borrow: true) }
+          .to raise_error(ArgumentError, /borrow/)
+      end
+    end
+
+    it "permits the borrow on both detail classes, which own the core fallback shares" do
+      described_class::DETAIL_CLASSES.each do |request_class|
+        expect(request(request_class: request_class, borrow: true).borrow).to be(true)
+      end
     end
 
     # The reason the flag rides on the request rather than on a RequestExecutor argument:

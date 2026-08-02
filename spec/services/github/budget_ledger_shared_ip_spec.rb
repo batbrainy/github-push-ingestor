@@ -76,27 +76,30 @@ RSpec.describe Github::BudgetLedger, "shared-IP reconciliation" do
   describe "an observed limit that changes mid-window" do
     # ADR 0004: "allowances are re-derived at window rollover and initialization, not
     # mid-window... the price of keeping the change atomic with the counter reset."
+    # A limit of 22 cannot fund the full 12 + 4 + 8 commitment, so a re-derivation here
+    # would have clamped the detail allowance to 2 — which is how staying at 4 proves
+    # nothing was re-derived.
     it "stores the new limit without re-deriving the allowances under it" do
       active_window
-      ledger.reconcile!(snapshot("x-ratelimit-limit" => "30", "x-ratelimit-remaining" => "20"),
+      ledger.reconcile!(snapshot("x-ratelimit-limit" => "22", "x-ratelimit-remaining" => "20"),
                         now: frozen_time)
 
-      expect(budget).to have_attributes(limit: 30, poll_allowance: 12, enrichment_allowance: 40)
+      expect(budget).to have_attributes(limit: 22, poll_allowance: 12, enrichment_allowance: 4)
     end
 
-    it "derives from the new limit at the next rollover" do
+    it "derives from the new limit at the next rollover, clamping the detail allowance to what it funds" do
       active_window
-      ledger.reconcile!(snapshot("x-ratelimit-limit" => "30", "x-ratelimit-remaining" => "20"),
+      ledger.reconcile!(snapshot("x-ratelimit-limit" => "22", "x-ratelimit-remaining" => "20"),
                         now: frozen_time)
 
       ledger.reserve!(:poll, now: window_reset + 1)
 
-      expect(budget).to have_attributes(poll_allowance: 12, enrichment_allowance: 10)
+      expect(budget).to have_attributes(poll_allowance: 12, enrichment_allowance: 2)
     end
 
-    # The over-commitment in between is real and is what the reserve guard covers: the row
-    # still authorises 52 attempts against a limit of 30, and `remaining <= reserve` is what
-    # actually stops it.
+    # The gap in between is real and is what the reserve guard covers: the row's own
+    # counters would still authorise sixteen attempts, and `remaining <= reserve` is what
+    # actually stops them against the drained window GitHub reports.
     it "leaves the reserve guard, not the allowances, holding the line until then" do
       active_window
       ledger.reconcile!(snapshot("x-ratelimit-limit" => "30", "x-ratelimit-remaining" => "8"),
