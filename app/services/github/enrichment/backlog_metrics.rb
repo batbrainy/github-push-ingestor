@@ -45,23 +45,34 @@ module Github
       private_class_method :entry_for
 
       def self.aggregate_columns(model)
-        connection = model.connection
-        status_column = connection.quote_column_name(:enrichment_status)
-        created_at_column = connection.quote_column_name(:created_at)
-        candidate_values = Enrichable::CANDIDATE_STATUSES.map do |status|
-          connection.quote(status)
-        end.join(", ")
-        candidate_filter = "#{status_column} IN (#{candidate_values})"
+        table = model.arel_table
+        status_column = table[:enrichment_status]
+        candidate_filter = status_column.in(Enrichable::CANDIDATE_STATUSES)
 
         STATUSES.map do |status|
-          quoted_status = connection.quote(status)
-          Arel.sql("COUNT(*) FILTER (WHERE #{status_column} = #{quoted_status})")
+          count_if(status_column.eq(status))
         end + [
-          Arel.sql("COUNT(*) FILTER (WHERE #{candidate_filter})"),
-          Arel.sql("MIN(#{created_at_column}) FILTER (WHERE #{candidate_filter})")
+          count_if(candidate_filter),
+          minimum_if(candidate_filter, table[:created_at])
         ]
       end
       private_class_method :aggregate_columns
+
+      # Build conditional aggregates as Arel nodes instead of interpolating quoted SQL.
+      # COUNT ignores the implicit NULL for rows that do not match the CASE predicate.
+      def self.count_if(predicate)
+        conditional = Arel::Nodes::Case.new.when(predicate).then(1)
+
+        Arel::Nodes::NamedFunction.new("COUNT", [ conditional ])
+      end
+      private_class_method :count_if
+
+      def self.minimum_if(predicate, value)
+        conditional = Arel::Nodes::Case.new.when(predicate).then(value)
+
+        Arel::Nodes::NamedFunction.new("MIN", [ conditional ])
+      end
+      private_class_method :minimum_if
 
       # A database timestamp a fraction ahead of the application clock can occur around a
       # snapshot boundary. A negative backlog age is never useful, so clamp that harmless

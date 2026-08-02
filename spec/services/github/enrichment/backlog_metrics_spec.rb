@@ -32,6 +32,21 @@ RSpec.describe Github::Enrichment::BacklogMetrics do
     )
   end
 
+  it "excludes older terminal rows from the oldest backlog wait" do
+    create_actor(github_id: 1, enrichment_status: "complete",
+                 fetched_at: now, created_at: now - 1800)
+    create_actor(github_id: 2, enrichment_status: "permanent_failure",
+                 created_at: now - 1200)
+    create_actor(github_id: 3, enrichment_status: "pending",
+                 created_at: now - 300)
+
+    expect(capture.actor).to have_attributes(
+      backlog_count: 1,
+      oldest_pending_at: now - 300,
+      oldest_pending_age_seconds: 300
+    )
+  end
+
   it "reports each entity class independently" do
     create_actor(github_id: 1, created_at: now - 300)
     create_repository(github_id: 2, created_at: now - 600)
@@ -74,7 +89,7 @@ RSpec.describe Github::Enrichment::BacklogMetrics do
 
     expect(actor_reads.one?).to be(true)
     expect(repository_reads.one?).to be(true)
-    expect(actor_reads.first).to include("COUNT(*) FILTER", "MIN(")
-    expect(repository_reads.first).to include("COUNT(*) FILTER", "MIN(")
+    expect(actor_reads.first).to include("COUNT(CASE WHEN", "MIN(CASE WHEN")
+    expect(repository_reads.first).to include("COUNT(CASE WHEN", "MIN(CASE WHEN")
   end
 end
