@@ -76,7 +76,9 @@ What this buys:
   (8 spendable search requests/minute × batches of 10) — stated as a **capacity
   hypothesis**, since misses, fallback, retries, and pacing all subtract from it.
 - Core polling is better protected than before: normal-path enrichment no longer
-  competes on core at all, and the detail lane remains capped at 40.
+  competes on core at all, and what core enrichment may still spend is an explicit
+  `CORE_DETAIL_FALLBACK_ALLOWANCE` cap rather than whatever the poll allowance and
+  reserve happen to leave over.
 - Every enrichment claim is auditable from durable state: what was asked, what came
   back, what validated, what was applied, and which raw evidence supports the current
   projection.

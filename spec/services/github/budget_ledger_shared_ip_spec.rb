@@ -76,9 +76,10 @@ RSpec.describe Github::BudgetLedger, "shared-IP reconciliation" do
   describe "an observed limit that changes mid-window" do
     # ADR 0004: "allowances are re-derived at window rollover and initialization, not
     # mid-window... the price of keeping the change atomic with the counter reset."
-    # A limit of 22 cannot fund the full 12 + 4 + 8 commitment, so a re-derivation here
-    # would have clamped the detail allowance to 2 — which is how staying at 4 proves
-    # nothing was re-derived.
+    # A limit of 22 cannot fund the 12 + 4 + 8 this window stores — the helper's
+    # deliberately small detail allowance, not the 40 a real window derives — so a
+    # re-derivation here would have clamped the detail allowance to 2, which is how
+    # staying at 4 proves nothing was re-derived.
     it "stores the new limit without re-deriving the allowances under it" do
       active_window
       ledger.reconcile!(snapshot("x-ratelimit-limit" => "22", "x-ratelimit-remaining" => "20"),
