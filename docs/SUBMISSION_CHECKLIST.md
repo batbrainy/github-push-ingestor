@@ -5,14 +5,17 @@ Repository: https://github.com/batbrainy/github-push-ingestor
 This is a reusable runbook, not a record of one run. Keep the boxes unchecked in the
 repository. The external findings report — most recently
 [`docs/evidence/2026-08-01-post-merge-verification.md`](evidence/2026-08-01-post-merge-verification.md)
-— records the default-branch SHA, UTC date, command, exit code, salient output, duration,
-and one classification for every gate: pass, repository defect, environment issue, or
-documentation mismatch.
+— records the verified refs, UTC date, command/assertion synopses, salient output, duration,
+and one classification for each reported gate or gate group: pass, repository defect,
+environment issue, or documentation mismatch. The exact commands remain in this checklist.
 
-Run every gate against the default branch after the final hardening change merges, from a
-fresh clone — never against a working tree. A working tree can hide an untracked `.env` or
-`config/master.key`, while Compose's fixed project name can make even a fresh clone reuse a
-stale image or the globally named `github-push-ingestor_pgdata` volume.
+Run every application, runtime, and repository-history gate against the default branch
+after the final hardening change merges, from a fresh clone — never against a modified
+working tree. A documentation-only gate for content not yet merged may use the final PR
+blob when the report records that blob separately and does not attribute it to the runtime
+checkout. A modified runtime tree can hide an untracked `.env` or `config/master.key`,
+while Compose's fixed project name can make even a fresh clone reuse a stale image or the
+globally named `github-push-ingestor_pgdata` volume.
 
 ---
 
